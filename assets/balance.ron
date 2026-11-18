@@ -1,0 +1,72 @@
+// Iron Dots — balance parameters (spec section 2.8).
+//
+// Values are in human units: HP, seconds, tiles, money. Decimals are written as
+// strings ("9.2") so the simulation never parses floating point. The simulation
+// converts everything to ticks and integers on load.
+//
+// Any change here changes sim_version (the hash of this content is part of it).
+// Values marked "proposal" are placeholders until measured (spec 2.11).
+(
+    tick_rate: 30,
+
+    unit: (
+        max_hp: 100,
+        // Soft push between dots so they don't pass through each other. proposal
+        separation_radius: "0.6",
+        // Speed multiplier while in contact with an enemy. proposal
+        engaged_speed: "0.5",
+        light: (speed: "2.0", atk: "1.0", def: "1.0", supply: 1, cost: 200, upkeep: "1"),
+        heavy: (speed: "1.0", atk: "1.5", def: "1.5", supply: 2, cost: 400, upkeep: "2"),
+    ),
+
+    combat: (
+        // Also the spatial grid cell size.
+        contact_radius: "1.5",
+        // HP/s; a duel of two equal light units without morale lasts ~15 s.
+        base_dps: "9.2",
+        // Damage multiplier taken by the attacking side. proposal
+        attacker_taken: "1.25",
+    ),
+
+    morale: (
+        max: 100,
+        loss_attack: "4",   // per second, proposal
+        loss_defend: "1",   // per second, proposal
+        regen: "5",         // per second out of combat, proposal
+    ),
+
+    // Stage 2 (cities, money, supply) — loaded and validated, not simulated yet.
+    economy: (city_income: "10", start_money: 200),
+    supply: (
+        per_city: 5,
+        starve_dps: "5",
+        broke_starve_dps: "2",
+        heal_dps: "2",
+        heal_city_dps: "4",
+        heal_delay: "3",
+    ),
+    territory: (radius: 3),
+    city: (capture_time: "5", defense_bonus: "0.5"),
+    match_rules: (start_light_units: 3, win_city_share: "0.8"),
+
+    water: (
+        damage_dps: "3",    // HP/s for infantry in water
+        ship_after: "5",    // seconds in water before turning into a ship
+    ),
+
+    // Per terrain: (speed, strength) multipliers for light / heavy, and the
+    // defense bonus for a defender standing on the tile. Strength multiplies
+    // both attack and defense of the unit (so a heavy in forest is weak, as in
+    // spec 2.3). Mountains are impassable.
+    terrain: (
+        plain:    (light: ("1",   "1"),    heavy: ("1",   "1"),    defense: "0"),
+        forest:   (light: ("1",   "1"),    heavy: ("0.5", "0.5"),  defense: "0.25"),
+        hills:    (light: ("1",   "1"),    heavy: ("0.5", "0.5"),  defense: "0.5"),
+        sand:     (light: ("0.6", "1"),    heavy: ("1",   "1"),    defense: "0"),
+        snow:     (light: ("0.8", "0.75"), heavy: ("0.8", "0.75"), defense: "0"),
+        mud:      (light: ("0.7", "0.75"), heavy: ("0.7", "0.75"), defense: "0"),
+        water:    (light: ("0.5", "0.5"),  heavy: ("0.5", "0.5"),  defense: "0"),
+        ship:     (light: ("1.5", "0.5"),  heavy: ("1.5", "0.5"),  defense: "0"),
+        // Cities and bridges behave like plain; a city adds city.defense_bonus.
+    ),
+)

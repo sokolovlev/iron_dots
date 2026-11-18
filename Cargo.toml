@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/sim-core", "crates/headless"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sokolovlev/iron_dots"
+rust-version = "1.85"
+
+[workspace.dependencies]
+sim-core = { path = "crates/sim-core" }
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+bitcode = { version = "0.6", features = ["serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1
