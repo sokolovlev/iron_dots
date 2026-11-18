@@ -1,15 +1,16 @@
 //! The world state and the fixed-order tick (spec 4.3).
 //!
-//! Phases implemented in stage 1:
-//!  1. apply commands (sorted by player, seq)
+//!  1. apply commands (sorted by player, seq); Move runs the pathfinder
 //!  2. rebuild the spatial grid
+//!  3. (flow fields — stage 5; stage 2 plans routes when a command is applied)
 //!  4. intent: desired velocity from the current order
 //!  5. separation + integration + terrain blocking (pull: every unit writes only itself)
-//!  6. combat: contacts → damage pulled from enemies → HP/morale update
-//! 10. remove dead units
+//!  6. combat: contacts → damage (combat, water, starvation) → HP/morale update
+//!  7. territory painting
+//!  8. supply: pockets every 15 ticks, starvation rates, healing
+//!  9. cities: capture; once per second money and victory check
+//! 10. remove dead units, then spawn bought ones
 //! 11. state hash (on demand; the runner records it every 30 ticks)
-//!
-//! Stage 2 adds pathing (3), territory (7), supply (8) and cities (9).
 
 use crate::balance::{Balance, Rules, SHIP_ROW};
 use crate::command::{Command, CommandKind};
@@ -17,7 +18,9 @@ use crate::fx::{Fx, FxPoint, ONE, dist2, isqrt_u64, length};
 use crate::grid::Grid;
 use crate::map::{Map, Terrain};
 use crate::order::{MAX_PATH_POINTS, OrderPool};
+use crate::pathfind;
 use crate::rng::{Purpose, rand, stochastic_round_q16};
+use crate::territory::{self, NO_POCKET, SUPPLY_INTERVAL};
 use crate::unit::{NO_ORDER, UnitHandle, UnitKind, UnitStore, flags};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -30,6 +33,40 @@ pub const MAX_PLAYERS: usize = 8;
 pub struct PlayerSetup {
     /// Team id; players on the same team are allies.
     pub team: u8,
+}
+
+/// A city or capital (spec 2.4). Cities are points on the map; a city tile
+/// always belongs to the city's owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct City {
+    pub x: u16,
+    pub y: u16,
+    /// Current owner (0 = neutral).
+    pub owner: u8,
+    /// Player whose capital this is (0 = ordinary city). Stays the same
+    /// after capture, so the capital can be retaken.
+    pub capital_of: u8,
+    /// Player currently capturing it and for how many ticks.
+    pub capture_by: u8,
+    pub capture_ticks: u16,
+}
+
+impl City {
+    pub fn center(&self) -> FxPoint {
+        FxPoint::tile_center(self.x as i32, self.y as i32)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlayerState {
+    /// Treasury in thousandths.
+    pub money: i64,
+    /// Income minus upkeep over the last second, thousandths.
+    pub net_income: i64,
+    /// The treasury ran dry at the last settlement: units outside cities starve.
+    pub broke: bool,
+    /// No cities and no units left.
+    pub eliminated: bool,
 }
 
 /// Counters of the last tick, for debug panels and tests.
@@ -53,6 +90,23 @@ pub struct World {
     team: [u8; MAX_PLAYERS + 1],
     players: u8,
     stats: TickStats,
+    cities: Vec<City>,
+    /// Per tile (row-major): 1 + index of the city whose 3×3 area covers it, or 0.
+    city_area: Vec<u16>,
+    player: [PlayerState; MAX_PLAYERS + 1],
+    /// Team that won, once decided.
+    winner: Option<u8>,
+    /// Pocket label per tile (row-major), owner/limit/used per label.
+    labels: Vec<u32>,
+    pocket_owner: Vec<u8>,
+    pocket_limit: Vec<u32>,
+    pocket_used: Vec<u32>,
+    territory_changed: bool,
+    /// Chunks whose territory changed since the renderer last looked.
+    dirty_chunks: Vec<bool>,
+    pending_spawns: Vec<(u8, UnitKind, u16)>,
+    /// Sandbox mode (spec 2.7): no upkeep, supply limits effectively unbounded.
+    sandbox: bool,
     // Scratch buffers reused every tick (no allocations in steady state).
     vel_x: Vec<i32>,
     vel_y: Vec<i32>,
@@ -62,6 +116,9 @@ pub struct World {
     contacts: Vec<u16>,
     dmg_in: Vec<u32>,
     cmd_order: Vec<u32>,
+    enemies_scratch: Vec<(i32, i32)>,
+    stack_scratch: Vec<(u32, u32)>,
+    path_scratch: pathfind::Scratch,
 }
 
 impl World {
@@ -78,6 +135,12 @@ impl World {
         }
         let min_cell = rules.contact_radius.0 + 2 * max_move_per_tick(&rules).0;
         let grid = Grid::new(min_cell, map.width(), map.height());
+        let mut player = [PlayerState::default(); MAX_PLAYERS + 1];
+        for p in player.iter_mut().skip(1).take(players.len()) {
+            p.money = rules.start_money;
+        }
+        let tiles = (map.width() * map.height()) as usize;
+        let chunks = (map.chunks_w() * map.chunks_h()) as usize;
         Ok(World {
             tick: 0,
             seed,
@@ -89,6 +152,18 @@ impl World {
             team,
             players: players.len() as u8,
             stats: TickStats::default(),
+            cities: Vec::new(),
+            city_area: vec![0; tiles],
+            player,
+            winner: None,
+            labels: Vec::new(),
+            pocket_owner: Vec::new(),
+            pocket_limit: Vec::new(),
+            pocket_used: Vec::new(),
+            territory_changed: true,
+            dirty_chunks: vec![true; chunks],
+            pending_spawns: Vec::new(),
+            sandbox: false,
             vel_x: Vec::new(),
             vel_y: Vec::new(),
             next_x: Vec::new(),
@@ -97,6 +172,9 @@ impl World {
             contacts: Vec::new(),
             dmg_in: Vec::new(),
             cmd_order: Vec::new(),
+            enemies_scratch: Vec::new(),
+            stack_scratch: Vec::new(),
+            path_scratch: pathfind::Scratch::default(),
         })
     }
 
@@ -123,6 +201,121 @@ impl World {
     }
     pub fn player_count(&self) -> u8 {
         self.players
+    }
+    pub fn cities(&self) -> &[City] {
+        &self.cities
+    }
+    /// State of player `id` (1..=8).
+    pub fn player(&self, id: u8) -> PlayerState {
+        self.player[id as usize]
+    }
+    pub fn team_of(&self, player: u8) -> u8 {
+        self.team[player as usize]
+    }
+    /// Winning team, once the match is decided (spec 2.6).
+    pub fn winner(&self) -> Option<u8> {
+        self.winner
+    }
+    /// `(used, limit)` supply of the pocket that contains city `c`, if any.
+    pub fn city_supply(&self, c: usize) -> Option<(u32, u32)> {
+        let p = self.pocket_of_city(c)?;
+        Some((self.pocket_used[p as usize], self.pocket_limit[p as usize]))
+    }
+    /// `(used, limit)` summed over all pockets of a player, for the HUD.
+    pub fn supply_totals(&self, player: u8) -> (u32, u32) {
+        let mut t = (0, 0);
+        for (k, &o) in self.pocket_owner.iter().enumerate() {
+            if o == player {
+                t.0 += self.pocket_used[k];
+                t.1 += self.pocket_limit[k];
+            }
+        }
+        t
+    }
+    /// Chunks whose territory changed since the last call (for GPU upload).
+    pub fn take_dirty_chunks(&mut self, mut f: impl FnMut(u32, u32)) {
+        let cw = self.map.chunks_w() as usize;
+        for (k, d) in self.dirty_chunks.iter_mut().enumerate() {
+            if std::mem::take(d) {
+                f((k % cw) as u32, (k / cw) as u32);
+            }
+        }
+    }
+
+    /// Sandbox mode (spec 2.7): supply limits scale up so huge armies don't
+    /// starve, and there is no upkeep.
+    pub fn set_sandbox(&mut self, on: bool) {
+        self.sandbox = on;
+    }
+
+    /// Adds a city (match setup). Its tile becomes [`Terrain::City`] owned by
+    /// `owner`; `capital` makes it the owner's capital.
+    pub fn add_city(&mut self, x: u32, y: u32, owner: u8, capital: bool) -> Result<u16, String> {
+        if x >= self.map.width() || y >= self.map.height() {
+            return Err("city outside the map".into());
+        }
+        if owner > self.players || (capital && owner == 0) {
+            return Err(format!("bad city owner {owner}"));
+        }
+        if self.cities.len() >= u16::MAX as usize - 1 {
+            return Err("too many cities".into());
+        }
+        let idx = self.cities.len() as u16;
+        self.map.set_terrain(x, y, Terrain::City);
+        self.map.set_owner(x, y, owner);
+        let w = self.map.width();
+        for ny in y.saturating_sub(1)..=(y + 1).min(self.map.height() - 1) {
+            for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                self.city_area[(ny * w + nx) as usize] = idx + 1;
+            }
+        }
+        self.cities.push(City {
+            x: x as u16,
+            y: y as u16,
+            owner,
+            capital_of: if capital { owner } else { 0 },
+            capture_by: 0,
+            capture_ticks: 0,
+        });
+        self.territory_changed = true;
+        Ok(idx)
+    }
+
+    /// Gives `player` all non-city tiles within `radius` of tile `(x, y)`
+    /// (match setup: land around starting capitals).
+    pub fn claim(&mut self, player: u8, x: u32, y: u32, radius: u32) {
+        let r = radius as i64;
+        for ny in y.saturating_sub(radius)..=(y + radius).min(self.map.height() - 1) {
+            for nx in x.saturating_sub(radius)..=(x + radius).min(self.map.width() - 1) {
+                let (dx, dy) = (nx as i64 - x as i64, ny as i64 - y as i64);
+                if dx * dx + dy * dy <= r * r && self.map.terrain(nx, ny) != Terrain::City {
+                    self.map.set_owner(nx, ny, player);
+                }
+            }
+        }
+        self.territory_changed = true;
+        self.dirty_chunks.fill(true);
+    }
+
+    /// Index of the city whose 3×3 area contains the unit's tile, if owned by
+    /// `owner` or an ally of `owner`.
+    #[inline]
+    fn friendly_city_at(&self, x: i32, y: i32, owner: u8) -> Option<usize> {
+        let k = self.city_area[((y >> 16) as u32 * self.map.width() + (x >> 16) as u32) as usize];
+        if k == 0 {
+            return None;
+        }
+        let c = &self.cities[k as usize - 1];
+        (c.owner != 0 && !self.enemies(c.owner, owner)).then_some(k as usize - 1)
+    }
+
+    fn pocket_of_city(&self, c: usize) -> Option<u32> {
+        let city = &self.cities[c];
+        if city.owner == 0 || self.labels.is_empty() {
+            return None;
+        }
+        let l = self.labels[(city.y as u32 * self.map.width() + city.x as u32) as usize];
+        (l != NO_POCKET).then_some(l)
     }
 
     #[inline]
@@ -161,7 +354,11 @@ impl World {
         self.phase_move();
         self.phase_orders_and_terrain();
         self.phase_combat();
+        self.phase_territory();
+        self.phase_supply();
+        self.phase_cities();
         self.phase_remove_dead();
+        self.phase_spawn();
         self.tick += 1;
     }
 
@@ -179,6 +376,7 @@ impl World {
     // ---------------------------------------------------------------- phase 1
 
     fn apply_commands(&mut self, commands: &[Command]) {
+        self.path_scratch.budget = pathfind::TICK_BUDGET;
         let mut order = std::mem::take(&mut self.cmd_order);
         order.clear();
         order.extend(commands.iter().enumerate().filter(|(_, c)| c.tick == self.tick).map(|(k, _)| k as u32));
@@ -219,7 +417,8 @@ impl World {
                 let max_y = Fx((self.map.height() as i32) * ONE - 1);
                 let path: Vec<FxPoint> =
                     path.iter().map(|p| FxPoint::new(p.x.clamp(Fx::ZERO, max_x), p.y.clamp(Fx::ZERO, max_y))).collect();
-                self.apply_move(&idx, path, *queue);
+                let (points, via) = self.plan_route(&idx, &path);
+                self.apply_move(&idx, points, via, *queue);
                 true
             }
             CommandKind::Stop { units } => {
@@ -232,6 +431,7 @@ impl World {
                 }
                 !idx.is_empty()
             }
+            CommandKind::Buy { city, kind } => self.apply_buy(c.player, *city as usize, *kind),
             CommandKind::ClearQueue { units } => {
                 let idx = self.own_units(c.player, units);
                 // Units sharing (order, waypoint) share the trimmed copy.
@@ -254,13 +454,80 @@ impl World {
         }
     }
 
-    fn apply_move(&mut self, idx: &[usize], path: Vec<FxPoint>, queue: bool) {
+    /// Inserts pathfinder waypoints where a straight segment of the requested
+    /// path would cross mountains or costlier terrain than its endpoints
+    /// (spec 2.9: "segments through mountains are routed around").
+    fn plan_route(&mut self, idx: &[usize], path: &[FxPoint]) -> (Vec<FxPoint>, Vec<bool>) {
+        const MAX_POINTS: usize = u8::MAX as usize;
+        let heavy = idx.iter().any(|&i| self.units.kind[i] == UnitKind::Heavy as u8);
+        let kind = if heavy { UnitKind::Heavy } else { UnitKind::Light };
+        let costs = pathfind::terrain_costs(&self.rules, kind);
+        let n = idx.len() as i64;
+        let cx = idx.iter().map(|&i| self.units.pos_x[i] as i64).sum::<i64>() / n;
+        let cy = idx.iter().map(|&i| self.units.pos_y[i] as i64).sum::<i64>() / n;
+        let tile = |x: i64, y: i64| ((x >> 16) as u32, (y >> 16) as u32);
+        let cost = |t: (u32, u32)| costs[self.map.terrain_raw(t.0, t.1) as usize];
+        let mut prev = tile(cx, cy);
+        let (mut points, mut via) = (Vec::new(), Vec::new());
+        for p in path {
+            let target = tile(p.x.0 as i64, p.y.0 as i64);
+            let limit = cost(prev).max(cost(target)).max(1000);
+            if !pathfind::clear_line(&self.map, &costs, prev, target, limit) {
+                if let Some(route) = pathfind::find_route(&self.map, &costs, prev, target, &mut self.path_scratch) {
+                    let wps = pathfind::smooth(&self.map, &costs, &route);
+                    for &(x, y) in &wps[1..wps.len() - 1] {
+                        points.push(FxPoint::tile_center(x as i32, y as i32));
+                        via.push(true);
+                    }
+                }
+            }
+            points.push(*p);
+            via.push(false);
+            prev = target;
+        }
+        // Order waypoints are indexed by u8: keep the last MAX_POINTS.
+        if points.len() > MAX_POINTS {
+            let cut = points.len() - MAX_POINTS;
+            points.drain(..cut);
+            via.drain(..cut);
+        }
+        (points, via)
+    }
+
+    fn apply_buy(&mut self, player: u8, city: usize, kind: UnitKind) -> bool {
+        if city >= self.cities.len() || self.cities[city].owner != player {
+            return false;
+        }
+        let cost = self.rules.cost[kind as usize];
+        if self.player[player as usize].money < cost {
+            return false;
+        }
+        if self.sandbox {
+            self.player[player as usize].money -= cost;
+            self.pending_spawns.push((player, kind, city as u16));
+            return true;
+        }
+        if self.labels.is_empty() {
+            self.recompute_supply();
+        }
+        let Some(p) = self.pocket_of_city(city) else { return false };
+        let need = self.rules.supply[kind as usize];
+        if self.pocket_used[p as usize] + need > self.pocket_limit[p as usize] {
+            return false;
+        }
+        self.pocket_used[p as usize] += need;
+        self.player[player as usize].money -= cost;
+        self.pending_spawns.push((player, kind, city as u16));
+        true
+    }
+
+    fn apply_move(&mut self, idx: &[usize], path: Vec<FxPoint>, via: Vec<bool>, queue: bool) {
         let n = idx.len() as i64;
         let cx = idx.iter().map(|&i| self.units.pos_x[i] as i64).sum::<i64>() / n;
         let cy = idx.iter().map(|&i| self.units.pos_y[i] as i64).sum::<i64>() / n;
         // Keep the formation, but not wider than ~ (1 + sqrt(n)/2) tiles.
         let cap = ONE as i64 + (isqrt_u64(n as u64) as i64) * (ONE as i64) / 2;
-        let new_order = self.orders.alloc(path, NO_ORDER);
+        let new_order = self.orders.alloc_via(path, via, NO_ORDER);
         let mut queued_copies: BTreeMap<(u32, u8), u32> = BTreeMap::new();
         for &i in idx {
             let old = self.units.order[i];
@@ -304,7 +571,12 @@ impl World {
         if o == NO_ORDER {
             return None;
         }
-        let p = self.orders.get(o).points[self.units.waypoint[i] as usize];
+        let order = self.orders.get(o);
+        let wp = self.units.waypoint[i] as usize;
+        let p = order.points[wp];
+        if order.via[wp] {
+            return Some((p.x.0, p.y.0));
+        }
         let max_x = (self.map.width() as i32) * ONE - 1;
         let max_y = (self.map.height() as i32) * ONE - 1;
         let tx = (p.x.0 as i64 + self.units.off_x[i] as i64).clamp(0, max_x as i64) as i32;
@@ -525,6 +797,12 @@ impl World {
             if u.row[b] == Terrain::Water as u8 {
                 q16 += rl.water_dmg_q16;
             }
+            q16 += u.starve[b] as u64;
+            if self.player[u.owner[b] as usize].broke
+                && self.friendly_city_at(u.pos_x[b], u.pos_y[b], u.owner[b]).is_none()
+            {
+                q16 += rl.broke_starve_q16;
+            }
             let dmg = stochastic_round_q16(q16, rand(self.seed, self.tick, u.slot[b], Purpose::Damage));
             self.dmg_in[b] = dmg.min(u32::MAX as u64) as u32;
         }
@@ -535,6 +813,7 @@ impl World {
             u.hp[i] = u.hp[i].saturating_sub(self.dmg_in[i].min(u16::MAX as u32) as u16);
             let f = u.flags[i];
             let r = rand(self.seed, self.tick, u.slot[i], Purpose::Morale);
+            u.calm[i] = if f & flags::IN_COMBAT != 0 { 0 } else { u.calm[i].saturating_add(1) };
             if f & flags::IN_COMBAT != 0 {
                 let loss_q16 = if f & flags::ATTACKING != 0 {
                     self.rules.morale_loss_attack_q16
@@ -557,6 +836,252 @@ impl World {
         }
     }
 
+    // ---------------------------------------------------------------- phase 7
+
+    fn phase_territory(&mut self) {
+        let changed = territory::paint(
+            &mut self.map,
+            &self.units,
+            &self.grid,
+            &self.team,
+            self.rules.territory_radius,
+            &mut self.dirty_chunks,
+            &mut self.enemies_scratch,
+        );
+        self.territory_changed |= changed;
+    }
+
+    // ---------------------------------------------------------------- phase 8
+
+    /// Pockets, supply limits and starvation rates (every 15 ticks).
+    fn recompute_supply(&mut self) {
+        if self.territory_changed || self.labels.is_empty() {
+            self.pocket_owner = territory::label_pockets(&self.map, &mut self.labels, &mut self.stack_scratch);
+            self.territory_changed = false;
+        }
+        let np = self.pocket_owner.len();
+        self.pocket_limit.clear();
+        self.pocket_limit.resize(np, 0);
+        self.pocket_used.clear();
+        self.pocket_used.resize(np, 0);
+        let w = self.map.width();
+        for c in &self.cities {
+            if c.owner == 0 {
+                continue;
+            }
+            let l = self.labels[(c.y as u32 * w + c.x as u32) as usize];
+            if l != NO_POCKET && self.pocket_owner[l as usize] == c.owner {
+                let per_city = if self.sandbox { 1 << 20 } else { self.rules.per_city };
+                self.pocket_limit[l as usize] += per_city;
+            }
+        }
+        let u = &mut self.units;
+        for i in 0..u.len() {
+            let p = territory::unit_pocket(
+                &self.map,
+                &self.labels,
+                u.owner[i],
+                u.pos_x[i],
+                u.pos_y[i],
+                self.rules.territory_radius,
+            );
+            u.pocket[i] = p;
+            if p != NO_POCKET {
+                self.pocket_used[p as usize] += self.rules.supply[u.kind[i] as usize];
+            }
+        }
+        // Units bought this tick are not spawned yet but already take supply.
+        for &(owner, kind, city) in &self.pending_spawns {
+            let c = &self.cities[city as usize];
+            let l = self.labels[(c.y as u32 * w + c.x as u32) as usize];
+            if l != NO_POCKET && self.pocket_owner[l as usize] == owner {
+                self.pocket_used[l as usize] += self.rules.supply[kind as usize];
+            }
+        }
+        let max = self.rules.starve_q16;
+        for i in 0..u.len() {
+            let p = u.pocket[i];
+            u.starve[i] = if self.sandbox {
+                0
+            } else if p == NO_POCKET || self.pocket_limit[p as usize] == 0 {
+                max as u32
+            } else {
+                let (used, limit) = (self.pocket_used[p as usize] as u64, self.pocket_limit[p as usize] as u64);
+                if used > limit { (max * (used - limit) / limit).min(max) as u32 } else { 0 }
+            };
+        }
+    }
+
+    fn phase_supply(&mut self) {
+        // Sandbox: no supply limits or starvation, so no pockets to label
+        // (labelling a 4096² map is the most expensive step at that size).
+        if self.tick % SUPPLY_INTERVAL == 0 && !self.sandbox {
+            self.recompute_supply();
+        }
+        // Healing: out of combat long enough, not starving, on friendly land.
+        for i in 0..self.units.len() {
+            let u = &self.units;
+            if u.calm[i] < self.rules.heal_delay_ticks
+                || u.starve[i] != 0
+                || u.hp[i] >= self.rules.max_hp
+                || u.row[i] == Terrain::Water as u8
+            {
+                continue;
+            }
+            let (x, y, me) = (u.pos_x[i], u.pos_y[i], u.owner[i]);
+            let tile_owner = self.map.owner((x >> 16) as u32, (y >> 16) as u32);
+            if tile_owner == 0 || self.enemies(tile_owner, me) {
+                continue;
+            }
+            let in_city = self.friendly_city_at(x, y, me).is_some();
+            if self.player[me as usize].broke && !in_city {
+                continue;
+            }
+            let q16 = if in_city { self.rules.heal_city_q16 } else { self.rules.heal_q16 };
+            let heal = stochastic_round_q16(q16, rand(self.seed, self.tick, u.slot[i], Purpose::Environment));
+            let hp = (self.units.hp[i] as u64 + heal).min(self.rules.max_hp as u64);
+            self.units.hp[i] = hp as u16;
+        }
+    }
+
+    // ---------------------------------------------------------------- phase 9
+
+    fn phase_cities(&mut self) {
+        self.capture_cities();
+        if self.tick % self.rules.tick_rate == self.rules.tick_rate - 1 {
+            self.settle_money();
+            self.check_victory();
+        }
+    }
+
+    fn capture_cities(&mut self) {
+        for c in 0..self.cities.len() {
+            let city = &self.cities[c];
+            let (cx, cy, owner) = (city.x as i32, city.y as i32, city.owner);
+            let center = city.center();
+            let u = &self.units;
+            let mut defended = false;
+            // Lowest attacking player id; attackers of two teams = contested.
+            let mut attacker: Option<u8> = None;
+            let mut contested = false;
+            self.grid.for_each_in_range(center.x.0, center.y.0, 2 * ONE, |j| {
+                let (tx, ty) = (u.pos_x[j] >> 16, u.pos_y[j] >> 16);
+                if (tx - cx).abs() > 1 || (ty - cy).abs() > 1 {
+                    return;
+                }
+                let o = u.owner[j];
+                if owner != 0 && !self.enemies(o, owner) {
+                    defended = true;
+                    return;
+                }
+                attacker = match attacker {
+                    None => Some(o),
+                    Some(a) if !self.enemies(a, o) => Some(a.min(o)),
+                    Some(a) => {
+                        contested = true;
+                        Some(a)
+                    }
+                };
+            });
+            let capture_ticks = self.rules.capture_ticks;
+            let same_team = |a: u8, b: u8| a != 0 && b != 0 && self.team[a as usize] == self.team[b as usize];
+            let city = &mut self.cities[c];
+            match attacker {
+                Some(a) if !defended && !contested => {
+                    if !same_team(city.capture_by, a) {
+                        city.capture_by = a;
+                        city.capture_ticks = 0;
+                    }
+                    city.capture_ticks += 1;
+                    if city.capture_ticks >= capture_ticks {
+                        city.owner = city.capture_by;
+                        city.capture_by = 0;
+                        city.capture_ticks = 0;
+                        let (x, y, o) = (city.x as u32, city.y as u32, city.owner);
+                        self.map.set_owner(x, y, o);
+                        let cw = self.map.chunks_w() as usize;
+                        self.dirty_chunks[(y as usize >> 6) * cw + (x as usize >> 6)] = true;
+                        self.territory_changed = true;
+                    }
+                }
+                Some(_) if contested && !defended => {} // frozen while contested
+                _ => {
+                    city.capture_by = 0;
+                    city.capture_ticks = 0;
+                }
+            }
+        }
+    }
+
+    /// Once per second: income from cities, upkeep of units outside cities.
+    fn settle_money(&mut self) {
+        let mut delta = [0i64; MAX_PLAYERS + 1];
+        for c in &self.cities {
+            delta[c.owner as usize] += self.rules.city_income;
+        }
+        let u = &self.units;
+        let w = self.map.width();
+        for i in 0..u.len() {
+            let o = u.owner[i];
+            let k = self.city_area[((u.pos_y[i] >> 16) as u32 * w + (u.pos_x[i] >> 16) as u32) as usize];
+            let in_own_city = k != 0 && self.cities[k as usize - 1].owner == o;
+            if !in_own_city && !self.sandbox {
+                delta[o as usize] -= self.rules.upkeep[u.kind[i] as usize];
+            }
+        }
+        for (p, d) in delta.iter().enumerate().skip(1).take(self.players as usize) {
+            let st = &mut self.player[p];
+            st.net_income = *d;
+            st.money += d;
+            st.broke = st.money < 0;
+            if st.money < 0 {
+                st.money = 0;
+            }
+        }
+    }
+
+    /// Spec 2.6: a team wins holding every enemy capital and at least
+    /// `win_city_share` of all cities, or by being the last team standing.
+    fn check_victory(&mut self) {
+        let counts = self.unit_counts();
+        let mut cities_of = [0u32; MAX_PLAYERS + 1];
+        for c in &self.cities {
+            cities_of[c.owner as usize] += 1;
+        }
+        for p in 1..=self.players as usize {
+            if !self.player[p].eliminated && cities_of[p] == 0 && counts[p] == 0 {
+                self.player[p].eliminated = true;
+            }
+        }
+        if self.winner.is_some() {
+            return;
+        }
+        let mut alive_teams: Vec<u8> =
+            (1..=self.players as usize).filter(|&p| !self.player[p].eliminated).map(|p| self.team[p]).collect();
+        alive_teams.sort_unstable();
+        alive_teams.dedup();
+        let all_teams = {
+            let mut t: Vec<u8> = (1..=self.players as usize).map(|p| self.team[p]).collect();
+            t.sort_unstable();
+            t.dedup();
+            t.len()
+        };
+        if alive_teams.len() == 1 && all_teams > 1 {
+            self.winner = Some(alive_teams[0]);
+            return;
+        }
+        let total = self.cities.len() as i64;
+        for &t in &alive_teams {
+            let ours = |p: u8| p != 0 && self.team[p as usize] == t;
+            let held = self.cities.iter().filter(|c| ours(c.owner)).count() as i64;
+            let capitals = self.cities.iter().all(|c| c.capital_of == 0 || ours(c.capital_of) || ours(c.owner));
+            if all_teams > 1 && capitals && total > 0 && held * 1000 >= self.rules.win_city_share.0 * total {
+                self.winner = Some(t);
+                return;
+            }
+        }
+    }
+
     // --------------------------------------------------------------- phase 10
 
     fn phase_remove_dead(&mut self) {
@@ -569,6 +1094,24 @@ impl World {
                 self.stats.deaths += 1;
             }
         }
+    }
+
+    fn phase_spawn(&mut self) {
+        let mut spawns = std::mem::take(&mut self.pending_spawns);
+        for (k, &(owner, kind, city)) in spawns.iter().enumerate() {
+            let c = self.cities[city as usize].center();
+            // Small deterministic jitter so new units don't stack exactly.
+            let r = rand(self.seed, self.tick, ((city as u32) << 8) | (k as u32 & 0xFF), Purpose::Scenario);
+            let jx = ((r & 0xFFFF) as i32 - 0x8000) / 4;
+            let jy = (((r >> 16) & 0xFFFF) as i32 - 0x8000) / 4;
+            let at = FxPoint::new(c.x + Fx(jx), c.y + Fx(jy));
+            if self.spawn(owner, kind, at).is_err() {
+                // The city tile itself is always passable.
+                let _ = self.spawn(owner, kind, c);
+            }
+        }
+        spawns.clear();
+        self.pending_spawns = spawns;
     }
 
     // --------------------------------------------------------------- phase 11
@@ -597,7 +1140,22 @@ impl World {
         hash_i32s(&mut h, &u.off_y);
         h.update(&u.stuck);
         hash_u32s(&mut h, &u.slot);
+        hash_u16s(&mut h, &u.calm);
+        hash_u32s(&mut h, &u.starve);
+        hash_u32s(&mut h, &u.pocket);
         u.hash_slots(&mut h);
+        for c in &self.cities {
+            h.update(&[c.owner, c.capital_of, c.capture_by]);
+            h.update(&c.capture_ticks.to_le_bytes());
+            h.update(&c.x.to_le_bytes());
+            h.update(&c.y.to_le_bytes());
+        }
+        for p in &self.player {
+            h.update(&p.money.to_le_bytes());
+            h.update(&p.net_income.to_le_bytes());
+            h.update(&[p.broke as u8, p.eliminated as u8]);
+        }
+        h.update(&[self.winner.unwrap_or(0), self.sandbox as u8]);
         self.orders.hash_into(&mut h);
         h.update(self.map.owner_plane());
         h.digest()

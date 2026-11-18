@@ -25,16 +25,16 @@ parallel without changing results.
 
 | # | Phase | Stage |
 |---|---|---|
-| 1 | Apply this tick's commands, sorted by `(player, seq)` | 1 ✓ |
+| 1 | Apply this tick's commands, sorted by `(player, seq)`; Move plans an A* route | 1–2 ✓ |
 | 2 | Rebuild the spatial grid (counting sort) | 1 ✓ |
-| 3 | Pathfinding: flow fields | 2 / 5 |
+| 3 | Pathfinding: hierarchical flow fields | 5 |
 | 4 | Intent: desired velocity from the current order | 1 ✓ |
 | 5 | Separation + integration + terrain blocking; waypoints, water/ships | 1 ✓ |
-| 6 | Combat: contacts → pulled damage → HP and morale | 1 ✓ |
-| 7 | Territory painting | 2 |
-| 8 | Supply (pockets), starvation, healing | 2 |
-| 9 | Cities: production and capture | 2 |
-| 10 | Remove the dead (descending swap-remove), spawn | 1 ✓ |
+| 6 | Combat: contacts → pulled damage (combat, water, starvation) → HP and morale | 1–2 ✓ |
+| 7 | Territory painting | 2 ✓ |
+| 8 | Supply: pockets every 15 ticks, starvation rates, healing | 2 ✓ |
+| 9 | Cities: capture; once per second money and the victory check | 2 ✓ |
+| 10 | Remove the dead (descending swap-remove), then spawn bought units | 1–2 ✓ |
 | 11 | State hash (xxh3) | 1 ✓ |
 
 The grid cell is a power of two no smaller than the contact radius plus twice
@@ -80,6 +80,64 @@ Enforced by `crates/sim-core/clippy.toml`, `#![deny(clippy::float_arithmetic)]`,
 Rendering and UI may use floats freely, since they never feed back into the
 simulation.
 
+## Gameplay rules: decisions the spec left open
+
+Stage 2 had to pin down details that spec §2 describes only in words:
+
+- **Territory:** a unit claims tiles within `territory.radius` unless an enemy
+  is within that radius of the tile. Allied land and city tiles are never
+  repainted; a city tile always belongs to the city's owner.
+- **Pockets:** 4-connected components of one player's land. A unit belongs to
+  the pocket under it, or the nearest own tile within the territory radius.
+  Otherwise it has no supply and starves at the full rate. Units bought this
+  tick already count against the pocket.
+- **Upkeep and income** are settled once per second. A unit is "in a city"
+  (no upkeep, double healing) inside the city's 3×3 tiles.
+- **Healing** needs 3 s out of combat, no starvation, friendly land, and not
+  being in water (otherwise healing cancelled the water damage).
+- **Capture:** enemy units inside the 3×3 area with no defenders. Any
+  defender resets the progress; attackers from two hostile teams freeze it.
+- **Sandbox** (benchmarks, spec §2.7): no upkeep and no supply limits, so
+  pocket labelling is skipped entirely.
+- **Pathfinding:** A* only when the straight segment would cross mountains
+  or terrain costlier than its endpoints. The search window is the bounding
+  box of start and goal grown by the route length (max 512 tiles per side),
+  with at most 20 000 nodes per search and 200 000 per tick. Commands beyond
+  the budget walk straight. Waypoints inserted by A* are followed exactly;
+  the player's own points keep the formation offset.
+
+## Bots
+
+`crates/ai` reads the world and returns ordinary commands, so the same bots
+run on every client in a lockstep game. It follows the same determinism rules
+(integers, ordered containers; a `clippy.toml` enforces it). Strategy is
+simple: buy when money and supply allow, pick the nearest neutral or enemy
+city (weighted by how well it is defended), defend threatened cities, and pull
+back units with broken morale. Difficulty changes reaction time, defense
+awareness, tactics and cash reserve.
+
+Measured in self-play on 256² maps, 20 matches per pairing with sides swapped:
+Normal beats Easy 13/20, while Hard beats Normal 9/20 and Easy 10/20. Making
+each level reliably stronger (spec v1.0 target: ≥ 70%) is stage 7 work.
+
+## Rendering
+
+`crates/render` draws everything in three pipelines:
+
+1. **Map:** a single fullscreen triangle. Terrain and owner planes are two
+   `R8Uint` textures. The fragment shader colours tiles, tints territory and
+   draws borders where a neighbour has another owner. Dirty 64×64 chunks are
+   re-uploaded as one contiguous 4 KiB copy each (the map stores chunks
+   row-major).
+2. **Markers:** units and cities as instanced quads (16 bytes each). Shapes
+   (dot, heavy ring, ship diamond, city, capital star), HP and morale bars,
+   selection ring and combat tremble are drawn in the shader.
+3. **Overlay:** coloured triangles in tile space for paths and the selection box.
+
+The client interpolates unit positions between the last two ticks. Colours
+are authored in sRGB and converted for the sRGB swapchain. Player colours
+come from a colour-blind-safe palette (`render::palette`).
+
 ## Balance
 
 `assets/balance.ron` (spec §2.8) is validated on load (range checks protect
@@ -92,14 +150,20 @@ a **strength** multiplier applied to both attack and defense. With attack only,
 a heavy unit (base defense 1.5) would still beat a light one in forest and
 hills, which contradicts spec §2.3 ("slow and weak").
 
-## Performance (stage 1, scalar, single thread)
+## Performance (stage 2, scalar, single thread)
 
-Measured with `iron-dots-headless bench` on a 4-core cloud VM:
+Measured with `iron-dots-headless bench` (sandbox battle, scripted players)
+on a 4-core cloud VM:
 
-| Scenario | Mean tick |
-|---|---|
-| 10 000 units, 1024² map | ~4.2 ms |
-| 100 000 units, 4096² map, 8 players | ~40 ms |
+| Scenario | Mean tick | p99 |
+|---|---|---|
+| 10 000 units, 1024² map | 4.5 ms | 6.6 ms |
+| 100 000 units, 4096² map, 8 players | 40 ms | 62 ms |
+| 1 200 units, 256² map, 4 players | 0.7 ms | 1.4 ms |
+
+In normal (non-sandbox) matches, pocket labelling floods the whole map every
+15 ticks. That is fine up to 1024² but is replaced by union-find over the chunk
+graph in stage 5.
 
 The targets (≤ 1 ms and ≤ 8 ms on the reference PC) belong to stages 3–5:
 rayon over fixed-size blocks, sleeping chunks, Morton re-sorting, SIMD kernels,

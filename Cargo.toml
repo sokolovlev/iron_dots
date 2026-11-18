@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/sim-core", "crates/headless"]
+members = ["crates/sim-core", "crates/ai", "crates/render", "crates/client", "crates/headless"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,16 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 sim-core = { path = "crates/sim-core" }
+ai = { path = "crates/ai" }
+render = { path = "crates/render" }
+wgpu = "30"
+winit = "0.30.13"
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = { version = "0.37", features = ["winit"] }
+egui-winit = "0.37"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "1"
+png = "0.18"
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
 bitcode = { version = "0.6", features = ["serde"] }
@@ -22,6 +32,10 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Simulation tests run thousands of ticks; unoptimised builds are too slow.
+[profile.dev]
+opt-level = 1
 
 [profile.release]
 lto = "fat"

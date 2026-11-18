@@ -70,6 +70,12 @@ pub struct UnitStore {
     pub stuck: Vec<u8>,
     /// Slot of this unit (stable id).
     pub slot: Vec<u32>,
+    /// Ticks since the unit was last in combat (saturating).
+    pub calm: Vec<u16>,
+    /// Starvation damage per tick, Q16 HP hundredths (set by the supply phase).
+    pub starve: Vec<u32>,
+    /// Supply pocket of the unit, or `territory::NO_POCKET`.
+    pub pocket: Vec<u32>,
 
     slot_generation: Vec<u32>,
     slot_index: Vec<u32>,
@@ -118,6 +124,9 @@ impl UnitStore {
         self.off_y.push(0);
         self.stuck.push(0);
         self.slot.push(slot);
+        self.calm.push(u16::MAX);
+        self.starve.push(0);
+        self.pocket.push(u32::MAX);
         UnitHandle { slot, generation: self.slot_generation[slot as usize] }
     }
 
@@ -145,6 +154,9 @@ impl UnitStore {
         self.off_y.swap_remove(i);
         self.stuck.swap_remove(i);
         self.slot.swap_remove(i);
+        self.calm.swap_remove(i);
+        self.starve.swap_remove(i);
+        self.pocket.swap_remove(i);
         self.slot_generation[slot as usize] = self.slot_generation[slot as usize].wrapping_add(1);
         self.slot_index[slot as usize] = FREE;
         self.free_slots.push(slot);

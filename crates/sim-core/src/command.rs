@@ -29,6 +29,10 @@ pub enum CommandKind {
     Stop { units: Vec<UnitHandle> },
     /// C: drop queued orders, keep walking the current one.
     ClearQueue { units: Vec<UnitHandle> },
+    /// Q / W: buy a unit in one of your cities (index into `World::cities`).
+    /// Needs the money and free supply in the city's pocket; the unit
+    /// appears in the city at the end of the tick.
+    Buy { city: u16, kind: crate::unit::UnitKind },
 }
 
 impl Command {

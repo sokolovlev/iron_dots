@@ -35,8 +35,14 @@
         regen: "5",         // per second out of combat, proposal
     ),
 
-    // Stage 2 (cities, money, supply) — loaded and validated, not simulated yet.
+    // Money: each city pays city_income per second; units outside cities cost
+    // their upkeep per second. Settled once per second.
     economy: (city_income: "10", start_money: 200),
+    // Supply is counted per pocket (connected piece of a player's territory):
+    // per_city places for every city in it. Overloaded units starve at
+    // starve_dps × (used − limit) / limit HP/s (at most starve_dps); with an
+    // empty treasury units outside cities lose broke_starve_dps. Units heal
+    // after heal_delay seconds out of combat on own or allied land.
     supply: (
         per_city: 5,
         starve_dps: "5",

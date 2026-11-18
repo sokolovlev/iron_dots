@@ -5,14 +5,17 @@
 //! iron-dots-headless verify FILE                re-simulate a replay, check every hash
 //! iron-dots-headless hash   [opts]              print the final state hash
 //! iron-dots-headless bench  [opts]              tick timings: p50 / p99 / max
+//! iron-dots-headless match  [opts] [--out FILE] bots play a standard match to the end
 //!
 //! opts: --map N (tiles, default 256)  --units N (per player, default 200)
 //!       --players N (default 2)       --seed N (default 1)
 //!       --ticks N (default 1800)      --balance FILE (default: built-in)
+//!       --difficulty easy|normal|hard (match; default normal, or a list per
+//!       player like easy,hard)
 //! ```
 
 use sim_core::replay::Replay;
-use sim_core::scenario::{ScenarioSpec, ScriptedPlayer};
+use sim_core::scenario::{Controller, ScenarioSpec, ScriptedPlayer};
 use sim_core::{Balance, World};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -25,6 +28,7 @@ struct Opts {
     ticks: u32,
     balance: Option<String>,
     out: Option<String>,
+    difficulty: Vec<ai::Difficulty>,
     positional: Vec<String>,
 }
 
@@ -37,6 +41,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         ticks: 1800,
         balance: None,
         out: None,
+        difficulty: Vec::new(),
         positional: Vec::new(),
     };
     let mut it = args.iter();
@@ -51,6 +56,17 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--ticks" => o.ticks = num(val("--ticks")?)? as u32,
             "--balance" => o.balance = Some(val("--balance")?),
             "--out" => o.out = Some(val("--out")?),
+            "--difficulty" => {
+                o.difficulty = val("--difficulty")?
+                    .split(',')
+                    .map(|d| match d {
+                        "easy" => Ok(ai::Difficulty::Easy),
+                        "normal" => Ok(ai::Difficulty::Normal),
+                        "hard" => Ok(ai::Difficulty::Hard),
+                        _ => Err(format!("unknown difficulty {d}")),
+                    })
+                    .collect::<Result<_, _>>()?
+            }
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             s => o.positional.push(s.to_string()),
         }
@@ -112,6 +128,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{:016x}", r.final_hash().unwrap_or(0));
         }
         "bench" => bench(&o, &b)?,
+        "match" => play_match(&o, &b)?,
         _ => return Err(usage()),
     }
     Ok(())
@@ -155,8 +172,40 @@ fn bench(o: &Opts, b: &Balance) -> Result<(), String> {
     Ok(())
 }
 
+fn play_match(o: &Opts, b: &Balance) -> Result<(), String> {
+    let spec = ScenarioSpec::standard_match(o.map, o.players, o.seed, b)?;
+    let mut bots: Vec<Box<dyn Controller>> = (1..=o.players)
+        .map(|p| {
+            let d = o.difficulty.get(p as usize - 1).or(o.difficulty.last()).copied().unwrap_or(ai::Difficulty::Normal);
+            Box::new(ai::Bot::new(p, d)) as Box<dyn Controller>
+        })
+        .collect();
+    let t = Instant::now();
+    let mut winner = None;
+    let r = Replay::record(&spec, b, o.ticks, &mut bots, |w| {
+        winner = w.winner();
+        winner.is_some()
+    })?;
+    let secs = r.ticks / b.tick_rate;
+    match winner {
+        Some(team) => println!("team {team} won after {}:{:02} game time", secs / 60, secs % 60),
+        None => println!("no winner after {}:{:02} game time", secs / 60, secs % 60),
+    }
+    println!(
+        "{} commands, final hash {:016x}, simulated in {:.2?}",
+        r.commands.len(),
+        r.final_hash().unwrap_or(0),
+        t.elapsed()
+    );
+    if let Some(out) = &o.out {
+        std::fs::write(out, r.encode()).map_err(|e| format!("{out}: {e}"))?;
+        println!("wrote {out}");
+    }
+    Ok(())
+}
+
 fn usage() -> String {
-    "usage: iron-dots-headless <record|verify|hash|bench> [--map N] [--units N] [--players N] \
+    "usage: iron-dots-headless <record|verify|hash|bench|match> [--map N] [--units N] [--players N] \
      [--seed N] [--ticks N] [--balance FILE] [--out FILE] [FILE]"
         .into()
 }

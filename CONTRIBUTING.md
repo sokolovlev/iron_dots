@@ -23,14 +23,17 @@ long replay produces the same hash on all of them.
 
 Read [ARCHITECTURE.md → Determinism rules](ARCHITECTURE.md#determinism-rules)
 before touching `crates/sim-core`. In short: no floats, no hash-map iteration,
-no clock, no shared RNG, and integer-only accumulation.
+no clock, no shared RNG, and integer-only accumulation. The same applies to
+`crates/ai`: bots run on every client in lockstep games.
 
 If your change alters game behaviour on purpose (logic or balance):
 
 1. bump `SIM_CODE_VERSION` in `crates/sim-core/src/lib.rs` (logic changes only;
    balance is hashed automatically);
-2. update the golden hashes in `crates/sim-core/tests/determinism.rs`. The
-   failing test prints the new values;
+2. update the golden hashes in `crates/sim-core/tests/determinism.rs` (the
+   failing test prints the new values) and the golden bot match in
+   `crates/ai/tests/matches.rs` (`iron-dots-headless match --map 256 --seed 1`
+   prints its final hash);
 3. explain the gameplay effect in the PR description.
 
 ## Performance

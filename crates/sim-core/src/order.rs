@@ -10,6 +10,10 @@ pub const MAX_PATH_POINTS: usize = 32;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Order {
     pub points: Vec<FxPoint>,
+    /// Per point: true for waypoints inserted by the pathfinder. Units go
+    /// through those exactly (no formation offset) so groups don't snag on
+    /// the walls of a pass.
+    pub via: Vec<bool>,
     /// Order to continue with after the last point, or [`NO_ORDER`].
     pub next: u32,
     /// Units and orders referencing this one. 0 means the slot is free.
@@ -27,7 +31,14 @@ pub struct OrderPool {
 impl OrderPool {
     /// Allocates an order with zero references; the caller retains it.
     pub fn alloc(&mut self, points: Vec<FxPoint>, next: u32) -> u32 {
-        let order = Order { points, next, refs: 0 };
+        let via = vec![false; points.len()];
+        self.alloc_via(points, via, next)
+    }
+
+    /// Like [`OrderPool::alloc`] with explicit pathfinder markers.
+    pub fn alloc_via(&mut self, points: Vec<FxPoint>, via: Vec<bool>, next: u32) -> u32 {
+        debug_assert_eq!(points.len(), via.len());
+        let order = Order { points, via, next, refs: 0 };
         match self.free.pop() {
             Some(id) => {
                 self.orders[id as usize] = order;
@@ -63,6 +74,7 @@ impl OrderPool {
             }
             let next = o.next;
             o.points = Vec::new();
+            o.via = Vec::new();
             o.next = NO_ORDER;
             self.free.push(id);
             id = next;
@@ -78,13 +90,13 @@ impl OrderPool {
     /// dropping everything after the first order, and appending `tail`.
     /// Returns the new chain head with zero references.
     pub fn copy_chain(&mut self, id: u32, from: usize, keep_queue: bool, tail: u32) -> u32 {
-        let mut segments: Vec<Vec<FxPoint>> = Vec::new();
+        let mut segments: Vec<(Vec<FxPoint>, Vec<bool>)> = Vec::new();
         let mut cur = id;
         let mut first = true;
         while cur != NO_ORDER {
             let o = self.get(cur);
             let start = if first { from.min(o.points.len()) } else { 0 };
-            segments.push(o.points[start..].to_vec());
+            segments.push((o.points[start..].to_vec(), o.via[start..].to_vec()));
             first = false;
             if !keep_queue {
                 break;
@@ -92,11 +104,11 @@ impl OrderPool {
             cur = o.next;
         }
         let mut next = tail;
-        for seg in segments.into_iter().rev() {
+        for (seg, via) in segments.into_iter().rev() {
             if seg.is_empty() {
                 continue;
             }
-            let n = self.alloc(seg, next);
+            let n = self.alloc_via(seg, via, next);
             self.retain(next);
             next = n;
         }
@@ -111,9 +123,10 @@ impl OrderPool {
             }
             h.update(&o.next.to_le_bytes());
             h.update(&(o.points.len() as u32).to_le_bytes());
-            for p in &o.points {
+            for (p, &v) in o.points.iter().zip(&o.via) {
                 h.update(&p.x.0.to_le_bytes());
                 h.update(&p.y.0.to_le_bytes());
+                h.update(&[v as u8]);
             }
         }
         crate::world::hash_u32s(h, &self.free);

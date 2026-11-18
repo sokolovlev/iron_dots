@@ -1,32 +1,68 @@
 # Iron Dots
 
-A minimalist real-time strategy game in Rust: armies are dots on an operational
-map, territory shifts as they move, and cities pay for new troops. The goal of
-the project is a simulation that handles **100 000 units on a 4096² map** at a
-fixed 30 ticks per second. It is fully deterministic, which is what makes
-lockstep multiplayer and tiny replays possible.
+A minimalist real-time strategy game in Rust. Armies are dots on an
+operational map, territory shifts as they move, cities pay for new troops, and
+encircled armies starve. The goal of the project is a simulation that handles
+**100 000 units on a 4096² map** at a fixed 30 ticks per second. It is fully
+deterministic, which is what makes lockstep multiplayer and tiny replays
+possible.
 
 Free and open source (MIT OR Apache-2.0). The full spec (in Russian) is in
 [`docs/spec-ru.md`](docs/spec-ru.md).
 
+![A match in progress](docs/screenshot.png)
+
 ## Status
 
-**Stage 1 — simulation prototype** (spec §8):
+**Stage 1: simulation prototype** ✓
+fixed-point SoA core, spatial grid, movement, combat with morale, replays, golden hashes on 4 platforms.
 
-- [x] Fixed-point (Q16.16) SoA simulation core, no floats, no `unsafe`
-- [x] Spatial grid (counting sort), soft separation, movement along drawn paths with formation offsets and Shift-queue
-- [x] Terrain multipliers, impassable mountains, water damage, units turning into ships
-- [x] Combat by the formula in §2.8: attacker / defender, morale, damage split between enemies in contact, broken attacks
-- [x] Commands as the only input; replays (scenario + commands + hash every 30 ticks)
-- [x] Headless runner: record / verify / hash / bench
-- [x] Golden replays and a CI matrix comparing hashes on Linux, Windows, macOS, ARM64
+**Stage 2: playable version** ✓ (spec §8)
 
-Next: stage 2 (rendering, cities, territory, supply, pathfinding, simple AI).
+- [x] Cities and capitals, money (income, upkeep, purchases), territory painting and borders
+- [x] Supply per pocket (connected territory), starvation, healing, city capture, victory (capital + 80% of cities)
+- [x] A* pathfinding around mountains and costly terrain (per unit type), with a per-tick budget
+- [x] Bots (`ai` crate) with three difficulty levels; bot-vs-bot matches play to victory in CI
+- [x] wgpu renderer: tile map, territory tint, borders, instanced units and cities, paths, selection
+- [x] Client (winit + egui): main menu, HUD, city panel, controls from spec §2.9, pause/speed, end-of-match charts, replays saved to `replays/`
 
-## Quick start
+Next: stage 3, parallelism (rayon over fixed blocks, sleeping chunks, dirty flags, Tracy).
+
+## Play
 
 ```bash
-cargo test --workspace
+cargo run --release -p client
+```
+
+Or jump straight into a match:
+
+```bash
+cargo run --release -p client -- --play --map 256 --opponents 1 --difficulty normal
+```
+
+| Action | Input |
+|---|---|
+| Select / add to selection | LMB / Shift + LMB, drag for a box |
+| All units of that type on screen | double LMB |
+| Move (shortest path) / along a drawn path | RMB click / RMB drag; Shift queues |
+| Stop / clear queued orders | S / C |
+| Buy light / heavy unit in the selected city | Q / W (click your city first) |
+| Groups | Ctrl + 1–9 store, 1–9 select, twice to jump |
+| Camera | wheel zoom to cursor, MMB drag, screen edges, Home = capital |
+| Pause / speed | Space / + and − (×0.5 … ×4) |
+| Menu | Esc |
+
+Keys are matched by physical position, so they work on any keyboard layout.
+Linux needs a Vulkan or GL driver and `libxkbcommon-x11-0` (or Wayland) at runtime.
+
+## Headless tools
+
+```bash
+cargo run --release -p headless -- match --map 256 --players 2 --difficulty hard,easy --out match.idr
+```
+
+```bash
+cargo run --release -p headless -- verify match.idr
 ```
 
 ```bash
@@ -34,30 +70,30 @@ cargo run --release -p headless -- bench --map 1024 --units 5000 --players 2 --t
 ```
 
 ```bash
-cargo run --release -p headless -- record --map 256 --units 300 --players 4 --ticks 3000 --out match.idr
+cargo run --release -p client -- --screenshot frame.png --map 256 --ticks 4500
 ```
 
-```bash
-cargo run --release -p headless -- verify match.idr
-```
-
-Balance lives in [`assets/balance.ron`](assets/balance.ron); pass
-`--balance FILE` to the runner to try a different one.
+The last one renders a bot-vs-bot frame without a window (CI uses Mesa's
+software Vulkan driver). Balance lives in [`assets/balance.ron`](assets/balance.ron);
+pass `--balance FILE` to the headless runner to try another one.
 
 ## Workspace
 
 | Crate | What it is |
 |---|---|
-| `crates/sim-core` | Deterministic simulation: world, tick, commands, replays |
-| `crates/headless` | `iron-dots-headless` CLI: replays, determinism checks, benchmarks |
+| `crates/sim-core` | Deterministic simulation: world, tick phases, commands, pathfinding, replays |
+| `crates/ai` | Bots: read the world, issue ordinary commands; deterministic |
+| `crates/render` | wgpu renderer: map, territory, borders, instanced markers, overlay |
+| `crates/client` | `iron-dots`: window, input, egui UI, offscreen screenshots |
+| `crates/headless` | `iron-dots-headless`: matches, replays, determinism checks, benchmarks |
 
-More crates (`render`, `client`, `net`, `ai`, `pathing`, `simd-kernels`,
-`relay-server`, `editor`) arrive in later stages. See [ARCHITECTURE.md](ARCHITECTURE.md).
+Later stages add `simd-kernels`, `pathing` (flow fields), `net`, `relay-server`
+and `editor`. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The one rule that matters most is that
-`sim-core` must stay deterministic.
+`sim-core` (and `ai`) must stay deterministic.
 
 ## License
 

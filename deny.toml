@@ -1,6 +1,11 @@
 # cargo deny check — licenses must be compatible with MIT OR Apache-2.0.
 [licenses]
-allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "CC0-1.0", "BSL-1.0"]
+allow = [
+  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+  "ISC", "Unicode-3.0", "Zlib", "CC0-1.0", "BSL-1.0", "Unlicense", "0BSD",
+  # Fonts bundled by egui (epaint_default_fonts); spec 6.1 plans Noto (OFL) later.
+  "OFL-1.1", "Ubuntu-font-1.0",
+]
 confidence-threshold = 0.9
 
 [bans]

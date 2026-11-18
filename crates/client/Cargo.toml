@@ -1,0 +1,28 @@
+[package]
+name = "client"
+description = "Iron Dots game client: window, input, UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "iron-dots"
+path = "src/main.rs"
+
+[dependencies]
+sim-core.workspace = true
+ai.workspace = true
+render.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+pollster.workspace = true
+png.workspace = true
+
+[lints]
+workspace = true

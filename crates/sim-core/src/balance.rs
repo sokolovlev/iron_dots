@@ -183,6 +183,30 @@ impl Balance {
         range("water.damage_dps", self.water.damage_dps, 0, 1_000_000)?;
         range("water.ship_after", self.water.ship_after, 0, 600_000)?;
         range("city.defense_bonus", self.city.defense_bonus, 0, 10_000)?;
+        range("city.capture_time", self.city.capture_time, 0, 600_000)?;
+        range("economy.city_income", self.economy.city_income, 0, 1_000_000)?;
+        range("supply.starve_dps", self.supply.starve_dps, 0, 1_000_000)?;
+        range("supply.broke_starve_dps", self.supply.broke_starve_dps, 0, 1_000_000)?;
+        range("supply.heal_dps", self.supply.heal_dps, 0, 1_000_000)?;
+        range("supply.heal_city_dps", self.supply.heal_city_dps, 0, 1_000_000)?;
+        range("supply.heal_delay", self.supply.heal_delay, 0, 600_000)?;
+        if !(1..=16).contains(&self.territory.radius) {
+            return Err("territory.radius must be in [1, 16]".into());
+        }
+        if !(1..=100).contains(&self.supply.per_city) {
+            return Err("supply.per_city must be in [1, 100]".into());
+        }
+        for (n, u) in [("light", &self.unit.light), ("heavy", &self.unit.heavy)] {
+            if !(1..=100).contains(&u.supply) {
+                return Err(format!("unit.{n}.supply must be in [1, 100]"));
+            }
+            if u.cost > 1_000_000 {
+                return Err(format!("unit.{n}.cost must be at most 1000000"));
+            }
+        }
+        if self.economy.start_money > 1_000_000 || self.match_rules.start_light_units > 1_000 {
+            return Err("economy.start_money or match_rules.start_light_units is too large".into());
+        }
         range("match_rules.win_city_share", self.match_rules.win_city_share, 1, 1_000)?;
         let t = &self.terrain;
         for (n, r) in [
@@ -247,6 +271,26 @@ pub struct Rules {
     pub morale_regen_q16: u64,
     pub water_dmg_q16: u64,
     pub ship_after_ticks: u16,
+    /// Money is kept in thousandths. Cost of a unit by kind.
+    pub cost: [i64; UnitKind::COUNT],
+    /// Upkeep per second outside cities, thousandths of money.
+    pub upkeep: [i64; UnitKind::COUNT],
+    /// Supply places a unit takes, by kind.
+    pub supply: [u32; UnitKind::COUNT],
+    /// Income of one city per second, thousandths of money.
+    pub city_income: i64,
+    pub start_money: i64,
+    pub per_city: u32,
+    /// Max starvation damage per tick (Q16 HP hundredths) at full overload.
+    pub starve_q16: u64,
+    pub broke_starve_q16: u64,
+    pub heal_q16: u64,
+    pub heal_city_q16: u64,
+    pub heal_delay_ticks: u16,
+    pub territory_radius: u32,
+    pub capture_ticks: u16,
+    pub win_city_share: Milli,
+    pub start_light_units: u32,
     pub balance_hash: u64,
 }
 
@@ -309,6 +353,21 @@ impl Rules {
             morale_regen_q16: rate_q16(b.morale.regen, tr),
             water_dmg_q16: rate_q16(b.water.damage_dps, tr),
             ship_after_ticks: ((b.water.ship_after.0 * tr as i64) / 1000).min(u16::MAX as i64) as u16,
+            cost: [b.unit.light.cost as i64 * 1000, b.unit.heavy.cost as i64 * 1000],
+            upkeep: [b.unit.light.upkeep.0, b.unit.heavy.upkeep.0],
+            supply: [b.unit.light.supply, b.unit.heavy.supply],
+            city_income: b.economy.city_income.0,
+            start_money: b.economy.start_money as i64 * 1000,
+            per_city: b.supply.per_city,
+            starve_q16: rate_q16(b.supply.starve_dps, tr),
+            broke_starve_q16: rate_q16(b.supply.broke_starve_dps, tr),
+            heal_q16: rate_q16(b.supply.heal_dps, tr),
+            heal_city_q16: rate_q16(b.supply.heal_city_dps, tr),
+            heal_delay_ticks: ((b.supply.heal_delay.0 * tr as i64) / 1000).min(u16::MAX as i64) as u16,
+            territory_radius: b.territory.radius,
+            capture_ticks: ((b.city.capture_time.0 * tr as i64) / 1000).clamp(1, u16::MAX as i64) as u16,
+            win_city_share: b.match_rules.win_city_share,
+            start_light_units: b.match_rules.start_light_units,
             balance_hash: b.content_hash(),
         }
     }

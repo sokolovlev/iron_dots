@@ -188,6 +188,11 @@ impl Map {
         self.owner[self.index(x, y)]
     }
 
+    pub fn set_owner(&mut self, x: u32, y: u32, owner: u8) {
+        let i = self.index(x, y);
+        self.owner[i] = owner;
+    }
+
     /// Raw terrain plane (chunk-major) — for upload to the GPU and hashing.
     pub fn terrain_plane(&self) -> &[u8] {
         &self.terrain

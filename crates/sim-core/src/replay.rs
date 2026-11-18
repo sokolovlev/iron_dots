@@ -3,7 +3,7 @@
 
 use crate::balance::Balance;
 use crate::command::Command;
-use crate::scenario::{ScenarioSpec, ScriptedPlayer};
+use crate::scenario::{Controller, ScenarioSpec, ScriptedPlayer};
 use crate::world::World;
 use serde::{Deserialize, Serialize};
 
@@ -54,13 +54,30 @@ impl Replay {
     /// Plays `scenario` for `ticks` with scripted players on every slot and
     /// records the commands and hashes.
     pub fn record_scripted(scenario: &ScenarioSpec, balance: &Balance, ticks: u32) -> Result<Replay, String> {
+        let players = scenario.players.len() as u8;
+        let mut bots: Vec<Box<dyn Controller>> =
+            (1..=players).map(|p| Box::new(ScriptedPlayer::new(p)) as Box<dyn Controller>).collect();
+        Replay::record(scenario, balance, ticks, &mut bots, |_| false)
+    }
+
+    /// Plays `scenario` with the given controllers for at most `ticks`,
+    /// stopping early when `stop(world)` returns true.
+    pub fn record(
+        scenario: &ScenarioSpec,
+        balance: &Balance,
+        ticks: u32,
+        bots: &mut [Box<dyn Controller>],
+        mut stop: impl FnMut(&World) -> bool,
+    ) -> Result<Replay, String> {
         let mut world = scenario.build(balance)?;
-        let mut bots: Vec<ScriptedPlayer> = (1..=world.player_count()).map(ScriptedPlayer::new).collect();
         let mut commands = Vec::new();
         let mut checkpoints = Vec::new();
         for _ in 0..ticks {
+            if stop(&world) {
+                break;
+            }
             let start = commands.len();
-            for b in &mut bots {
+            for b in bots.iter_mut() {
                 commands.extend(b.think(&world));
             }
             world.step(&commands[start..]);
@@ -75,7 +92,7 @@ impl Replay {
             sim_code_version: crate::SIM_CODE_VERSION,
             balance_hash: balance.content_hash(),
             scenario: scenario.clone(),
-            ticks,
+            ticks: world.tick(),
             commands,
             checkpoints,
         })

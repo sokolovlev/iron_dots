@@ -1,0 +1,17 @@
+[package]
+name = "render"
+description = "Iron Dots renderer: tile map, territory, borders, instanced units (wgpu)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+sim-core.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+
+[lints]
+workspace = true

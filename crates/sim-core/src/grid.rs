@@ -78,6 +78,22 @@ impl Grid {
         self.cell_start[0] = 0;
     }
 
+    /// Calls `f(j)` for every unit in cells overlapping the square of
+    /// half-size `range` (raw Q16.16) around `(x, y)`.
+    #[inline]
+    pub fn for_each_in_range(&self, x: i32, y: i32, range: i32, mut f: impl FnMut(usize)) {
+        let (cx0, cy0) = self.cell_xy(x.saturating_sub(range), y.saturating_sub(range));
+        let (cx1, cy1) = self.cell_xy(x.saturating_add(range), y.saturating_add(range));
+        for gy in cy0..=cy1 {
+            let row = gy * self.cells_w;
+            let a = self.cell_start[(row + cx0) as usize] as usize;
+            let b = self.cell_start[(row + cx1) as usize + 1] as usize;
+            for &j in &self.cell_units[a..b] {
+                f(j as usize);
+            }
+        }
+    }
+
     /// Calls `f(j)` for every unit in the 3×3 cells around the cell of `(x, y)`.
     #[inline]
     pub fn for_each_near(&self, x: i32, y: i32, mut f: impl FnMut(usize)) {

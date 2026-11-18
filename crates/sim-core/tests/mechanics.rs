@@ -14,7 +14,10 @@ fn pt(x: i32, y: i32) -> FxPoint {
 
 fn world(map: Map) -> World {
     let players = [PlayerSetup { team: 1 }, PlayerSetup { team: 2 }];
-    World::new(map, &Balance::default_balance(), 42, &players).unwrap()
+    let mut w = World::new(map, &Balance::default_balance(), 42, &players).unwrap();
+    // Pure movement/combat checks: no supply or upkeep in the way.
+    w.set_sandbox(true);
+    w
 }
 
 fn plain() -> Map {
@@ -157,17 +160,19 @@ fn water_hurts_then_turns_into_ship() {
     let a = w.spawn(1, UnitKind::Light, pt(19, 10)).unwrap();
     let cmds = [mv(0, 1, 0, &[a], &[pt(43, 10)])];
     let mut became_ship_at = None;
+    let mut hp_at_ship = 0;
     for _ in 0..30 * TPS {
         w.step(&cmds);
         let i = w.units().index_of(a).unwrap();
         if became_ship_at.is_none() && w.units().flags[i] & flags::SHIP != 0 {
             became_ship_at = Some(w.tick());
+            hp_at_ship = w.units().hp[i];
         }
     }
     let t = became_ship_at.expect("never became a ship") as i32;
     assert!((5 * TPS as i32..=6 * TPS as i32 + 15).contains(&t), "ship after {t} ticks");
-    // ~5 s at 3 HP/s ≈ 15 HP lost, then no more water damage.
-    let lost = 10_000 - hp(&w, a).unwrap() as i32;
+    // ~5 s at 3 HP/s ≈ 15 HP lost (no healing in water), then no more water damage.
+    let lost = 10_000 - hp_at_ship as i32;
     assert!((1_200..=1_800).contains(&lost), "lost {lost} hundredths of HP");
 }
 

@@ -1,0 +1,9 @@
+# Bots run on every client in lockstep games, so they must be deterministic
+# exactly like sim-core (see ARCHITECTURE.md).
+disallowed-types = [
+  { path = "f32", reason = "bots must be deterministic; use integers" },
+  { path = "f64", reason = "bots must be deterministic; use integers" },
+  { path = "std::collections::HashMap", reason = "iteration order is random; use BTreeMap" },
+  { path = "std::collections::HashSet", reason = "iteration order is random; use BTreeSet" },
+  { path = "std::time::Instant", reason = "wall-clock time must not influence bots" },
+]

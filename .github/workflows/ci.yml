@@ -69,3 +69,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --release -p headless -- bench --map 1024 --units 5000 --players 2 --ticks 600
       - run: cargo run --release -p headless -- bench --map 256 --units 2000 --players 4 --ticks 1200
+      # Stage 2 exit criterion, automated: bots play a full match to victory.
+      - run: cargo run --release -p headless -- match --map 256 --players 2 --seed 1 --ticks 45000
+
+  # Renders a real frame (map, units, HUD) with a software Vulkan driver and
+  # keeps it as an artifact, so rendering regressions are visible in PRs.
+  screenshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - run: cargo run --release -p client -- --screenshot overview.png --map 256 --ticks 4500 --seed 1
+      - run: cargo run --release -p client -- --screenshot closeup.png --map 256 --ticks 6000 --seed 2 --opponents 2 --zoom 9
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: "*.png"

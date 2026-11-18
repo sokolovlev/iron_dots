@@ -1,10 +1,11 @@
 //! Reproducible match setups and a simple scripted player used by tests,
-//! golden replays and benchmarks. The real AI lives in the `ai` crate (stage 2).
+//! golden replays and benchmarks. The real AI lives in the `ai` crate.
 
 use crate::balance::Balance;
 use crate::command::{Command, CommandKind};
 use crate::fx::{Fx, FxPoint, ONE};
 use crate::map::{Map, MapSource, Terrain};
+use crate::rng::{Purpose, rand};
 use crate::unit::UnitKind;
 use crate::world::{MAX_PLAYERS, PlayerSetup, World};
 use serde::{Deserialize, Serialize};
@@ -16,42 +17,144 @@ pub struct Spawn {
     pub at: FxPoint,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CitySpawn {
+    pub x: u32,
+    pub y: u32,
+    /// 0 = neutral.
+    pub owner: u8,
+    pub capital: bool,
+    /// Starting territory radius around the city, tiles (0 = just the city).
+    pub claim: u32,
+}
+
 /// Everything needed to rebuild the initial world bit for bit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScenarioSpec {
     pub map: MapSource,
     pub seed: u64,
     pub players: Vec<PlayerSetup>,
+    pub cities: Vec<CitySpawn>,
     pub spawns: Vec<Spawn>,
+    /// Sandbox rules (spec 2.7): unbounded supply, no upkeep.
+    pub sandbox: bool,
+}
+
+/// Directions of starting positions on a ring, in eighths of the half-size
+/// (no trigonometry): W, E, N, S, NW, SE, NE, SW.
+const DIRS: [(i32, i32); 8] = [(-6, 0), (6, 0), (0, -6), (0, 6), (-4, -4), (4, 4), (4, -4), (-4, 4)];
+
+fn is_land(map: &Map, x: i32, y: i32) -> bool {
+    x >= 0
+        && y >= 0
+        && (x as u32) < map.width()
+        && (y as u32) < map.height()
+        && !matches!(map.terrain(x as u32, y as u32), Terrain::Mountain | Terrain::Water)
+}
+
+/// Nearest land tile to `(x, y)` in growing square rings (fixed scan order).
+fn nearest_land(map: &Map, x: i32, y: i32) -> Option<(i32, i32)> {
+    let max = map.width().max(map.height()) as i32;
+    for r in 0..max {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if (dx.abs() == r || dy.abs() == r) && is_land(map, x + dx, y + dy) {
+                    return Some((x + dx, y + dy));
+                }
+            }
+        }
+    }
+    None
 }
 
 impl ScenarioSpec {
     pub fn build(&self, balance: &Balance) -> Result<World, String> {
         let map = self.map.build()?;
         let mut w = World::new(map, balance, self.seed, &self.players)?;
+        w.set_sandbox(self.sandbox);
+        for c in &self.cities {
+            w.add_city(c.x, c.y, c.owner, c.capital)?;
+            if c.owner != 0 && c.claim > 0 {
+                w.claim(c.owner, c.x, c.y, c.claim);
+            }
+        }
         for s in &self.spawns {
             w.spawn(s.owner, s.kind, s.at)?;
         }
         Ok(w)
     }
 
-    /// Generated map with `players` armies (each `units_per_player` strong,
-    /// every 4th unit heavy) placed around the centre, free-for-all teams.
+    /// A normal match (spec 2.8 "match start"): every player gets a capital
+    /// with some land and `start_light_units` light units; neutral cities are
+    /// scattered over the map. Free-for-all teams unless `teams` is given.
+    pub fn standard_match(map_size: u32, players: u8, seed: u64, balance: &Balance) -> Result<ScenarioSpec, String> {
+        if !(2..=MAX_PLAYERS as u8).contains(&players) {
+            return Err(format!("players must be in 2..={MAX_PLAYERS}"));
+        }
+        let source = MapSource::Generated { width: map_size, height: map_size, seed };
+        let map = source.build()?;
+        let half = map_size as i32 / 2;
+        let mut cities: Vec<CitySpawn> = Vec::new();
+        let mut spawns = Vec::new();
+        for p in 0..players {
+            let (dx, dy) = DIRS[p as usize];
+            let (x, y) = nearest_land(&map, half + dx * half / 8, half + dy * half / 8).ok_or("map has no land")?;
+            cities.push(CitySpawn { x: x as u32, y: y as u32, owner: p + 1, capital: true, claim: 6 });
+            let start = balance.match_rules.start_light_units;
+            for at in army_positions(&map, x + 2, y, start) {
+                spawns.push(Spawn { owner: p + 1, kind: UnitKind::Light, at });
+            }
+        }
+        // Neutral cities: rejection sampling with a minimum spacing.
+        // Roughly 20 cities on a 256² map; never fewer than 3 per player.
+        let spacing = (map_size as i64 / 8).clamp(16, 48);
+        let target = ((map_size as i64 / spacing).pow(2) / 3).max(players as i64 * 3) as usize;
+        let mut attempt = 0u32;
+        while cities.len() < target + players as usize && attempt < 20_000 {
+            let r = rand(seed, attempt, 0, Purpose::Scenario);
+            attempt += 1;
+            let margin = 4;
+            let span = map_size as u64 - 2 * margin;
+            let x = (margin + (r & 0xFFFF_FFFF) % span) as i32;
+            let y = (margin + (r >> 32) % span) as i32;
+            if !is_land(&map, x, y) {
+                continue;
+            }
+            let far = cities.iter().all(|c| {
+                let (ddx, ddy) = (c.x as i64 - x as i64, c.y as i64 - y as i64);
+                ddx * ddx + ddy * ddy >= spacing * spacing
+            });
+            if far {
+                cities.push(CitySpawn { x: x as u32, y: y as u32, owner: 0, capital: false, claim: 0 });
+            }
+        }
+        Ok(ScenarioSpec {
+            map: source,
+            seed,
+            players: (0..players).map(|p| PlayerSetup { team: p + 1 }).collect(),
+            cities,
+            spawns,
+            sandbox: false,
+        })
+    }
+
+    /// Sandbox battle for benchmarks: generated map with `players` armies
+    /// (each `units_per_player` strong, every 4th unit heavy) around the
+    /// centre, each with a capital. Free-for-all teams.
     pub fn battle(map_size: u32, units_per_player: u32, players: u8, seed: u64) -> Result<ScenarioSpec, String> {
         if !(1..=MAX_PLAYERS as u8).contains(&players) {
             return Err(format!("players must be in 1..={MAX_PLAYERS}"));
         }
         let source = MapSource::Generated { width: map_size, height: map_size, seed };
         let map = source.build()?;
-        // Directions on a ring, in eighths of the half-size (no trigonometry).
-        const DIRS: [(i32, i32); 8] = [(-6, 0), (6, 0), (0, -6), (0, 6), (-4, -4), (4, 4), (4, -4), (-4, 4)];
         let half = map_size as i32 / 2;
         let mut spawns = Vec::new();
+        let mut cities = Vec::new();
         for p in 0..players {
             let (dx, dy) = DIRS[p as usize];
-            let cx = half + dx * half / 8;
-            let cy = half + dy * half / 8;
-            for (k, at) in army_positions(&map, cx, cy, units_per_player).into_iter().enumerate() {
+            let (cx, cy) = nearest_land(&map, half + dx * half / 8, half + dy * half / 8).ok_or("map has no land")?;
+            cities.push(CitySpawn { x: cx as u32, y: cy as u32, owner: p + 1, capital: true, claim: 4 });
+            for (k, at) in army_positions(&map, cx, cy + 2, units_per_player).into_iter().enumerate() {
                 let kind = if k % 4 == 3 { UnitKind::Heavy } else { UnitKind::Light };
                 spawns.push(Spawn { owner: p + 1, kind, at });
             }
@@ -60,7 +163,9 @@ impl ScenarioSpec {
             map: source,
             seed,
             players: (0..players).map(|p| PlayerSetup { team: p + 1 }).collect(),
+            cities,
             spawns,
+            sandbox: true,
         })
     }
 }
@@ -71,18 +176,12 @@ fn army_positions(map: &Map, cx: i32, cy: i32, count: u32) -> Vec<FxPoint> {
     let step = ONE * 3 / 4;
     let mut out = Vec::with_capacity(count as usize);
     let max_ring = (map.width().max(map.height()) as i32) * 2;
-    let land = |x: i32, y: i32| -> bool {
-        let (tx, ty) = (x >> 16, y >> 16);
-        tx >= 0
-            && ty >= 0
-            && (tx as u32) < map.width()
-            && (ty as u32) < map.height()
-            && !matches!(map.terrain(tx as u32, ty as u32), Terrain::Mountain | Terrain::Water)
+    let land = |x: i32, y: i32| {
+        is_land(map, x >> 16, y >> 16) && map.terrain((x >> 16) as u32, (y >> 16) as u32) != Terrain::City
     };
     let (ox, oy) = (cx * ONE + ONE / 2, cy * ONE + ONE / 2);
     let mut ring = 0;
     while (out.len() as u32) < count && ring < max_ring {
-        // Walk the square ring of radius `ring` in a fixed order.
         for gy in -ring..=ring {
             for gx in -ring..=ring {
                 if gx.abs() != ring && gy.abs() != ring {
@@ -114,9 +213,17 @@ impl ScriptedPlayer {
     pub fn new(player: u8) -> Self {
         Self { player, period: 90, group: 64, seq: 0 }
     }
+}
 
-    /// Commands for the current tick of `world` (empty most ticks).
-    pub fn think(&mut self, world: &World) -> Vec<Command> {
+/// Anything that issues commands from the world state: a scripted player,
+/// the AI, a recorded stream.
+pub trait Controller {
+    /// Commands for the current tick of `world` (usually empty).
+    fn think(&mut self, world: &World) -> Vec<Command>;
+}
+
+impl Controller for ScriptedPlayer {
+    fn think(&mut self, world: &World) -> Vec<Command> {
         let tick = world.tick();
         // Players think on different ticks to spread the load.
         if (tick + self.player as u32 * 7) % self.period != 0 {
