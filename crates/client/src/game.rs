@@ -67,7 +67,11 @@ impl Game {
         let balance = Balance::default_balance();
         let players = settings.opponents + 1;
         let spec = ScenarioSpec::standard_match(settings.map_size, players, settings.seed, &balance)?;
-        let world = spec.build(&balance)?;
+        let mut world = spec.build(&balance)?;
+        // Leave one core for rendering and the UI; results do not depend on
+        // the thread count.
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        world.set_threads(cores.saturating_sub(1).max(1))?;
         let me = 1;
         let bots = (2..=players).map(|p| Bot::new(p, settings.difficulty)).collect();
         let cap = world.cities().iter().find(|c| c.capital_of == me).map(|c| c.center()).unwrap_or_default();

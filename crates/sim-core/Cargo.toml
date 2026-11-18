@@ -12,6 +12,12 @@ serde.workspace = true
 ron.workspace = true
 bitcode.workspace = true
 xxhash-rust.workspace = true
+rayon.workspace = true
+tracing = { workspace = true, optional = true }
+
+[features]
+# Spans around every tick phase, for Tracy or any `tracing` subscriber.
+tracing = ["dep:tracing"]
 
 [dev-dependencies]
 proptest.workspace = true

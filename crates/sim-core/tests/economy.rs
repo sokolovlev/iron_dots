@@ -68,13 +68,15 @@ fn supply_limit_blocks_buying() {
 fn units_paint_territory_unless_enemies_are_near() {
     let mut w = world();
     let a = w.spawn(1, UnitKind::Light, pt(20, 20)).unwrap();
-    w.step(&[]);
+    // Units paint every PAINT_INTERVAL ticks, staggered.
+    let interval = sim_core::territory::PAINT_INTERVAL;
+    run(&mut w, &[], interval);
     assert_eq!(w.map().owner(20, 20), 1);
     assert_eq!(w.map().owner(23, 20), 1);
     assert_eq!(w.map().owner(24, 20), 0);
     // An enemy within the radius of a tile blocks repainting it.
     w.spawn(2, UnitKind::Light, pt(40, 20)).unwrap();
-    w.step(&[]);
+    run(&mut w, &[], interval);
     assert_eq!(w.map().owner(40, 20), 2);
     let cmds = [mv(w.tick(), 1, &[a], pt(36, 20))];
     run(&mut w, &cmds, 10 * TPS);

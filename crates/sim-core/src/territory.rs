@@ -15,82 +15,96 @@ use crate::unit::UnitStore;
 pub const SUPPLY_INTERVAL: u32 = 15;
 /// "No pocket": unit is not on or next to its own land.
 pub const NO_POCKET: u32 = u32::MAX;
+/// Each unit paints every this many ticks, staggered by its slot (spec 5.3:
+/// spread work over ticks). A unit moves at most ~0.3 tiles in that time,
+/// far less than the territory radius, so no gaps appear.
+pub const PAINT_INTERVAL: u32 = 4;
 
-/// Paints territory around units. `team[p]` is player p's team.
-/// Returns true if any tile changed; marks changed chunks in `dirty`.
-/// `enemies` is a scratch buffer.
+/// Tiles unit `i` would claim, judged on the map as it is now: within
+/// `radius`, not the unit's own or an ally's, not a city, and with no enemy
+/// unit within `radius` of the tile. Appends `(x, y, owner)` to `out`.
+/// `hot = false` means no enemy can be near (sleeping chunk); the enemy
+/// search is skipped then.
 #[allow(clippy::too_many_arguments)]
-pub fn paint(
-    map: &mut Map,
+pub fn paint_candidates(
+    map: &Map,
     units: &UnitStore,
     grid: &Grid,
     team: &[u8],
     radius: u32,
-    dirty: &mut [bool],
+    i: usize,
+    hot: bool,
     enemies: &mut Vec<(i32, i32)>,
-) -> bool {
+    out: &mut Vec<(u16, u16, u8)>,
+) {
     let r = radius as i32;
     let r_raw = r * ONE;
     let r2 = (r_raw as i64) * (r_raw as i64);
     let (w, h) = (map.width() as i32, map.height() as i32);
-    let chunks_w = map.chunks_w() as usize;
-    let mut changed = false;
-    for i in 0..units.len() {
-        let me = units.owner[i];
-        let my_team = team[me as usize];
-        let (ux, uy) = (units.pos_x[i], units.pos_y[i]);
-        let (tx, ty) = (ux >> 16, uy >> 16);
-        // Quick pass: is anything in reach not ours or an ally's?
-        let mut needs = false;
-        'scan: for dy in -r..=r {
-            for dx in -r..=r {
-                if dx * dx + dy * dy > r * r {
-                    continue;
-                }
-                let (x, y) = (tx + dx, ty + dy);
-                if x < 0 || y < 0 || x >= w || y >= h {
-                    continue;
-                }
-                let o = map.owner(x as u32, y as u32);
-                if o == 0 || team[o as usize] != my_team {
-                    needs = true;
-                    break 'scan;
-                }
+    let me = units.owner[i];
+    let my_team = team[me as usize];
+    let (ux, uy) = (units.pos_x[i], units.pos_y[i]);
+    let (tx, ty) = (ux >> 16, uy >> 16);
+    let claimable = |x: i32, y: i32| -> bool {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return false;
+        }
+        let o = map.owner(x as u32, y as u32);
+        !(o != 0 && team[o as usize] == my_team) && map.terrain(x as u32, y as u32) != Terrain::City
+    };
+    // Quick pass: anything in reach that is not ours or an ally's?
+    let mut needs = false;
+    'scan: for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy <= r * r && claimable(tx + dx, ty + dy) {
+                needs = true;
+                break 'scan;
             }
         }
-        if !needs {
-            continue;
-        }
-        // Enemies that could be within the radius of any tile we touch.
-        enemies.clear();
+    }
+    if !needs {
+        return;
+    }
+    // Enemies that could be within the radius of any tile we touch.
+    enemies.clear();
+    if hot {
         grid.for_each_in_range(ux, uy, 2 * r_raw + ONE, |j| {
             if team[units.owner[j] as usize] != my_team {
                 enemies.push((units.pos_x[j], units.pos_y[j]));
             }
         });
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if dx * dx + dy * dy > r * r {
-                    continue;
-                }
-                let (x, y) = (tx + dx, ty + dy);
-                if x < 0 || y < 0 || x >= w || y >= h {
-                    continue;
-                }
-                let (xu, yu) = (x as u32, y as u32);
-                let o = map.owner(xu, yu);
-                if (o != 0 && team[o as usize] == my_team) || map.terrain(xu, yu) == Terrain::City {
-                    continue;
-                }
-                let (cx, cy) = ((x << 16) + ONE / 2, (y << 16) + ONE / 2);
-                if enemies.iter().any(|&(ex, ey)| dist2(ex, ey, cx, cy) <= r2) {
-                    continue;
-                }
-                map.set_owner(xu, yu, me);
-                dirty[(yu as usize >> CHUNK_SHIFT) * chunks_w + (xu as usize >> CHUNK_SHIFT)] = true;
-                changed = true;
+    }
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let (x, y) = (tx + dx, ty + dy);
+            if dx * dx + dy * dy > r * r || !claimable(x, y) {
+                continue;
             }
+            let (cx, cy) = ((x << 16) + ONE / 2, (y << 16) + ONE / 2);
+            if enemies.iter().any(|&(ex, ey)| dist2(ex, ey, cx, cy) <= r2) {
+                continue;
+            }
+            out.push((x as u16, y as u16, me));
         }
+    }
+}
+
+/// Applies candidate writes block by block, in order. A tile is skipped if
+/// an earlier write this tick gave it to an ally of the writer, which is
+/// exactly what a sequential pass over the units would do. Returns true if
+/// any tile changed and marks changed chunks in `dirty`.
+pub fn apply_paint(map: &mut Map, team: &[u8], blocks: &[Vec<(u16, u16, u8)>], dirty: &mut [bool]) -> bool {
+    let chunks_w = map.chunks_w() as usize;
+    let mut changed = false;
+    for &(x, y, me) in blocks.iter().flatten() {
+        let (x, y) = (x as u32, y as u32);
+        let o = map.owner(x, y);
+        if o != 0 && team[o as usize] == team[me as usize] {
+            continue;
+        }
+        map.set_owner(x, y, me);
+        dirty[(y as usize >> CHUNK_SHIFT) * chunks_w + (x as usize >> CHUNK_SHIFT)] = true;
+        changed = true;
     }
     changed
 }

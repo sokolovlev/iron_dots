@@ -1,9 +1,20 @@
-//! Uniform spatial grid rebuilt every tick with a counting sort, O(n + cells).
+//! Spatial grid rebuilt every tick with a counting sort, O(n + occupied cells).
 //!
 //! The cell size is a power of two in Q16.16 that is at least the contact
 //! radius plus twice the largest per-tick move, so a 3×3 neighbourhood built
 //! from positions at the start of the tick still contains every unit within
 //! contact radius after the movement phase.
+//!
+//! Cells are grouped in blocks of 32×32. Only blocks that contain units get
+//! prefix sums, so a huge, mostly empty map (4096² tiles = 4 M cells) costs
+//! as much as the area its armies cover.
+
+const BLOCK_SHIFT: u32 = 5;
+const BLOCK: u32 = 1 << BLOCK_SHIFT;
+const BLOCK_CELLS: usize = (BLOCK * BLOCK) as usize;
+/// Stride of one block's prefix-sum array (cells + 1 end marker).
+const STRIDE: usize = BLOCK_CELLS + 1;
+const EMPTY: u32 = u32::MAX;
 
 #[derive(Clone, Debug, Default)]
 pub struct Grid {
@@ -11,12 +22,19 @@ pub struct Grid {
     shift: u32,
     cells_w: u32,
     cells_h: u32,
-    /// `cell_start[c]..cell_start[c + 1]` is the range of `cell_units` for cell `c`.
-    cell_start: Vec<u32>,
-    /// Unit indices sorted by cell; within a cell by ascending index.
+    blocks_w: u32,
+    /// Per block: index of its prefix-sum array in `starts`, or [`EMPTY`].
+    block_slot: Vec<u32>,
+    /// Occupied blocks in ascending block order (as filled this tick).
+    occupied: Vec<u32>,
+    /// `STRIDE` entries per occupied block: absolute start of each cell in
+    /// `cell_units`, plus the end of the last cell.
+    starts: Vec<u32>,
+    /// Unit indices sorted by (block, cell); within a cell by ascending index.
     cell_units: Vec<u32>,
-    /// Cell of each unit.
-    unit_cell: Vec<u32>,
+    /// Per unit: block and cell-within-block.
+    unit_block: Vec<u32>,
+    unit_cell: Vec<u16>,
 }
 
 impl Grid {
@@ -28,13 +46,15 @@ impl Grid {
             raw.div_ceil(1u64 << shift) as u32
         };
         let (cells_w, cells_h) = (span(map_w), span(map_h));
+        let blocks_w = cells_w.div_ceil(BLOCK);
+        let blocks_h = cells_h.div_ceil(BLOCK);
         Grid {
             shift,
             cells_w,
             cells_h,
-            cell_start: vec![0; (cells_w * cells_h) as usize + 1],
-            cell_units: Vec::new(),
-            unit_cell: Vec::new(),
+            blocks_w,
+            block_slot: vec![EMPTY; (blocks_w * blocks_h) as usize],
+            ..Default::default()
         }
     }
 
@@ -50,32 +70,95 @@ impl Grid {
         (cx, cy)
     }
 
+    #[inline]
+    fn block_and_local(&self, cx: u32, cy: u32) -> (u32, usize) {
+        let b = (cy >> BLOCK_SHIFT) * self.blocks_w + (cx >> BLOCK_SHIFT);
+        let l = ((cy & (BLOCK - 1)) << BLOCK_SHIFT) | (cx & (BLOCK - 1));
+        (b, l as usize)
+    }
+
     pub fn rebuild(&mut self, pos_x: &[i32], pos_y: &[i32]) {
         let n = pos_x.len();
+        for &b in &self.occupied {
+            self.block_slot[b as usize] = EMPTY;
+        }
+        self.occupied.clear();
+        self.unit_block.resize(n, 0);
         self.unit_cell.resize(n, 0);
         self.cell_units.resize(n, 0);
-        self.cell_start.fill(0);
+        // Pass 1: which blocks are occupied, and where each unit goes.
         for i in 0..n {
             let (cx, cy) = self.cell_xy(pos_x[i], pos_y[i]);
-            let c = cy * self.cells_w + cx;
-            self.unit_cell[i] = c;
-            self.cell_start[c as usize + 1] += 1;
+            let (b, l) = self.block_and_local(cx, cy);
+            self.unit_block[i] = b;
+            self.unit_cell[i] = l as u16;
+            if self.block_slot[b as usize] == EMPTY {
+                self.block_slot[b as usize] = 0; // mark; slot assigned below
+                self.occupied.push(b);
+            }
         }
-        for c in 1..self.cell_start.len() {
-            self.cell_start[c] += self.cell_start[c - 1];
+        // Slots in ascending block order keep the layout independent of
+        // which unit happened to touch a block first.
+        self.occupied.sort_unstable();
+        for (k, &b) in self.occupied.iter().enumerate() {
+            self.block_slot[b as usize] = k as u32;
         }
-        // Scatter in ascending index order; `cell_start[c]` temporarily acts
-        // as the write cursor and is restored afterwards by shifting.
+        self.starts.clear();
+        self.starts.resize(self.occupied.len() * STRIDE, 0);
+        // Pass 2: counts.
         for i in 0..n {
-            let c = self.unit_cell[i] as usize;
-            let at = self.cell_start[c];
-            self.cell_units[at as usize] = i as u32;
-            self.cell_start[c] += 1;
+            let slot = self.block_slot[self.unit_block[i] as usize] as usize;
+            self.starts[slot * STRIDE + self.unit_cell[i] as usize + 1] += 1;
         }
-        for c in (1..self.cell_start.len()).rev() {
-            self.cell_start[c] = self.cell_start[c - 1];
+        // Prefix sums across all occupied blocks: absolute positions.
+        let mut running = 0u32;
+        for k in 0..self.occupied.len() {
+            let base = k * STRIDE;
+            self.starts[base] = running;
+            for c in 1..STRIDE {
+                running += self.starts[base + c];
+                self.starts[base + c] = running;
+            }
         }
-        self.cell_start[0] = 0;
+        // Pass 3: scatter in ascending index order, using a cursor per cell.
+        // `starts[c]` is temporarily the cursor of cell c; shifted back after.
+        for i in 0..n {
+            let slot = self.block_slot[self.unit_block[i] as usize] as usize;
+            let at = &mut self.starts[slot * STRIDE + self.unit_cell[i] as usize];
+            self.cell_units[*at as usize] = i as u32;
+            *at += 1;
+        }
+        for k in 0..self.occupied.len() {
+            let base = k * STRIDE;
+            let end = self.starts[base + STRIDE - 1];
+            for c in (1..STRIDE - 1).rev() {
+                self.starts[base + c] = self.starts[base + c - 1];
+            }
+            // Cell 0 started where the previous block ended.
+            self.starts[base] = if k == 0 { 0 } else { self.starts[base - 1] };
+            self.starts[base + STRIDE - 1] = end;
+        }
+    }
+
+    /// Units of cells `x0..=x1` in row `cy`. Cells of one block row are
+    /// contiguous, so this is one slice per block touched (usually one).
+    #[inline]
+    fn row(&self, cy: u32, x0: u32, x1: u32, f: &mut impl FnMut(usize)) {
+        let mut x = x0;
+        while x <= x1 {
+            let block_end = (x | (BLOCK - 1)).min(x1);
+            let (b, l0) = self.block_and_local(x, cy);
+            let slot = self.block_slot[b as usize];
+            if slot != EMPTY {
+                let base = slot as usize * STRIDE;
+                let l1 = l0 + (block_end - x) as usize;
+                let (a, z) = (self.starts[base + l0] as usize, self.starts[base + l1 + 1] as usize);
+                for &j in &self.cell_units[a..z] {
+                    f(j as usize);
+                }
+            }
+            x = block_end + 1;
+        }
     }
 
     /// Calls `f(j)` for every unit in cells overlapping the square of
@@ -85,12 +168,7 @@ impl Grid {
         let (cx0, cy0) = self.cell_xy(x.saturating_sub(range), y.saturating_sub(range));
         let (cx1, cy1) = self.cell_xy(x.saturating_add(range), y.saturating_add(range));
         for gy in cy0..=cy1 {
-            let row = gy * self.cells_w;
-            let a = self.cell_start[(row + cx0) as usize] as usize;
-            let b = self.cell_start[(row + cx1) as usize + 1] as usize;
-            for &j in &self.cell_units[a..b] {
-                f(j as usize);
-            }
+            self.row(gy, cx0, cx1, &mut f);
         }
     }
 
@@ -103,12 +181,7 @@ impl Grid {
         let y0 = cy.saturating_sub(1);
         let y1 = (cy + 1).min(self.cells_h - 1);
         for gy in y0..=y1 {
-            let row = gy * self.cells_w;
-            let a = self.cell_start[(row + x0) as usize] as usize;
-            let b = self.cell_start[(row + x1) as usize + 1] as usize;
-            for &j in &self.cell_units[a..b] {
-                f(j as usize);
-            }
+            self.row(gy, x0, x1, &mut f);
         }
     }
 }
@@ -117,6 +190,7 @@ impl Grid {
 mod tests {
     use super::*;
     use crate::fx::ONE;
+    use proptest::prelude::*;
 
     #[test]
     fn finds_neighbours() {
@@ -132,5 +206,30 @@ mod tests {
         near.clear();
         g.for_each_near(ONE * 63, ONE * 63, |j| near.push(j));
         assert_eq!(near, vec![3]);
+    }
+
+    proptest! {
+        /// The grid returns exactly the units a brute-force scan finds.
+        #[test]
+        fn matches_brute_force(
+            pts in proptest::collection::vec((0i32..512 * ONE, 0i32..512 * ONE), 0..400),
+            qx in 0i32..512 * ONE, qy in 0i32..512 * ONE,
+        ) {
+            let mut g = Grid::new(ONE * 3 / 2, 512, 512);
+            let xs: Vec<i32> = pts.iter().map(|p| p.0).collect();
+            let ys: Vec<i32> = pts.iter().map(|p| p.1).collect();
+            // Rebuild twice to exercise clearing of the previous tick.
+            g.rebuild(&ys, &xs);
+            g.rebuild(&xs, &ys);
+            let cs = g.cell_size();
+            let mut got = Vec::new();
+            g.for_each_near(qx, qy, |j| got.push(j));
+            got.sort();
+            let cell = |v: i32| v / cs;
+            let want: Vec<usize> = (0..xs.len())
+                .filter(|&j| (cell(xs[j]) - cell(qx)).abs() <= 1 && (cell(ys[j]) - cell(qy)).abs() <= 1)
+                .collect();
+            prop_assert_eq!(got, want);
+        }
     }
 }

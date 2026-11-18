@@ -10,13 +10,15 @@
 //! opts: --map N (tiles, default 256)  --units N (per player, default 200)
 //!       --players N (default 2)       --seed N (default 1)
 //!       --ticks N (default 1800)      --balance FILE (default: built-in)
+//!       --threads N (bench; default 1, results are identical for any N)
+//!       --scenario battle|front (armies around the map / one long front line)
 //!       --difficulty easy|normal|hard (match; default normal, or a list per
 //!       player like easy,hard)
 //! ```
 
 use sim_core::replay::Replay;
 use sim_core::scenario::{Controller, ScenarioSpec, ScriptedPlayer};
-use sim_core::{Balance, World};
+use sim_core::{Balance, Phase, World};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -29,6 +31,8 @@ struct Opts {
     balance: Option<String>,
     out: Option<String>,
     difficulty: Vec<ai::Difficulty>,
+    threads: usize,
+    scenario: String,
     positional: Vec<String>,
 }
 
@@ -42,6 +46,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         balance: None,
         out: None,
         difficulty: Vec::new(),
+        threads: 1,
+        scenario: "battle".into(),
         positional: Vec::new(),
     };
     let mut it = args.iter();
@@ -56,6 +62,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--ticks" => o.ticks = num(val("--ticks")?)? as u32,
             "--balance" => o.balance = Some(val("--balance")?),
             "--out" => o.out = Some(val("--out")?),
+            "--scenario" => o.scenario = val("--scenario")?,
+            "--threads" => o.threads = num(val("--threads")?)?.max(1) as usize,
             "--difficulty" => {
                 o.difficulty = val("--difficulty")?
                     .split(',')
@@ -85,7 +93,11 @@ fn balance(o: &Opts) -> Result<Balance, String> {
 }
 
 fn scenario(o: &Opts) -> Result<ScenarioSpec, String> {
-    ScenarioSpec::battle(o.map, o.units, o.players, o.seed)
+    match o.scenario.as_str() {
+        "battle" => ScenarioSpec::battle(o.map, o.units, o.players, o.seed),
+        "front" => ScenarioSpec::front(o.map, o.units, o.seed),
+        s => Err(format!("unknown scenario {s} (battle or front)")),
+    }
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -137,10 +149,12 @@ fn run(args: &[String]) -> Result<(), String> {
 fn bench(o: &Opts, b: &Balance) -> Result<(), String> {
     let spec = scenario(o)?;
     let mut world: World = spec.build(b)?;
+    world.set_threads(o.threads)?;
     let mut bots: Vec<ScriptedPlayer> = (1..=world.player_count()).map(ScriptedPlayer::new).collect();
     let start_units = world.units().len();
     let mut times: Vec<Duration> = Vec::with_capacity(o.ticks as usize);
     let mut peak_combat = 0;
+    let mut phase_time = [Duration::ZERO; Phase::ALL.len()];
     let mut cmds = Vec::new();
     for _ in 0..o.ticks {
         cmds.clear();
@@ -148,7 +162,12 @@ fn bench(o: &Opts, b: &Balance) -> Result<(), String> {
             cmds.extend(bot.think(&world));
         }
         let t = Instant::now();
-        world.step(&cmds);
+        let mut last = t;
+        world.step_with(&cmds, &mut |p| {
+            let now = Instant::now();
+            phase_time[p as usize] += now - last;
+            last = now;
+        });
         times.push(t.elapsed());
         peak_combat = peak_combat.max(world.stats().units_in_combat);
     }
@@ -156,9 +175,10 @@ fn bench(o: &Opts, b: &Balance) -> Result<(), String> {
     let pct = |p: usize| times[(times.len() - 1) * p / 100];
     let total: Duration = times.iter().sum();
     println!(
-        "map {m}x{m}, {start_units} units ({} left), {} ticks, peak in combat {peak_combat}",
+        "map {m}x{m}, {start_units} units ({} left), {} ticks, {} threads, peak in combat {peak_combat}",
         world.units().len(),
         o.ticks,
+        o.threads,
         m = o.map
     );
     println!(
@@ -168,6 +188,14 @@ fn bench(o: &Opts, b: &Balance) -> Result<(), String> {
         pct(99),
         times.last().copied().unwrap_or_default()
     );
+    let total_phases: Duration = phase_time.iter().sum();
+    let mut line = String::from("phases:");
+    for p in Phase::ALL {
+        let d = phase_time[p as usize];
+        let pct = d.as_nanos() * 100 / total_phases.as_nanos().max(1);
+        line += &format!("  {} {:.2?} ({pct}%)", p.name(), d / o.ticks.max(1));
+    }
+    println!("{line}");
     println!("final hash {:016x}", world.state_hash());
     Ok(())
 }
@@ -210,7 +238,20 @@ fn usage() -> String {
         .into()
 }
 
+/// With `--features tracy`, sends tick-phase spans to the Tracy profiler.
+fn init_profiling() {
+    #[cfg(feature = "tracy")]
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(tracing_tracy::TracyLayer::default());
+        if tracing::subscriber::set_global_default(subscriber).is_err() {
+            eprintln!("profiling: a tracing subscriber is already installed");
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    init_profiling();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,

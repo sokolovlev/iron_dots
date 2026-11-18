@@ -62,7 +62,20 @@ fn parse() -> Result<(Option<String>, bool, offscreen::ShotOptions), String> {
     Ok((shot, play, o))
 }
 
+/// With `--features tracy`, sends tick-phase spans to the Tracy profiler.
+fn init_profiling() {
+    #[cfg(feature = "tracy")]
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(tracing_tracy::TracyLayer::default());
+        if tracing::subscriber::set_global_default(subscriber).is_err() {
+            eprintln!("profiling: a tracing subscriber is already installed");
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    init_profiling();
     let (shot, play, opts) = match parse() {
         Ok(v) => v,
         Err(e) => {

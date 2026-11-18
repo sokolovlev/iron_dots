@@ -22,9 +22,16 @@ use crate::pathfind;
 use crate::rng::{Purpose, rand, stochastic_round_q16};
 use crate::territory::{self, NO_POCKET, SUPPLY_INTERVAL};
 use crate::unit::{NO_ORDER, UnitHandle, UnitKind, UnitStore, flags};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::mem::take;
+use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
+
+/// Units per parallel work item. A fixed size (never derived from the
+/// thread count) keeps every result independent of how many threads run.
+pub const BLOCK: usize = 1024;
 
 /// Max players per match (ids 1..=8; 0 is "nobody").
 pub const MAX_PLAYERS: usize = 8;
@@ -69,12 +76,56 @@ pub struct PlayerState {
     pub eliminated: bool,
 }
 
+/// Tick phases as reported to the probe of [`World::step_with`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Phase {
+    Commands,
+    Grid,
+    Intent,
+    Move,
+    Combat,
+    Territory,
+    Supply,
+    Cities,
+    Spawn,
+}
+
+impl Phase {
+    pub const ALL: [Phase; 9] = [
+        Phase::Commands,
+        Phase::Grid,
+        Phase::Intent,
+        Phase::Move,
+        Phase::Combat,
+        Phase::Territory,
+        Phase::Supply,
+        Phase::Cities,
+        Phase::Spawn,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Commands => "commands",
+            Phase::Grid => "grid",
+            Phase::Intent => "intent",
+            Phase::Move => "move",
+            Phase::Combat => "combat",
+            Phase::Territory => "territory",
+            Phase::Supply => "supply",
+            Phase::Cities => "cities",
+            Phase::Spawn => "dead+spawn",
+        }
+    }
+}
+
 /// Counters of the last tick, for debug panels and tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TickStats {
     pub commands_applied: u32,
     pub commands_rejected: u32,
     pub units_in_combat: u32,
+    /// Chunks with hostile units nearby (the rest sleep, spec 5.3).
+    pub hot_chunks: u32,
     pub deaths: u32,
 }
 
@@ -116,9 +167,15 @@ pub struct World {
     contacts: Vec<u16>,
     dmg_in: Vec<u32>,
     cmd_order: Vec<u32>,
-    enemies_scratch: Vec<(i32, i32)>,
     stack_scratch: Vec<(u32, u32)>,
     path_scratch: pathfind::Scratch,
+    paint_scratch: Vec<Vec<(u16, u16, u8)>>,
+    /// Bit of each player's team (teams numbered in ascending id order).
+    team_bit: [u8; MAX_PLAYERS + 1],
+    chunk_mask: Vec<u8>,
+    hot: Vec<bool>,
+    pool: Arc<rayon::ThreadPool>,
+    threads: usize,
 }
 
 impl World {
@@ -138,6 +195,13 @@ impl World {
         let mut player = [PlayerState::default(); MAX_PLAYERS + 1];
         for p in player.iter_mut().skip(1).take(players.len()) {
             p.money = rules.start_money;
+        }
+        let mut teams: Vec<u8> = players.iter().map(|p| p.team).collect();
+        teams.sort_unstable();
+        teams.dedup();
+        let mut team_bit = [0u8; MAX_PLAYERS + 1];
+        for (k, p) in players.iter().enumerate() {
+            team_bit[k + 1] = 1 << teams.binary_search(&p.team).expect("team is listed");
         }
         let tiles = (map.width() * map.height()) as usize;
         let chunks = (map.chunks_w() * map.chunks_h()) as usize;
@@ -172,10 +236,30 @@ impl World {
             contacts: Vec::new(),
             dmg_in: Vec::new(),
             cmd_order: Vec::new(),
-            enemies_scratch: Vec::new(),
             stack_scratch: Vec::new(),
             path_scratch: pathfind::Scratch::default(),
+            paint_scratch: Vec::new(),
+            team_bit,
+            chunk_mask: Vec::new(),
+            hot: Vec::new(),
+            pool: Arc::new(make_pool(1)?),
+            threads: 1,
         })
+    }
+
+    /// Runs the parallel phases on `n` worker threads (1 = single thread).
+    /// The result of every tick is bit-identical for any `n`.
+    pub fn set_threads(&mut self, n: usize) -> Result<(), String> {
+        let n = n.max(1);
+        if n != self.threads {
+            self.pool = Arc::new(make_pool(n)?);
+            self.threads = n;
+        }
+        Ok(())
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 
     pub fn tick(&self) -> u32 {
@@ -346,19 +430,38 @@ impl World {
     /// Advances the world by one tick. `commands` may contain commands for
     /// any tick; only those with `tick == self.tick()` are applied.
     pub fn step(&mut self, commands: &[Command]) {
+        self.step_with(commands, &mut |_| {});
+    }
+
+    /// Like [`World::step`], calling `probe(phase)` right after each phase
+    /// finishes. The simulation never reads a clock; profilers measure the
+    /// time between probe calls instead (see `iron-dots-headless bench`).
+    pub fn step_with(&mut self, commands: &[Command], probe: &mut dyn FnMut(Phase)) {
+        macro_rules! phase {
+            ($p:expr, $body:expr) => {{
+                #[cfg(feature = "tracing")]
+                let _span = tracing::info_span!("phase", name = $p.name()).entered();
+                $body;
+                probe($p);
+            }};
+        }
         self.stats = TickStats::default();
         self.prepare_scratch();
-        self.apply_commands(commands);
-        self.grid.rebuild(&self.units.pos_x, &self.units.pos_y);
-        self.phase_intent();
-        self.phase_move();
-        self.phase_orders_and_terrain();
-        self.phase_combat();
-        self.phase_territory();
-        self.phase_supply();
-        self.phase_cities();
-        self.phase_remove_dead();
-        self.phase_spawn();
+        phase!(Phase::Commands, self.apply_commands(commands));
+        phase!(Phase::Grid, self.grid.rebuild(&self.units.pos_x, &self.units.pos_y));
+        phase!(Phase::Intent, self.phase_intent());
+        phase!(Phase::Move, {
+            self.phase_move();
+            self.phase_orders_and_terrain()
+        });
+        phase!(Phase::Combat, self.phase_combat());
+        phase!(Phase::Territory, self.phase_territory());
+        phase!(Phase::Supply, self.phase_supply());
+        phase!(Phase::Cities, self.phase_cities());
+        phase!(Phase::Spawn, {
+            self.phase_remove_dead();
+            self.phase_spawn()
+        });
         self.tick += 1;
     }
 
@@ -595,259 +698,455 @@ impl World {
         s.0
     }
 
-    fn phase_intent(&mut self) {
-        for i in 0..self.units.len() {
-            self.vel_x[i] = 0;
-            self.vel_y[i] = 0;
-            self.arrive[i] = false;
-            let Some((tx, ty)) = self.waypoint_target(i) else { continue };
-            let dx = tx - self.units.pos_x[i];
-            let dy = ty - self.units.pos_y[i];
-            let d = length(dx, dy);
-            let s = self.speed_of(i);
-            if d <= s {
-                self.vel_x[i] = dx;
-                self.vel_y[i] = dy;
-                self.arrive[i] = true;
-            } else {
-                self.vel_x[i] = (dx as i64 * s as i64 / d as i64) as i32;
-                self.vel_y[i] = (dy as i64 * s as i64 / d as i64) as i32;
-            }
+    /// Desired velocity of unit `i` and whether it reaches its waypoint now.
+    #[inline]
+    fn intent_of(&self, i: usize) -> (i32, i32, bool) {
+        let Some((tx, ty)) = self.waypoint_target(i) else { return (0, 0, false) };
+        let dx = tx - self.units.pos_x[i];
+        let dy = ty - self.units.pos_y[i];
+        let d = length(dx, dy);
+        let s = self.speed_of(i);
+        if d <= s {
+            (dx, dy, true)
+        } else {
+            ((dx as i64 * s as i64 / d as i64) as i32, (dy as i64 * s as i64 / d as i64) as i32, false)
         }
+    }
+
+    fn phase_intent(&mut self) {
+        let (mut vx, mut vy, mut ar) = (take(&mut self.vel_x), take(&mut self.vel_y), take(&mut self.arrive));
+        let this = &*self;
+        this.pool.install(|| {
+            (vx.par_chunks_mut(BLOCK), vy.par_chunks_mut(BLOCK), ar.par_chunks_mut(BLOCK))
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(k, (vx, vy, ar))| {
+                    for j in 0..vx.len() {
+                        (vx[j], vy[j], ar[j]) = this.intent_of(k * BLOCK + j);
+                    }
+                });
+        });
+        (self.vel_x, self.vel_y, self.arrive) = (vx, vy, ar);
     }
 
     // ---------------------------------------------------------------- phase 5
 
-    fn phase_move(&mut self) {
+    /// Position of unit `i` after walking and soft separation, before
+    /// terrain blocking is resolved. Reads start-of-tick positions only.
+    #[inline]
+    fn move_of(&self, i: usize) -> (i32, i32) {
         let r = self.rules.separation_radius.0 as i64;
         let r2 = r * r;
         let cap = (r / 8).max(1);
         let max_x = (self.map.width() as i32) * ONE - 1;
         let max_y = (self.map.height() as i32) * ONE - 1;
         let u = &self.units;
-        for i in 0..u.len() {
-            let (x, y) = (u.pos_x[i], u.pos_y[i]);
-            // Soft separation, pulled from neighbours' start-of-tick positions.
-            let (mut px, mut py) = (0i64, 0i64);
-            if r > 0 {
-                self.grid.for_each_near(x, y, |j| {
-                    if j == i {
-                        return;
-                    }
-                    let d2 = dist2(u.pos_x[j], u.pos_y[j], x, y);
-                    if d2 >= r2 {
-                        return;
-                    }
-                    let (mut dx, mut dy) = ((x - u.pos_x[j]) as i64, (y - u.pos_y[j]) as i64);
-                    let mut d = isqrt_u64(d2 as u64) as i64;
-                    if d == 0 {
-                        // Same spot: split along a direction derived from the
-                        // pair, opposite for the two units.
-                        let (a, b) = (u.slot[i].min(u.slot[j]), u.slot[i].max(u.slot[j]));
-                        let h = rand(self.seed, a, b, Purpose::Separation);
-                        dx = ((h & 0xFFFF) as i64) - 0x8000;
-                        dy = (((h >> 16) & 0xFFFF) as i64) - 0x8000;
-                        if dx == 0 && dy == 0 {
-                            dx = 1;
-                        }
-                        if u.slot[i] > u.slot[j] {
-                            dx = -dx;
-                            dy = -dy;
-                        }
-                        d = isqrt_u64((dx * dx + dy * dy) as u64) as i64;
-                    }
-                    let overlap = r - isqrt_u64(d2 as u64) as i64;
-                    px += dx * overlap / (2 * d);
-                    py += dy * overlap / (2 * d);
-                });
-                let len = isqrt_u64((px * px + py * py) as u64) as i64;
-                if len > cap {
-                    px = px * cap / len;
-                    py = py * cap / len;
+        let (x, y) = (u.pos_x[i], u.pos_y[i]);
+        // Soft separation, pulled from neighbours' start-of-tick positions.
+        let (mut px, mut py) = (0i64, 0i64);
+        if r > 0 {
+            self.grid.for_each_near(x, y, |j| {
+                if j == i {
+                    return;
                 }
+                let d2 = dist2(u.pos_x[j], u.pos_y[j], x, y);
+                if d2 >= r2 {
+                    return;
+                }
+                let (mut dx, mut dy) = ((x - u.pos_x[j]) as i64, (y - u.pos_y[j]) as i64);
+                let dist = isqrt_u64(d2 as u64) as i64;
+                let mut d = dist;
+                if d == 0 {
+                    // Same spot: split along a direction derived from the
+                    // pair, opposite for the two units.
+                    let (a, b) = (u.slot[i].min(u.slot[j]), u.slot[i].max(u.slot[j]));
+                    let h = rand(self.seed, a, b, Purpose::Separation);
+                    dx = ((h & 0xFFFF) as i64) - 0x8000;
+                    dy = (((h >> 16) & 0xFFFF) as i64) - 0x8000;
+                    if dx == 0 && dy == 0 {
+                        dx = 1;
+                    }
+                    if u.slot[i] > u.slot[j] {
+                        dx = -dx;
+                        dy = -dy;
+                    }
+                    d = isqrt_u64((dx * dx + dy * dy) as u64) as i64;
+                }
+                let overlap = r - dist;
+                px += dx * overlap / (2 * d);
+                py += dy * overlap / (2 * d);
+            });
+            let len = isqrt_u64((px * px + py * py) as u64) as i64;
+            if len > cap {
+                px = px * cap / len;
+                py = py * cap / len;
             }
-            let nx = (x as i64 + self.vel_x[i] as i64 + px).clamp(0, max_x as i64) as i32;
-            let ny = (y as i64 + self.vel_y[i] as i64 + py).clamp(0, max_y as i64) as i32;
-            // Impassable tiles: slide along an axis, otherwise stay.
-            let pass =
-                |x: i32, y: i32| self.rules.passable[self.map.terrain_raw((x >> 16) as u32, (y >> 16) as u32) as usize];
-            let (fx, fy) = if pass(nx, ny) {
-                (nx, ny)
-            } else if pass(nx, y) {
-                (nx, y)
-            } else if pass(x, ny) {
-                (x, ny)
-            } else {
-                (x, y)
-            };
-            self.next_x[i] = fx;
-            self.next_y[i] = fy;
         }
+        let nx = (x as i64 + self.vel_x[i] as i64 + px).clamp(0, max_x as i64) as i32;
+        let ny = (y as i64 + self.vel_y[i] as i64 + py).clamp(0, max_y as i64) as i32;
+        // Impassable tiles: slide along an axis, otherwise stay.
+        let pass =
+            |x: i32, y: i32| self.rules.passable[self.map.terrain_raw((x >> 16) as u32, (y >> 16) as u32) as usize];
+        if pass(nx, ny) {
+            (nx, ny)
+        } else if pass(nx, y) {
+            (nx, y)
+        } else if pass(x, ny) {
+            (x, ny)
+        } else {
+            (x, y)
+        }
+    }
+
+    fn phase_move(&mut self) {
+        let (mut nx, mut ny) = (take(&mut self.next_x), take(&mut self.next_y));
+        let this = &*self;
+        this.pool.install(|| {
+            (nx.par_chunks_mut(BLOCK), ny.par_chunks_mut(BLOCK)).into_par_iter().enumerate().for_each(
+                |(k, (nx, ny))| {
+                    for j in 0..nx.len() {
+                        (nx[j], ny[j]) = this.move_of(k * BLOCK + j);
+                    }
+                },
+            );
+        });
+        (self.next_x, self.next_y) = (nx, ny);
     }
 
     fn phase_orders_and_terrain(&mut self) {
         let stuck_limit = (2 * self.rules.tick_rate).min(250) as u8;
-        for i in 0..self.units.len() {
-            // Waypoint progress and stuck detection.
-            if let Some((tx, ty)) = self.waypoint_target(i) {
-                let before = dist2(self.units.pos_x[i], self.units.pos_y[i], tx, ty);
-                let after = dist2(self.next_x[i], self.next_y[i], tx, ty);
-                let mut advance = self.arrive[i];
-                if !advance && self.units.flags[i] & flags::IN_COMBAT == 0 {
-                    if after >= before {
-                        self.units.stuck[i] = self.units.stuck[i].saturating_add(1);
-                        advance = self.units.stuck[i] >= stuck_limit;
-                    } else {
-                        self.units.stuck[i] = 0;
+        let n = self.units.len();
+        // 5b. Waypoint progress and stuck detection (parallel, per unit).
+        // `arrive` becomes "advance to the next waypoint".
+        let (mut adv, mut stuck) = (take(&mut self.arrive), take(&mut self.units.stuck));
+        let this = &*self;
+        this.pool.install(|| {
+            (adv.par_chunks_mut(BLOCK), stuck.par_chunks_mut(BLOCK)).into_par_iter().enumerate().for_each(
+                |(k, (adv, stuck))| {
+                    for j in 0..adv.len() {
+                        let i = k * BLOCK + j;
+                        let Some((tx, ty)) = this.waypoint_target(i) else {
+                            adv[j] = false;
+                            continue;
+                        };
+                        let before = dist2(this.units.pos_x[i], this.units.pos_y[i], tx, ty);
+                        let after = dist2(this.next_x[i], this.next_y[i], tx, ty);
+                        let mut a = adv[j];
+                        if !a && this.units.flags[i] & flags::IN_COMBAT == 0 {
+                            if after >= before {
+                                stuck[j] = stuck[j].saturating_add(1);
+                                a = stuck[j] >= stuck_limit;
+                            } else {
+                                stuck[j] = 0;
+                            }
+                        }
+                        if a {
+                            stuck[j] = 0;
+                        }
+                        adv[j] = a;
                     }
-                }
-                if advance {
-                    self.units.stuck[i] = 0;
-                    let o = self.units.order[i];
-                    let wp = self.units.waypoint[i] as usize + 1;
-                    if wp < self.orders.get(o).points.len() {
-                        self.units.waypoint[i] = wp as u8;
-                    } else {
-                        let next = self.orders.get(o).next;
-                        self.orders.retain(next);
-                        self.orders.release(o);
-                        self.units.order[i] = next;
-                        self.units.waypoint[i] = 0;
-                    }
-                }
+                },
+            );
+        });
+        self.units.stuck = stuck;
+        // 5c. Order transitions touch the shared order pool: sequential, in
+        // ascending unit order (same order of retains/releases as always).
+        for (i, &a) in adv.iter().enumerate().take(n) {
+            if !a {
+                continue;
             }
-            self.units.pos_x[i] = self.next_x[i];
-            self.units.pos_y[i] = self.next_y[i];
-            // Water and ships.
-            let t = self.map.terrain_raw((self.next_x[i] >> 16) as u32, (self.next_y[i] >> 16) as u32);
-            if t == Terrain::Water as u8 {
-                let w = self.units.water_ticks[i].saturating_add(1);
-                self.units.water_ticks[i] = w;
-                if w >= self.rules.ship_after_ticks {
-                    self.units.flags[i] |= flags::SHIP;
-                }
+            let o = self.units.order[i];
+            let wp = self.units.waypoint[i] as usize + 1;
+            if wp < self.orders.get(o).points.len() {
+                self.units.waypoint[i] = wp as u8;
             } else {
-                self.units.water_ticks[i] = 0;
-                self.units.flags[i] &= !flags::SHIP;
+                let next = self.orders.get(o).next;
+                self.orders.retain(next);
+                self.orders.release(o);
+                self.units.order[i] = next;
+                self.units.waypoint[i] = 0;
             }
-            self.units.row[i] = if self.units.flags[i] & flags::SHIP != 0 { SHIP_ROW as u8 } else { t };
         }
+        self.arrive = adv;
+        // 5d. Commit positions; water and ships (parallel).
+        let u = &mut self.units;
+        let (mut px, mut py, mut wt, mut fl, mut row) =
+            (take(&mut u.pos_x), take(&mut u.pos_y), take(&mut u.water_ticks), take(&mut u.flags), take(&mut u.row));
+        let this = &*self;
+        this.pool.install(|| {
+            (
+                px.par_chunks_mut(BLOCK),
+                py.par_chunks_mut(BLOCK),
+                wt.par_chunks_mut(BLOCK),
+                fl.par_chunks_mut(BLOCK),
+                row.par_chunks_mut(BLOCK),
+            )
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(k, (px, py, wt, fl, row))| {
+                    for j in 0..px.len() {
+                        let i = k * BLOCK + j;
+                        let (x, y) = (this.next_x[i], this.next_y[i]);
+                        (px[j], py[j]) = (x, y);
+                        let t = this.map.terrain_raw((x >> 16) as u32, (y >> 16) as u32);
+                        if t == Terrain::Water as u8 {
+                            wt[j] = wt[j].saturating_add(1);
+                            if wt[j] >= this.rules.ship_after_ticks {
+                                fl[j] |= flags::SHIP;
+                            }
+                        } else {
+                            wt[j] = 0;
+                            fl[j] &= !flags::SHIP;
+                        }
+                        row[j] = if fl[j] & flags::SHIP != 0 { SHIP_ROW as u8 } else { t };
+                    }
+                });
+        });
+        let u = &mut self.units;
+        (u.pos_x, u.pos_y, u.water_ticks, u.flags, u.row) = (px, py, wt, fl, row);
+    }
+
+    // ---------------------------------------------------------------- sleep
+
+    /// Marks "hot" chunks: a chunk is hot when units of two hostile teams are
+    /// in it or its 8 neighbours. Elsewhere no unit can have an enemy within
+    /// contact or territory radius (both far below a chunk), so combat and
+    /// enemy searches are skipped there (spec 5.3, sleeping chunks). This
+    /// only skips work that would find nothing: results are unchanged.
+    fn update_hot_chunks(&mut self) {
+        let (cw, ch) = (self.map.chunks_w() as usize, self.map.chunks_h() as usize);
+        self.chunk_mask.clear();
+        self.chunk_mask.resize(cw * ch, 0);
+        let u = &self.units;
+        for i in 0..u.len() {
+            let c = ((u.pos_y[i] >> 22) as usize) * cw + (u.pos_x[i] >> 22) as usize;
+            self.chunk_mask[c] |= self.team_bit[u.owner[i] as usize];
+        }
+        self.hot.clear();
+        self.hot.resize(cw * ch, false);
+        let mut hot = 0;
+        for cy in 0..ch {
+            for cx in 0..cw {
+                let mut m = 0u8;
+                for ny in cy.saturating_sub(1)..=(cy + 1).min(ch - 1) {
+                    for nx in cx.saturating_sub(1)..=(cx + 1).min(cw - 1) {
+                        m |= self.chunk_mask[ny * cw + nx];
+                    }
+                }
+                let h = m.count_ones() >= 2;
+                self.hot[cy * cw + cx] = h;
+                hot += h as u32;
+            }
+        }
+        self.stats.hot_chunks = hot;
+    }
+
+    #[inline]
+    fn is_hot(&self, x: i32, y: i32) -> bool {
+        self.hot[((y >> 22) as usize) * self.map.chunks_w() as usize + (x >> 22) as usize]
     }
 
     // ---------------------------------------------------------------- phase 6
 
-    fn phase_combat(&mut self) {
+    /// Damage unit `b` pulls from enemies in contact this tick, plus water,
+    /// starvation and empty-treasury damage.
+    #[inline]
+    fn damage_in(&self, b: usize) -> u32 {
         let r2 = self.rules.contact_r2;
-        let n = self.units.len();
-        // 6a. Contacts with enemies (positions after movement).
-        let mut in_combat = 0;
-        for i in 0..n {
-            let u = &self.units;
-            let (x, y, me) = (u.pos_x[i], u.pos_y[i], u.owner[i]);
-            let mut c = 0u16;
-            self.grid.for_each_near(x, y, |j| {
-                if self.enemies(me, u.owner[j]) && dist2(u.pos_x[j], u.pos_y[j], x, y) <= r2 {
-                    c = c.saturating_add(1);
+        let rl = &self.rules;
+        let u = &self.units;
+        let mut q16: u64 = 0;
+        if self.contacts[b] > 0 {
+            let (x, y, me) = (u.pos_x[b], u.pos_y[b], u.owner[b]);
+            let kb = u.kind[b] as usize;
+            let b_attacking = u.flags[b] & flags::ATTACKING != 0;
+            let def_terrain = if b_attacking { 1000 } else { rl.terrain_def[u.row[b] as usize].0 };
+            // The terrain strength multiplier ("atk" column) weakens a unit's
+            // defense as well as its attack: a heavy in forest is "slow and
+            // weak" (spec 2.3). With attack alone it would still beat a light.
+            let strength = rl.terrain_atk[u.row[b] as usize][kb].0;
+            let def = (rl.def[kb].0 * strength / 1000 * def_terrain / 1000).max(1) as u64;
+            let taken = if b_attacking { rl.attacker_taken.0 as u64 } else { 1000 };
+            self.grid.for_each_near(x, y, |a| {
+                if !self.enemies(me, u.owner[a]) || dist2(u.pos_x[a], u.pos_y[a], x, y) > r2 {
+                    return;
                 }
+                let ka = u.kind[a] as usize;
+                let f_hp = 32_768 + 32_768 * u.hp[a] as u64 / rl.max_hp as u64;
+                let f_m = 32_768 + 32_768 * u.morale[a] as u64 / rl.max_morale as u64;
+                let atk = (rl.atk[ka].0 * rl.terrain_atk[u.row[a] as usize][ka].0 / 1000) as u64;
+                let mut d = (rl.base_dmg_q16 * f_hp) >> 16;
+                d = (d * f_m) >> 16;
+                d = d * atk / def;
+                d = d * taken / 1000;
+                q16 += d / self.contacts[a].max(1) as u64;
             });
-            self.contacts[i] = c;
-            let mut f = self.units.flags[i] & !(flags::IN_COMBAT | flags::ATTACKING);
-            if c > 0 {
-                in_combat += 1;
-                f |= flags::IN_COMBAT;
-                if self.units.order[i] != NO_ORDER {
-                    f |= flags::ATTACKING;
-                }
-            }
-            self.units.flags[i] = f;
         }
+        if u.row[b] == Terrain::Water as u8 {
+            q16 += rl.water_dmg_q16;
+        }
+        q16 += u.starve[b] as u64;
+        if self.player[u.owner[b] as usize].broke && self.friendly_city_at(u.pos_x[b], u.pos_y[b], u.owner[b]).is_none()
+        {
+            q16 += rl.broke_starve_q16;
+        }
+        let dmg = stochastic_round_q16(q16, rand(self.seed, self.tick, u.slot[b], Purpose::Damage));
+        dmg.min(u32::MAX as u64) as u32
+    }
+
+    fn phase_combat(&mut self) {
+        self.update_hot_chunks();
+        let r2 = self.rules.contact_r2;
+        // 6a. Contacts with enemies (positions after movement).
+        let (mut contacts, mut fl) = (take(&mut self.contacts), take(&mut self.units.flags));
+        let this = &*self;
+        let in_combat: u32 = this.pool.install(|| {
+            (contacts.par_chunks_mut(BLOCK), fl.par_chunks_mut(BLOCK))
+                .into_par_iter()
+                .enumerate()
+                .map(|(k, (contacts, fl))| {
+                    let u = &this.units;
+                    let mut count = 0u32;
+                    for j in 0..contacts.len() {
+                        let i = k * BLOCK + j;
+                        let (x, y, me) = (u.pos_x[i], u.pos_y[i], u.owner[i]);
+                        let mut c = 0u16;
+                        if this.is_hot(x, y) {
+                            this.grid.for_each_near(x, y, |j| {
+                                if this.enemies(me, u.owner[j]) && dist2(u.pos_x[j], u.pos_y[j], x, y) <= r2 {
+                                    c = c.saturating_add(1);
+                                }
+                            });
+                        }
+                        contacts[j] = c;
+                        let mut f = fl[j] & !(flags::IN_COMBAT | flags::ATTACKING);
+                        if c > 0 {
+                            count += 1;
+                            f |= flags::IN_COMBAT;
+                            if u.order[i] != NO_ORDER {
+                                f |= flags::ATTACKING;
+                            }
+                        }
+                        fl[j] = f;
+                    }
+                    count
+                })
+                .sum()
+        });
+        (self.contacts, self.units.flags) = (contacts, fl);
         self.stats.units_in_combat = in_combat;
 
         // 6b. Each unit pulls the damage dealt to it by enemies in contact.
-        let rl = &self.rules;
-        for b in 0..n {
-            let u = &self.units;
-            let mut q16: u64 = 0;
-            if self.contacts[b] > 0 {
-                let (x, y, me) = (u.pos_x[b], u.pos_y[b], u.owner[b]);
-                let kb = u.kind[b] as usize;
-                let b_attacking = u.flags[b] & flags::ATTACKING != 0;
-                let def_terrain = if b_attacking { 1000 } else { rl.terrain_def[u.row[b] as usize].0 };
-                // The terrain strength multiplier ("atk" column) weakens a unit's
-                // defense as well as its attack: a heavy in forest is "slow and
-                // weak" (spec 2.3). With attack alone it would still beat a light.
-                let strength = rl.terrain_atk[u.row[b] as usize][kb].0;
-                let def = (rl.def[kb].0 * strength / 1000 * def_terrain / 1000).max(1) as u64;
-                let taken = if b_attacking { rl.attacker_taken.0 as u64 } else { 1000 };
-                self.grid.for_each_near(x, y, |a| {
-                    if !self.enemies(me, u.owner[a]) || dist2(u.pos_x[a], u.pos_y[a], x, y) > r2 {
-                        return;
-                    }
-                    let ka = u.kind[a] as usize;
-                    let f_hp = 32_768 + 32_768 * u.hp[a] as u64 / rl.max_hp as u64;
-                    let f_m = 32_768 + 32_768 * u.morale[a] as u64 / rl.max_morale as u64;
-                    let atk = (rl.atk[ka].0 * rl.terrain_atk[u.row[a] as usize][ka].0 / 1000) as u64;
-                    let mut d = (rl.base_dmg_q16 * f_hp) >> 16;
-                    d = (d * f_m) >> 16;
-                    d = d * atk / def;
-                    d = d * taken / 1000;
-                    q16 += d / self.contacts[a].max(1) as u64;
-                });
-            }
-            if u.row[b] == Terrain::Water as u8 {
-                q16 += rl.water_dmg_q16;
-            }
-            q16 += u.starve[b] as u64;
-            if self.player[u.owner[b] as usize].broke
-                && self.friendly_city_at(u.pos_x[b], u.pos_y[b], u.owner[b]).is_none()
-            {
-                q16 += rl.broke_starve_q16;
-            }
-            let dmg = stochastic_round_q16(q16, rand(self.seed, self.tick, u.slot[b], Purpose::Damage));
-            self.dmg_in[b] = dmg.min(u32::MAX as u64) as u32;
-        }
-
-        // 6c. Apply damage and morale.
-        for i in 0..n {
-            let u = &mut self.units;
-            u.hp[i] = u.hp[i].saturating_sub(self.dmg_in[i].min(u16::MAX as u32) as u16);
-            let f = u.flags[i];
-            let r = rand(self.seed, self.tick, u.slot[i], Purpose::Morale);
-            u.calm[i] = if f & flags::IN_COMBAT != 0 { 0 } else { u.calm[i].saturating_add(1) };
-            if f & flags::IN_COMBAT != 0 {
-                let loss_q16 = if f & flags::ATTACKING != 0 {
-                    self.rules.morale_loss_attack_q16
-                } else {
-                    self.rules.morale_loss_defend_q16
-                };
-                let loss = stochastic_round_q16(loss_q16, r).min(u16::MAX as u64) as u16;
-                u.morale[i] = u.morale[i].saturating_sub(loss);
-                if u.morale[i] == 0 && f & flags::ATTACKING != 0 {
-                    // Broken attack: the order is cancelled, the unit holds.
-                    let o = std::mem::replace(&mut u.order[i], NO_ORDER);
-                    u.waypoint[i] = 0;
-                    u.flags[i] &= !flags::ATTACKING;
-                    self.orders.release(o);
+        let mut dmg = take(&mut self.dmg_in);
+        let this = &*self;
+        this.pool.install(|| {
+            dmg.par_chunks_mut(BLOCK).enumerate().for_each(|(k, dmg)| {
+                for (j, d) in dmg.iter_mut().enumerate() {
+                    *d = this.damage_in(k * BLOCK + j);
                 }
-            } else {
-                let gain = stochastic_round_q16(self.rules.morale_regen_q16, r).min(u16::MAX as u64) as u16;
-                u.morale[i] = u.morale[i].saturating_add(gain).min(self.rules.max_morale);
-            }
+            });
+        });
+        self.dmg_in = dmg;
+
+        // 6c. Apply damage and morale; broken attacks drop their orders. The
+        // releases touch the shared order pool, so they are collected per
+        // block and applied afterwards in ascending unit order.
+        let u = &mut self.units;
+        let (mut hp, mut mo, mut ca, mut fl, mut ord, mut wp) = (
+            take(&mut u.hp),
+            take(&mut u.morale),
+            take(&mut u.calm),
+            take(&mut u.flags),
+            take(&mut u.order),
+            take(&mut u.waypoint),
+        );
+        let this = &*self;
+        let released: Vec<Vec<u32>> = this.pool.install(|| {
+            (
+                hp.par_chunks_mut(BLOCK),
+                mo.par_chunks_mut(BLOCK),
+                ca.par_chunks_mut(BLOCK),
+                fl.par_chunks_mut(BLOCK),
+                ord.par_chunks_mut(BLOCK),
+                wp.par_chunks_mut(BLOCK),
+            )
+                .into_par_iter()
+                .enumerate()
+                .map(|(k, (hp, mo, ca, fl, ord, wp))| {
+                    let rules = &this.rules;
+                    let mut released = Vec::new();
+                    for j in 0..hp.len() {
+                        let i = k * BLOCK + j;
+                        hp[j] = hp[j].saturating_sub(this.dmg_in[i].min(u16::MAX as u32) as u16);
+                        let f = fl[j];
+                        let r = rand(this.seed, this.tick, this.units.slot[i], Purpose::Morale);
+                        ca[j] = if f & flags::IN_COMBAT != 0 { 0 } else { ca[j].saturating_add(1) };
+                        if f & flags::IN_COMBAT != 0 {
+                            let loss_q16 = if f & flags::ATTACKING != 0 {
+                                rules.morale_loss_attack_q16
+                            } else {
+                                rules.morale_loss_defend_q16
+                            };
+                            let loss = stochastic_round_q16(loss_q16, r).min(u16::MAX as u64) as u16;
+                            mo[j] = mo[j].saturating_sub(loss);
+                            if mo[j] == 0 && f & flags::ATTACKING != 0 {
+                                // Broken attack: the order is cancelled, the unit holds.
+                                released.push(std::mem::replace(&mut ord[j], NO_ORDER));
+                                wp[j] = 0;
+                                fl[j] &= !flags::ATTACKING;
+                            }
+                        } else {
+                            let gain = stochastic_round_q16(rules.morale_regen_q16, r).min(u16::MAX as u64) as u16;
+                            mo[j] = mo[j].saturating_add(gain).min(rules.max_morale);
+                        }
+                    }
+                    released
+                })
+                .collect()
+        });
+        let u = &mut self.units;
+        (u.hp, u.morale, u.calm, u.flags, u.order, u.waypoint) = (hp, mo, ca, fl, ord, wp);
+        for o in released.into_iter().flatten() {
+            self.orders.release(o);
         }
     }
 
     // ---------------------------------------------------------------- phase 7
 
+    /// Territory: candidate tiles are found in parallel from the
+    /// start-of-phase map; writes are applied in ascending unit order with
+    /// the ally check repeated, which gives exactly the sequential result.
     fn phase_territory(&mut self) {
-        let changed = territory::paint(
-            &mut self.map,
-            &self.units,
-            &self.grid,
-            &self.team,
-            self.rules.territory_radius,
-            &mut self.dirty_chunks,
-            &mut self.enemies_scratch,
-        );
+        let mut out = take(&mut self.paint_scratch);
+        let this = &*self;
+        let n = this.units.len();
+        let blocks = n.div_ceil(BLOCK);
+        out.resize_with(blocks.max(out.len()), Vec::new);
+        this.pool.install(|| {
+            out[..blocks].par_iter_mut().enumerate().for_each(|(k, out)| {
+                out.clear();
+                let mut enemies = Vec::new();
+                for i in k * BLOCK..((k + 1) * BLOCK).min(n) {
+                    if (this.tick + this.units.slot[i]) % territory::PAINT_INTERVAL != 0 {
+                        continue;
+                    }
+                    let hot = this.is_hot(this.units.pos_x[i], this.units.pos_y[i]);
+                    territory::paint_candidates(
+                        &this.map,
+                        &this.units,
+                        &this.grid,
+                        &this.team,
+                        this.rules.territory_radius,
+                        i,
+                        hot,
+                        &mut enemies,
+                        out,
+                    );
+                }
+            });
+        });
+        let changed = territory::apply_paint(&mut self.map, &self.team, &out[..blocks], &mut self.dirty_chunks);
+        self.paint_scratch = out;
         self.territory_changed |= changed;
     }
 
@@ -875,17 +1174,30 @@ impl World {
                 self.pocket_limit[l as usize] += per_city;
             }
         }
+        // Pocket of every unit (parallel), then supply used per pocket
+        // (integer sums: order does not matter).
+        let mut pocket = take(&mut self.units.pocket);
+        let this = &*self;
+        this.pool.install(|| {
+            pocket.par_chunks_mut(BLOCK).enumerate().for_each(|(k, pocket)| {
+                let u = &this.units;
+                for (j, p) in pocket.iter_mut().enumerate() {
+                    let i = k * BLOCK + j;
+                    *p = territory::unit_pocket(
+                        &this.map,
+                        &this.labels,
+                        u.owner[i],
+                        u.pos_x[i],
+                        u.pos_y[i],
+                        this.rules.territory_radius,
+                    );
+                }
+            });
+        });
+        self.units.pocket = pocket;
         let u = &mut self.units;
         for i in 0..u.len() {
-            let p = territory::unit_pocket(
-                &self.map,
-                &self.labels,
-                u.owner[i],
-                u.pos_x[i],
-                u.pos_y[i],
-                self.rules.territory_radius,
-            );
-            u.pocket[i] = p;
+            let p = u.pocket[i];
             if p != NO_POCKET {
                 self.pocket_used[p as usize] += self.rules.supply[u.kind[i] as usize];
             }
@@ -919,29 +1231,41 @@ impl World {
             self.recompute_supply();
         }
         // Healing: out of combat long enough, not starving, on friendly land.
-        for i in 0..self.units.len() {
-            let u = &self.units;
-            if u.calm[i] < self.rules.heal_delay_ticks
-                || u.starve[i] != 0
-                || u.hp[i] >= self.rules.max_hp
-                || u.row[i] == Terrain::Water as u8
-            {
-                continue;
-            }
-            let (x, y, me) = (u.pos_x[i], u.pos_y[i], u.owner[i]);
-            let tile_owner = self.map.owner((x >> 16) as u32, (y >> 16) as u32);
-            if tile_owner == 0 || self.enemies(tile_owner, me) {
-                continue;
-            }
-            let in_city = self.friendly_city_at(x, y, me).is_some();
-            if self.player[me as usize].broke && !in_city {
-                continue;
-            }
-            let q16 = if in_city { self.rules.heal_city_q16 } else { self.rules.heal_q16 };
-            let heal = stochastic_round_q16(q16, rand(self.seed, self.tick, u.slot[i], Purpose::Environment));
-            let hp = (self.units.hp[i] as u64 + heal).min(self.rules.max_hp as u64);
-            self.units.hp[i] = hp as u16;
+        let mut hp = take(&mut self.units.hp);
+        let this = &*self;
+        this.pool.install(|| {
+            hp.par_chunks_mut(BLOCK).enumerate().for_each(|(k, hp)| {
+                for (j, h) in hp.iter_mut().enumerate() {
+                    *h = this.healed_hp(k * BLOCK + j, *h);
+                }
+            });
+        });
+        self.units.hp = hp;
+    }
+
+    /// HP of unit `i` after this tick's healing (`hp` is its current HP).
+    #[inline]
+    fn healed_hp(&self, i: usize, hp: u16) -> u16 {
+        let u = &self.units;
+        if u.calm[i] < self.rules.heal_delay_ticks
+            || u.starve[i] != 0
+            || hp >= self.rules.max_hp
+            || u.row[i] == Terrain::Water as u8
+        {
+            return hp;
         }
+        let (x, y, me) = (u.pos_x[i], u.pos_y[i], u.owner[i]);
+        let tile_owner = self.map.owner((x >> 16) as u32, (y >> 16) as u32);
+        if tile_owner == 0 || self.enemies(tile_owner, me) {
+            return hp;
+        }
+        let in_city = self.friendly_city_at(x, y, me).is_some();
+        if self.player[me as usize].broke && !in_city {
+            return hp;
+        }
+        let q16 = if in_city { self.rules.heal_city_q16 } else { self.rules.heal_q16 };
+        let heal = stochastic_round_q16(q16, rand(self.seed, self.tick, u.slot[i], Purpose::Environment));
+        (hp as u64 + heal).min(self.rules.max_hp as u64) as u16
     }
 
     // ---------------------------------------------------------------- phase 9
@@ -1169,6 +1493,14 @@ impl World {
         }
         c
     }
+}
+
+fn make_pool(n: usize) -> Result<rayon::ThreadPool, String> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .thread_name(|k| format!("sim-{k}"))
+        .build()
+        .map_err(|e| format!("cannot start simulation threads: {e}"))
 }
 
 /// Largest distance a unit can move in one tick (walking plus separation push).

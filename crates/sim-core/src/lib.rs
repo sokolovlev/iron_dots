@@ -29,11 +29,11 @@ pub use fx::{Fx, FxPoint, Milli};
 pub use map::{Map, MapSource, Terrain};
 pub use replay::Replay;
 pub use unit::{UnitHandle, UnitKind};
-pub use world::{City, PlayerSetup, PlayerState, World};
+pub use world::{City, Phase, PlayerSetup, PlayerState, World};
 
 /// Version of the simulation code. Bump on any change that can alter the
 /// outcome of a replay; CI fails if a golden replay hash changes without it.
-pub const SIM_CODE_VERSION: u32 = 2;
+pub const SIM_CODE_VERSION: u32 = 3;
 
 /// Full simulation version: code version plus balance content (spec 6.5).
 /// Only clients with equal `sim_version` can play together.

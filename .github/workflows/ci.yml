@@ -68,7 +68,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --release -p headless -- bench --map 1024 --units 5000 --players 2 --ticks 600
-      - run: cargo run --release -p headless -- bench --map 256 --units 2000 --players 4 --ticks 1200
+      - run: cargo run --release -p headless -- bench --map 1024 --units 5000 --players 2 --ticks 600 --threads 4
+      - run: cargo run --release -p headless -- bench --map 256 --units 2000 --players 4 --ticks 1200 --threads 4
+      - run: cargo run --release -p headless -- bench --map 4096 --units 12500 --players 8 --ticks 150 --threads 4
+      # Tracy instrumentation must keep compiling.
+      - run: cargo build --release -p headless --features tracy
       # Stage 2 exit criterion, automated: bots play a full match to victory.
       - run: cargo run --release -p headless -- match --map 256 --players 2 --seed 1 --ticks 45000
 
