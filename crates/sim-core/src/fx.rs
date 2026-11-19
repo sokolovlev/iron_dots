@@ -214,22 +214,12 @@ impl<'de> Deserialize<'de> for Milli {
     }
 }
 
-/// Integer square root of a `u64` (floor). Deterministic, no floats.
+/// Integer square root of a `u64` (floor). Deterministic, no floats: the
+/// standard library's exact integer algorithm (several times faster than a
+/// Newton iteration with 64-bit divisions).
 #[inline]
 pub const fn isqrt_u64(n: u64) -> u64 {
-    if n < 2 {
-        return n;
-    }
-    // Initial guess: 2^(ceil(bits/2)) is always >= sqrt(n).
-    let bits = 64 - n.leading_zeros();
-    let mut x = 1u64 << bits.div_ceil(2);
-    loop {
-        let y = (x + n / x) >> 1;
-        if y >= x {
-            return x;
-        }
-        x = y;
-    }
+    n.isqrt()
 }
 
 /// Length of the vector `(dx, dy)` in [`Fx`] units (floor).

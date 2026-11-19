@@ -21,8 +21,8 @@ struct Golden {
 }
 
 const GOLDEN: &[Golden] = &[
-    Golden { name: "duel-128", map: 128, units: 200, players: 2, seed: 1, ticks: 2400, hash: 0xadb7_11df_cedc_1ad8 },
-    Golden { name: "ffa4-128", map: 128, units: 100, players: 4, seed: 7, ticks: 2400, hash: 0x9eef_267f_0ea1_1564 },
+    Golden { name: "duel-128", map: 128, units: 200, players: 2, seed: 1, ticks: 2400, hash: 0x7cb8_7f48_a4fd_c95b },
+    Golden { name: "ffa4-128", map: 128, units: 100, players: 4, seed: 7, ticks: 2400, hash: 0x943a_f9a0_8018_6ca0 },
 ];
 
 #[test]
@@ -133,4 +133,39 @@ fn standard_match_is_independent_of_thread_count() {
         finals.push(w.state_hash());
     }
     assert!(finals.windows(2).all(|p| p[0] == p[1]), "{finals:x?}");
+}
+
+/// Stage 4 exit criterion: every SIMD level this CPU supports gives the same
+/// checkpoints as the scalar reference kernels (CI adds AVX-512 and NEON
+/// machines where available).
+#[test]
+fn hash_is_independent_of_simd_level() {
+    use simd_kernels::{Kernels, Level};
+    let b = Balance::default_balance();
+    let levels: Vec<Level> = Level::ALL.into_iter().filter(|l| Kernels::get(*l).is_some()).collect();
+    assert!(levels.contains(&Level::Scalar));
+    let mut runs = Vec::new();
+    for &level in &levels {
+        for scenario in [ScenarioSpec::battle(256, 3000, 3, 11).unwrap(), ScenarioSpec::front(256, 1500, 2).unwrap()] {
+            let mut w = scenario.build(&b).unwrap();
+            w.set_simd_level(level).unwrap();
+            w.set_threads(2).unwrap();
+            let mut bots: Vec<ScriptedPlayer> = (1..=w.player_count()).map(ScriptedPlayer::new).collect();
+            let mut hashes = Vec::new();
+            for _ in 0..600 {
+                let cmds: Vec<_> = bots.iter_mut().flat_map(|bot| bot.think(&w)).collect();
+                w.step(&cmds);
+                if w.tick() % 30 == 0 {
+                    hashes.push(w.state_hash());
+                }
+            }
+            runs.push((level, hashes));
+        }
+    }
+    println!("levels: {:?}", levels.iter().map(|l| l.name()).collect::<Vec<_>>());
+    let (scalar_battle, scalar_front) = (&runs[0].1, &runs[1].1);
+    for pair in runs.chunks(2).skip(1) {
+        assert_eq!(&pair[0].1, scalar_battle, "{} differs from scalar (battle)", pair[0].0.name());
+        assert_eq!(&pair[1].1, scalar_front, "{} differs from scalar (front)", pair[1].0.name());
+    }
 }

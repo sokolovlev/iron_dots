@@ -34,7 +34,15 @@ fixed-point SoA core, spatial grid, movement, combat with morale, replays, golde
 - [x] Per-phase profiling in `bench`, optional Tracy spans (`--features tracy`)
 - 100 000 units on 4096²: 24 ms → 8 ms per tick with 4 threads (see [ARCHITECTURE.md](ARCHITECTURE.md#performance-stage-3-parallel-still-scalar))
 
-Next: stage 4, SIMD kernels with runtime dispatch and scalar reference versions.
+**Stage 4: SIMD** ✓ (with an open performance question, see below)
+
+- [x] `simd-kernels` crate: auto-vectorised integer kernels compiled for SSE4.2 / AVX2 / AVX-512 / NEON, picked once at start-up
+- [x] Scalar reference kernels; property tests prove bit-identical results at every level; Miri in CI
+- [x] Neighbour searches run on contiguous grid-ordered slices; units are re-sorted spatially every 8 ticks
+- [x] The hash is identical at every SIMD level (tested) and on 1–16 threads
+- 10 000 units on 1024² with 4 threads: 1.4 ms marching, 2.5 ms on a full front line. The weak-PC target (≤ 3 ms) is met; ≤ 1 ms on the 12-thread reference PC still has to be shown ([details](ARCHITECTURE.md#performance-stage-4-parallel--simd))
+
+Next: stage 5, hierarchical flow-field pathfinding, 4096² maps, sandbox mode and rendering LOD.
 
 ## Play
 
@@ -89,13 +97,14 @@ pass `--balance FILE` to the headless runner to try another one.
 
 | Crate | What it is |
 |---|---|
+| `crates/simd-kernels` | SIMD kernels with scalar references and runtime CPU dispatch (the only `unsafe`) |
 | `crates/sim-core` | Deterministic simulation: world, tick phases, commands, pathfinding, replays |
 | `crates/ai` | Bots: read the world, issue ordinary commands; deterministic |
 | `crates/render` | wgpu renderer: map, territory, borders, instanced markers, overlay |
 | `crates/client` | `iron-dots`: window, input, egui UI, offscreen screenshots |
 | `crates/headless` | `iron-dots-headless`: matches, replays, determinism checks, benchmarks |
 
-Later stages add `simd-kernels`, `pathing` (flow fields), `net`, `relay-server`
+Later stages add `pathing` (flow fields), `net`, `relay-server`
 and `editor`. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Contributing

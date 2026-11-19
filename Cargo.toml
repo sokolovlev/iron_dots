@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/sim-core", "crates/ai", "crates/render", "crates/client", "crates/headless"]
+members = ["crates/simd-kernels", "crates/sim-core", "crates/ai", "crates/render", "crates/client", "crates/headless"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 sim-core = { path = "crates/sim-core" }
+simd-kernels = { path = "crates/simd-kernels" }
 ai = { path = "crates/ai" }
 render = { path = "crates/render" }
 wgpu = "30"

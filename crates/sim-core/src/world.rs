@@ -24,6 +24,7 @@ use crate::territory::{self, NO_POCKET, SUPPLY_INTERVAL};
 use crate::unit::{NO_ORDER, UnitHandle, UnitKind, UnitStore, flags};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use simd_kernels::{CHUNK, FAR, GROUP, Kernels, Level};
 use std::collections::BTreeMap;
 use std::mem::take;
 use std::sync::Arc;
@@ -32,6 +33,9 @@ use xxhash_rust::xxh3::Xxh3;
 /// Units per parallel work item. A fixed size (never derived from the
 /// thread count) keeps every result independent of how many threads run.
 pub const BLOCK: usize = 1024;
+
+/// Units are re-sorted into spatial (grid) order every this many ticks.
+pub const SORT_INTERVAL: u32 = 8;
 
 /// Max players per match (ids 1..=8; 0 is "nobody").
 pub const MAX_PLAYERS: usize = 8;
@@ -74,6 +78,63 @@ pub struct PlayerState {
     pub broke: bool,
     /// No cities and no units left.
     pub eliminated: bool,
+}
+
+/// Units of the 3×3 grid cells around one cell, copied into contiguous
+/// arrays (positions as in the grid's copy).
+#[derive(Default)]
+struct Hood {
+    cell: Option<(u32, u32)>,
+    xs: Vec<i32>,
+    ys: Vec<i32>,
+    teams: Vec<u8>,
+    ids: Vec<u32>,
+}
+
+impl Hood {
+    fn load(&mut self, g: &Grid, cell: (u32, u32)) {
+        if self.cell == Some(cell) {
+            return;
+        }
+        self.cell = Some(cell);
+        self.xs.clear();
+        self.ys.clear();
+        self.teams.clear();
+        self.ids.clear();
+        g.ranges_around_cell(cell.0, cell.1, |r| {
+            self.xs.extend_from_slice(&g.sx[r.clone()]);
+            self.ys.extend_from_slice(&g.sy[r.clone()]);
+            self.teams.extend_from_slice(&g.steam[r.clone()]);
+            self.ids.extend_from_slice(&g.cell_units[r]);
+        });
+        // Pad to whole kernel groups with points that never hit.
+        while self.xs.len() % GROUP != 0 {
+            self.xs.push(FAR);
+            self.ys.push(FAR);
+            self.teams.push(0);
+            self.ids.push(u32::MAX);
+        }
+    }
+
+    /// Calls `f(h)` for every hood entry `h` strictly within `sqrt(r2)` of
+    /// `(x, y)` and, with `enemy_of = Some(team)`, of another team.
+    #[inline]
+    fn query(&self, k: &Kernels, x: i32, y: i32, r2: i64, enemy_of: Option<u8>, mut f: impl FnMut(usize)) {
+        let mut start = 0;
+        while start < self.xs.len() {
+            let end = (start + CHUNK).min(self.xs.len());
+            let (xs, ys) = (&self.xs[start..end], &self.ys[start..end]);
+            let mut mask = match enemy_of {
+                None => k.within(xs, ys, x, y, r2),
+                Some(t) => k.enemies_within(xs, ys, &self.teams[start..end], t, x, y, r2),
+            };
+            while mask != 0 {
+                f(start + mask.trailing_zeros() as usize);
+                mask &= mask - 1;
+            }
+            start = end;
+        }
+    }
 }
 
 /// Tick phases as reported to the probe of [`World::step_with`].
@@ -176,6 +237,13 @@ pub struct World {
     hot: Vec<bool>,
     pool: Arc<rayon::ThreadPool>,
     threads: usize,
+    /// SIMD kernel table (chosen once per process; tests may pick a level).
+    kernels: &'static Kernels,
+    // Per-unit results computed in grid order.
+    push_sorted: Vec<(i32, i32)>,
+    strike: Vec<u64>,
+    contacts_sorted: Vec<u16>,
+    dmg_sorted: Vec<u32>,
 }
 
 impl World {
@@ -244,6 +312,11 @@ impl World {
             hot: Vec::new(),
             pool: Arc::new(make_pool(1)?),
             threads: 1,
+            kernels: simd_kernels::kernels(),
+            push_sorted: Vec::new(),
+            strike: Vec::new(),
+            contacts_sorted: Vec::new(),
+            dmg_sorted: Vec::new(),
         })
     }
 
@@ -260,6 +333,47 @@ impl World {
 
     pub fn threads(&self) -> usize {
         self.threads
+    }
+
+    /// Uses the SIMD kernels of `level` (results are identical at every
+    /// level; this exists for tests and benchmarks).
+    pub fn set_simd_level(&mut self, level: Level) -> Result<(), String> {
+        self.kernels = Kernels::get(level).ok_or_else(|| format!("this CPU cannot run {}", level.name()))?;
+        Ok(())
+    }
+
+    pub fn simd_level(&self) -> Level {
+        self.kernels.level()
+    }
+
+    /// Computes `f(i, hood)` for every unit `i`, walking units in grid order
+    /// in parallel blocks, and stores the results in grid order (`out[k]` is
+    /// for unit `grid.cell_units[k]`). `hood` holds the units of the 3×3
+    /// cells around `i`'s cell; it is gathered once per cell, so every unit
+    /// of a cell is tested against one contiguous SIMD-friendly buffer.
+    /// The hood is loaded only for units where `needs(i)` is true; `f`
+    /// gets `None` otherwise (sleeping chunks, no contacts).
+    fn par_by_grid<T: Send>(
+        &self,
+        out: &mut [T],
+        needs: impl Fn(usize) -> bool + Sync,
+        f: impl Fn(usize, Option<&Hood>) -> T + Sync,
+    ) {
+        let g = &self.grid;
+        self.pool.install(|| {
+            out.par_chunks_mut(BLOCK).enumerate().for_each(|(blk, out)| {
+                let mut hood = Hood::default();
+                for (j, o) in out.iter_mut().enumerate() {
+                    let i = g.cell_units[blk * BLOCK + j] as usize;
+                    *o = if needs(i) {
+                        hood.load(g, g.cell_of_unit(i));
+                        f(i, Some(&hood))
+                    } else {
+                        f(i, None)
+                    };
+                }
+            });
+        });
     }
 
     pub fn tick(&self) -> u32 {
@@ -448,7 +562,7 @@ impl World {
         self.stats = TickStats::default();
         self.prepare_scratch();
         phase!(Phase::Commands, self.apply_commands(commands));
-        phase!(Phase::Grid, self.grid.rebuild(&self.units.pos_x, &self.units.pos_y));
+        phase!(Phase::Grid, self.rebuild_grid());
         phase!(Phase::Intent, self.phase_intent());
         phase!(Phase::Move, {
             self.phase_move();
@@ -463,6 +577,23 @@ impl World {
             self.phase_spawn()
         });
         self.tick += 1;
+    }
+
+    /// Rebuilds the spatial grid. Every [`SORT_INTERVAL`] ticks the units
+    /// are also permuted into grid order (spec 5.1): neighbours on the map
+    /// become neighbours in memory, so the grid-order passes read the unit
+    /// arrays almost sequentially. Grid order is spatial (blocks of 32×32
+    /// cells, rows inside a block) and ties keep index order: deterministic.
+    fn rebuild_grid(&mut self) {
+        let u = &self.units;
+        self.grid.rebuild(&u.pos_x, &u.pos_y, &u.owner, &self.team);
+        if self.tick % SORT_INTERVAL == 0 && !self.units.is_empty() {
+            let order = take(&mut self.grid.cell_units);
+            self.units.permute(&order);
+            self.grid.cell_units = order;
+            let u = &self.units;
+            self.grid.rebuild(&u.pos_x, &u.pos_y, &u.owner, &self.team);
+        }
     }
 
     fn prepare_scratch(&mut self) {
@@ -731,59 +862,66 @@ impl World {
 
     // ---------------------------------------------------------------- phase 5
 
-    /// Position of unit `i` after walking and soft separation, before
-    /// terrain blocking is resolved. Reads start-of-tick positions only.
+    /// Soft separation push for unit `i` (capped), pulled from neighbours'
+    /// start-of-tick positions in `hood`.
     #[inline]
-    fn move_of(&self, i: usize) -> (i32, i32) {
+    fn separation_of(&self, i: usize, hood: &Hood) -> (i32, i32) {
         let r = self.rules.separation_radius.0 as i64;
+        if r == 0 {
+            return (0, 0);
+        }
         let r2 = r * r;
         let cap = (r / 8).max(1);
-        let max_x = (self.map.width() as i32) * ONE - 1;
-        let max_y = (self.map.height() as i32) * ONE - 1;
         let u = &self.units;
         let (x, y) = (u.pos_x[i], u.pos_y[i]);
-        // Soft separation, pulled from neighbours' start-of-tick positions.
         let (mut px, mut py) = (0i64, 0i64);
-        if r > 0 {
-            self.grid.for_each_near(x, y, |j| {
-                if j == i {
-                    return;
-                }
-                let d2 = dist2(u.pos_x[j], u.pos_y[j], x, y);
-                if d2 >= r2 {
-                    return;
-                }
-                let (mut dx, mut dy) = ((x - u.pos_x[j]) as i64, (y - u.pos_y[j]) as i64);
-                let dist = isqrt_u64(d2 as u64) as i64;
-                let mut d = dist;
-                if d == 0 {
-                    // Same spot: split along a direction derived from the
-                    // pair, opposite for the two units.
-                    let (a, b) = (u.slot[i].min(u.slot[j]), u.slot[i].max(u.slot[j]));
-                    let h = rand(self.seed, a, b, Purpose::Separation);
-                    dx = ((h & 0xFFFF) as i64) - 0x8000;
-                    dy = (((h >> 16) & 0xFFFF) as i64) - 0x8000;
-                    if dx == 0 && dy == 0 {
-                        dx = 1;
-                    }
-                    if u.slot[i] > u.slot[j] {
-                        dx = -dx;
-                        dy = -dy;
-                    }
-                    d = isqrt_u64((dx * dx + dy * dy) as u64) as i64;
-                }
-                let overlap = r - dist;
-                px += dx * overlap / (2 * d);
-                py += dy * overlap / (2 * d);
-            });
-            let len = isqrt_u64((px * px + py * py) as u64) as i64;
-            if len > cap {
-                px = px * cap / len;
-                py = py * cap / len;
+        hood.query(self.kernels, x, y, r2, None, |h| {
+            let j = hood.ids[h] as usize;
+            if j == i {
+                return;
             }
+            let (jx, jy) = (hood.xs[h], hood.ys[h]);
+            let d2 = dist2(jx, jy, x, y);
+            let (mut dx, mut dy) = ((x - jx) as i64, (y - jy) as i64);
+            let dist = isqrt_u64(d2 as u64) as i64;
+            let mut d = dist;
+            if d == 0 {
+                // Same spot: split along a direction derived from the
+                // pair, opposite for the two units.
+                let (a, b) = (u.slot[i].min(u.slot[j]), u.slot[i].max(u.slot[j]));
+                let h = rand(self.seed, a, b, Purpose::Separation);
+                dx = ((h & 0xFFFF) as i64) - 0x8000;
+                dy = (((h >> 16) & 0xFFFF) as i64) - 0x8000;
+                if dx == 0 && dy == 0 {
+                    dx = 1;
+                }
+                if u.slot[i] > u.slot[j] {
+                    dx = -dx;
+                    dy = -dy;
+                }
+                d = isqrt_u64((dx * dx + dy * dy) as u64) as i64;
+            }
+            let overlap = r - dist;
+            px += dx * overlap / (2 * d);
+            py += dy * overlap / (2 * d);
+        });
+        let len = isqrt_u64((px * px + py * py) as u64) as i64;
+        if len > cap {
+            px = px * cap / len;
+            py = py * cap / len;
         }
-        let nx = (x as i64 + self.vel_x[i] as i64 + px).clamp(0, max_x as i64) as i32;
-        let ny = (y as i64 + self.vel_y[i] as i64 + py).clamp(0, max_y as i64) as i32;
+        (px as i32, py as i32)
+    }
+
+    /// Position of unit `i` after walking and pushing by `(px, py)`, with
+    /// impassable tiles resolved.
+    #[inline]
+    fn move_of(&self, i: usize, (px, py): (i32, i32)) -> (i32, i32) {
+        let max_x = (self.map.width() as i32) * ONE - 1;
+        let max_y = (self.map.height() as i32) * ONE - 1;
+        let (x, y) = (self.units.pos_x[i], self.units.pos_y[i]);
+        let nx = (x as i64 + self.vel_x[i] as i64 + px as i64).clamp(0, max_x as i64) as i32;
+        let ny = (y as i64 + self.vel_y[i] as i64 + py as i64).clamp(0, max_y as i64) as i32;
         // Impassable tiles: slide along an axis, otherwise stay.
         let pass =
             |x: i32, y: i32| self.rules.passable[self.map.terrain_raw((x >> 16) as u32, (y >> 16) as u32) as usize];
@@ -799,18 +937,24 @@ impl World {
     }
 
     fn phase_move(&mut self) {
+        let mut push = take(&mut self.push_sorted);
+        push.resize(self.units.len(), (0, 0));
+        let separation = self.rules.separation_radius.0 > 0;
+        self.par_by_grid(&mut push, |_| separation, |i, hood| hood.map_or((0, 0), |h| self.separation_of(i, h)));
         let (mut nx, mut ny) = (take(&mut self.next_x), take(&mut self.next_y));
         let this = &*self;
+        let rank = &this.grid.rank;
         this.pool.install(|| {
             (nx.par_chunks_mut(BLOCK), ny.par_chunks_mut(BLOCK)).into_par_iter().enumerate().for_each(
                 |(k, (nx, ny))| {
                     for j in 0..nx.len() {
-                        (nx[j], ny[j]) = this.move_of(k * BLOCK + j);
+                        let i = k * BLOCK + j;
+                        (nx[j], ny[j]) = this.move_of(i, push[rank[i] as usize]);
                     }
                 },
             );
         });
-        (self.next_x, self.next_y) = (nx, ny);
+        (self.next_x, self.next_y, self.push_sorted) = (nx, ny, push);
     }
 
     fn phase_orders_and_terrain(&mut self) {
@@ -950,13 +1094,27 @@ impl World {
 
     /// Damage unit `b` pulls from enemies in contact this tick, plus water,
     /// starvation and empty-treasury damage.
+    /// Attacker's part of the damage formula for unit `a`, Q16 HP hundredths
+    /// per tick times attack in thousandths.
     #[inline]
-    fn damage_in(&self, b: usize) -> u32 {
+    fn strike_of(&self, a: usize) -> u64 {
+        let (u, rl) = (&self.units, &self.rules);
+        let ka = u.kind[a] as usize;
+        let f_hp = 32_768 + 32_768 * u.hp[a] as u64 / rl.max_hp as u64;
+        let f_m = 32_768 + 32_768 * u.morale[a] as u64 / rl.max_morale as u64;
+        let atk = (rl.atk[ka].0 * rl.terrain_atk[u.row[a] as usize][ka].0 / 1000) as u64;
+        let d = (rl.base_dmg_q16 * f_hp) >> 16;
+        ((d * f_m) >> 16) * atk
+    }
+
+    /// `hood` is the neighbourhood of `b`, given when `b` has contacts.
+    #[inline]
+    fn damage_in(&self, b: usize, hood: Option<&Hood>) -> u32 {
         let r2 = self.rules.contact_r2;
         let rl = &self.rules;
         let u = &self.units;
         let mut q16: u64 = 0;
-        if self.contacts[b] > 0 {
+        if let Some(hood) = hood.filter(|_| self.contacts[b] > 0) {
             let (x, y, me) = (u.pos_x[b], u.pos_y[b], u.owner[b]);
             let kb = u.kind[b] as usize;
             let b_attacking = u.flags[b] & flags::ATTACKING != 0;
@@ -967,19 +1125,14 @@ impl World {
             let strength = rl.terrain_atk[u.row[b] as usize][kb].0;
             let def = (rl.def[kb].0 * strength / 1000 * def_terrain / 1000).max(1) as u64;
             let taken = if b_attacking { rl.attacker_taken.0 as u64 } else { 1000 };
-            self.grid.for_each_near(x, y, |a| {
-                if !self.enemies(me, u.owner[a]) || dist2(u.pos_x[a], u.pos_y[a], x, y) > r2 {
-                    return;
-                }
-                let ka = u.kind[a] as usize;
-                let f_hp = 32_768 + 32_768 * u.hp[a] as u64 / rl.max_hp as u64;
-                let f_m = 32_768 + 32_768 * u.morale[a] as u64 / rl.max_morale as u64;
-                let atk = (rl.atk[ka].0 * rl.terrain_atk[u.row[a] as usize][ka].0 / 1000) as u64;
-                let mut d = (rl.base_dmg_q16 * f_hp) >> 16;
-                d = (d * f_m) >> 16;
-                d = d * atk / def;
-                d = d * taken / 1000;
-                q16 += d / self.contacts[a].max(1) as u64;
+            // Spec 2.8 formula, folded to one division per pair: the
+            // attacker's part (base × HP × morale × attack) is precomputed in
+            // `strike`, the defender's (defense × terrain, attacker penalty)
+            // and the split between the attacker's contacts are applied here.
+            let denom_b = def * 1000;
+            hood.query(self.kernels, x, y, r2 + 1, Some(self.team[me as usize]), |h| {
+                let a = hood.ids[h] as usize;
+                q16 += self.strike[a] * taken / (denom_b * self.contacts[a].max(1) as u64);
             });
         }
         if u.row[b] == Terrain::Water as u8 {
@@ -996,8 +1149,31 @@ impl World {
 
     fn phase_combat(&mut self) {
         self.update_hot_chunks();
+        // With no hot chunk anywhere nobody can be in contact: the grid
+        // passes below would find nothing, so they are skipped.
+        let any_hot = self.stats.hot_chunks > 0;
+        if any_hot {
+            // The kernels scan the grid's position copies: bring them up to date.
+            let (grid, units, pool) = (&mut self.grid, &self.units, &self.pool);
+            pool.install(|| grid.refresh_positions(&units.pos_x, &units.pos_y));
+        }
         let r2 = self.rules.contact_r2;
-        // 6a. Contacts with enemies (positions after movement).
+        // 6a. Contacts with enemies (positions after movement), counted in
+        // grid order, then copied to units.
+        let mut cs = take(&mut self.contacts_sorted);
+        cs.clear();
+        cs.resize(self.units.len(), 0);
+        if any_hot {
+            let hot = |i: usize| self.is_hot(self.units.pos_x[i], self.units.pos_y[i]);
+            self.par_by_grid(&mut cs, hot, |i, hood| {
+                let Some(hood) = hood else { return 0 };
+                let (x, y, me) = (self.units.pos_x[i], self.units.pos_y[i], self.units.owner[i]);
+                let mut c = 0u16;
+                hood.query(self.kernels, x, y, r2 + 1, Some(self.team[me as usize]), |_| c = c.saturating_add(1));
+                c
+            });
+        }
+        self.contacts_sorted = cs;
         let (mut contacts, mut fl) = (take(&mut self.contacts), take(&mut self.units.flags));
         let this = &*self;
         let in_combat: u32 = this.pool.install(|| {
@@ -1009,15 +1185,7 @@ impl World {
                     let mut count = 0u32;
                     for j in 0..contacts.len() {
                         let i = k * BLOCK + j;
-                        let (x, y, me) = (u.pos_x[i], u.pos_y[i], u.owner[i]);
-                        let mut c = 0u16;
-                        if this.is_hot(x, y) {
-                            this.grid.for_each_near(x, y, |j| {
-                                if this.enemies(me, u.owner[j]) && dist2(u.pos_x[j], u.pos_y[j], x, y) <= r2 {
-                                    c = c.saturating_add(1);
-                                }
-                            });
-                        }
+                        let c = this.contacts_sorted[this.grid.rank[i] as usize];
                         contacts[j] = c;
                         let mut f = fl[j] & !(flags::IN_COMBAT | flags::ATTACKING);
                         if c > 0 {
@@ -1036,21 +1204,56 @@ impl World {
         (self.contacts, self.units.flags) = (contacts, fl);
         self.stats.units_in_combat = in_combat;
 
-        // 6b. Each unit pulls the damage dealt to it by enemies in contact.
+        // 6b. Each unit pulls the damage dealt to it by enemies in contact
+        // (computed in grid order, then copied to units). First every unit
+        // in combat precomputes its strike.
+        if !any_hot {
+            // Only water, starvation and empty-treasury damage.
+            let mut dmg = take(&mut self.dmg_in);
+            let this = &*self;
+            this.pool.install(|| {
+                dmg.par_chunks_mut(BLOCK).enumerate().for_each(|(k, dmg)| {
+                    for (j, d) in dmg.iter_mut().enumerate() {
+                        *d = this.damage_in(k * BLOCK + j, None);
+                    }
+                });
+            });
+            self.dmg_in = dmg;
+            self.apply_damage_and_morale();
+            return;
+        }
+        let mut strike = take(&mut self.strike);
+        strike.resize(self.units.len(), 0);
+        let this = &*self;
+        this.pool.install(|| {
+            strike.par_chunks_mut(BLOCK).enumerate().for_each(|(k, st)| {
+                for (j, s) in st.iter_mut().enumerate() {
+                    let a = k * BLOCK + j;
+                    *s = if this.contacts[a] > 0 { this.strike_of(a) } else { 0 };
+                }
+            });
+        });
+        self.strike = strike;
+        let mut ds = take(&mut self.dmg_sorted);
+        ds.resize(self.units.len(), 0);
+        self.par_by_grid(&mut ds, |b| self.contacts[b] > 0, |b, hood| self.damage_in(b, hood));
         let mut dmg = take(&mut self.dmg_in);
         let this = &*self;
         this.pool.install(|| {
             dmg.par_chunks_mut(BLOCK).enumerate().for_each(|(k, dmg)| {
                 for (j, d) in dmg.iter_mut().enumerate() {
-                    *d = this.damage_in(k * BLOCK + j);
+                    *d = ds[this.grid.rank[k * BLOCK + j] as usize];
                 }
             });
         });
-        self.dmg_in = dmg;
+        (self.dmg_in, self.dmg_sorted) = (dmg, ds);
+        self.apply_damage_and_morale();
+    }
 
-        // 6c. Apply damage and morale; broken attacks drop their orders. The
-        // releases touch the shared order pool, so they are collected per
-        // block and applied afterwards in ascending unit order.
+    /// 6c. Apply damage and morale; broken attacks drop their orders. The
+    /// releases touch the shared order pool, so they are collected per
+    /// block and applied afterwards in ascending unit order.
+    fn apply_damage_and_morale(&mut self) {
         let u = &mut self.units;
         let (mut hp, mut mo, mut ca, mut fl, mut ord, mut wp) = (
             take(&mut u.hp),

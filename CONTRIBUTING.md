@@ -44,8 +44,20 @@ test proving bit-identical results.
 
 ## `unsafe`
 
-Forbidden everywhere except the future `simd-kernels` crate. There, every
-`unsafe` block needs a `// SAFETY:` comment and must be covered by Miri.
+Forbidden everywhere except `crates/simd-kernels`. There, every `unsafe`
+block needs a `// SAFETY:` comment (clippy enforces it) and must be covered
+by Miri:
+
+```bash
+PROPTEST_CASES=8 MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p simd-kernels
+```
+
+To check a kernel really vectorises, emit its assembly without LTO and look
+for `ymm`/`zmm` registers:
+
+```bash
+CARGO_PROFILE_RELEASE_LTO=false cargo rustc --release -p simd-kernels --lib -- --emit asm
+```
 
 ## Commits
 

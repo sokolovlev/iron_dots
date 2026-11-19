@@ -39,6 +39,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --release
+      # Same hash with the scalar reference kernels as with the best SIMD level.
+      - name: Scalar kernels
+        shell: bash
+        run: IRON_DOTS_SIMD=scalar cargo test --release -p sim-core --test determinism
       - name: Cross-platform replay hash
         shell: bash
         run: |
@@ -48,6 +52,20 @@ jobs:
         with:
           name: hash-${{ matrix.os }}
           path: hash.txt
+
+  # The only crate with `unsafe` (spec 3): its tests run under Miri.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo +nightly miri test -p simd-kernels
+        env:
+          PROPTEST_CASES: 8
+          # proptest stores failing cases on disk.
+          MIRIFLAGS: -Zmiri-disable-isolation
 
   compare-hashes:
     needs: test

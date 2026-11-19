@@ -1,0 +1,20 @@
+[package]
+name = "simd-kernels"
+description = "Iron Dots SIMD kernels with scalar references and runtime CPU dispatch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+# The only crate allowed to contain `unsafe` (spec 3): every block carries a
+# SAFETY comment, and the scalar path is checked by Miri in CI.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"

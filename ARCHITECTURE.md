@@ -86,6 +86,48 @@ only those chunks, and pockets are re-labelled only when territory changed.
 `headless` or `client` with `--features tracy` adds a `tracing` span per
 phase for the Tracy profiler.
 
+## SIMD (stage 4)
+
+`crates/simd-kernels` holds the vector code and is the only crate allowed
+`unsafe` (three calls through function pointers, each with a SAFETY comment;
+Miri runs its tests in CI).
+
+- **Kernels:** `within` (points strictly within a radius → 64-bit hit mask),
+  `enemies_within` (same, other team only), and `count_eq` (bytes equal to a
+  value, for territory statistics).
+- **One body, many targets.** Each kernel is plain integer Rust, written so
+  LLVM auto-vectorises it (fixed 16-lane groups, no early exits), and is
+  compiled per level with `#[target_feature]`: SSE4.2, AVX2, AVX-512 and NEON.
+  Differences are taken in `i32` (coordinates < 2²⁸), so squares use the
+  32×32→64-bit vector multiply. No intrinsics were needed (spec 5.5 rule 3).
+  The assembly was checked for `ymm`/`zmm` registers and `vpmuldq`.
+- **Scalar references** in `simd_kernels::reference` define the results
+  (written with `i128`). Property tests compare every available level with
+  them bit for bit.
+- **Dispatch once.** `simd_kernels::kernels()` picks the level at start-up from
+  CPUID (or `IRON_DOTS_SIMD=scalar|sse4.2|avx2|avx512|neon`). Calls go
+  through a table of function pointers, with no per-call checks.
+  `World::set_simd_level` overrides it in tests.
+- **Data the kernels can scan.** The grid keeps x, y and team copies in grid
+  order, so a row of cells is a contiguous slice. Per-unit queries run in
+  grid order: units of one cell share one neighbourhood buffer (≈ 60 units,
+  padded to whole 16-lane groups with far-away points), so each unit is
+  one long kernel call. Results are written in grid order and read back
+  through `grid.rank`.
+- **Spatial sorting (spec 5.1).** Every 8 ticks the unit arrays are permuted
+  into grid order. Neighbours on the map become neighbours in memory; this
+  costs O(n) because the grid order is already spatial.
+- **Fewer divisions.** Exact integer square roots use `u64::isqrt` (about 2×
+  faster than the old Newton loop; same results). The damage formula is
+  folded to one division per contact pair, with the attacker's part
+  precomputed once per tick. This and the sorting changed results
+  (`SIM_CODE_VERSION` 4).
+- **Where SIMD lost, it is not used.** The territory enemy check stays scalar:
+  its early exit beat the kernel (2.3 vs 2.8 ms in the front-line bench).
+
+`hash_is_independent_of_simd_level` runs a battle and a front line at every
+level the CPU supports and requires identical checkpoints.
+
 ## Data layout
 
 - `UnitStore`: one `Vec` per field (positions `i32` Q16.16, HP and morale
@@ -194,23 +236,36 @@ a **strength** multiplier applied to both attack and defense. With attack only,
 a heavy unit (base defense 1.5) would still beat a light one in forest and
 hills, which contradicts spec §2.3 ("slow and weak").
 
-## Performance (stage 3: parallel, still scalar)
+## Performance (stage 4: parallel + SIMD)
 
-`iron-dots-headless bench --threads N` on a 4-vCPU cloud VM (Xeon 2.1 GHz).
-Sandbox scenarios driven by scripted players; mean tick time:
+`iron-dots-headless bench`, best of 3 runs, mean tick on a 4-vCPU cloud VM
+(Xeon 2.1 GHz with AVX-512). "Stage 3" is the previous commit (scalar code);
+the stage 4 columns are the same scenario with the kernels at a forced level
+(`IRON_DOTS_SIMD`).
 
-| Scenario | 1 thread | 2 threads | 4 threads | Speed-up |
-|---|---|---|---|---|
-| 10 000 units, 1024², armies marching | 2.9 ms | — | 1.3 ms | 2.3× |
-| 10 000 units, one long front (`--scenario front`) | 8.2 ms | 4.9 ms | 3.2 ms | 2.6× |
-| 100 000 units, 4096², 8 players | 24.3 ms | 13.7 ms | 8.1 ms | 3.0× |
+| Scenario | Threads | Stage 3 | Reference kernels | SSE4.2 | AVX2 | AVX-512 |
+|---|---|---|---|---|---|---|
+| 10 000 units, 1024², marching | 1 | 2.90 ms | 3.95 ms | 2.52 ms | 2.33 ms | 2.41 ms |
+| | 4 | 1.27 ms | 1.81 ms | 1.38 ms | 1.37 ms | 1.44 ms |
+| 10 000 units, one front | 1 | 7.25 ms | 8.41 ms | 5.80 ms | 5.79 ms | 5.82 ms |
+| | 4 | 2.77 ms | 3.48 ms | 2.63 ms | 2.53 ms | 2.66 ms |
+| 100 000 units, 4096², 8 players | 1 | 23.9 ms | 30.1 ms | 18.7 ms | 18.0 ms | 18.2 ms |
+| | 4 | 7.99 ms | 10.4 ms | 7.46 ms | 7.33 ms | 7.06 ms |
 
-The stage 3 exit target is ≥ 4× on 8 threads. This VM has only 4 vCPUs, so
-that is measured in CI and on real hardware, not here. Scaling on 4 threads
-is 2.3–3.0×. What stays sequential is grid rebuild (~0.8 ms at 100k), order
-transitions, applying territory writes and the hot-chunk mask; these are the
-next candidates. Separation in the move phase is 60% of the tick and is the
-first SIMD target (stage 4).
+Single-threaded, the vector kernels plus sorting cut the tick by 16–25%. On
+4 threads the gain is smaller (0–9%) because the remaining sequential work
+(grid rebuild, order transitions, territory writes) and memory bandwidth
+dominate. AVX-512 is not faster than AVX2 here: the inputs are about 60
+elements long.
+
+Against the spec 3 targets for 10 000 units on 1024²:
+
+- **Weak PC (4 cores, SSE4.2): ≤ 3 ms.** Met on this 4-vCPU VM at the SSE4.2
+  level in both scenarios (1.38 ms, 2.63 ms).
+- **Average PC (6 cores / 12 threads, AVX2): ≤ 1 ms.** Not demonstrated
+  here; 4 threads give 1.37 ms marching, 2.53 ms on a full front. This has
+  to be measured on the reference machine. The obvious next steps are a
+  parallel grid rebuild and cheaper territory painting near fronts.
 
 In normal (non-sandbox) matches, pocket labelling floods the whole map every
 15 ticks. That is fine up to 1024² but is replaced by union-find over the chunk

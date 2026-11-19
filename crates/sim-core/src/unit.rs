@@ -162,6 +162,38 @@ impl UnitStore {
         self.free_slots.push(slot);
     }
 
+    /// Reorders all units: new index `k` holds the unit that was at
+    /// `order[k]`. `order` must be a permutation of `0..len()`. Handles stay
+    /// valid; only array indices change (spec 5.1, spatial sorting).
+    pub fn permute(&mut self, order: &[u32]) {
+        debug_assert_eq!(order.len(), self.len());
+        fn apply<T: Copy>(v: &mut Vec<T>, order: &[u32]) {
+            let old = std::mem::take(v);
+            v.extend(order.iter().map(|&i| old[i as usize]));
+        }
+        apply(&mut self.pos_x, order);
+        apply(&mut self.pos_y, order);
+        apply(&mut self.hp, order);
+        apply(&mut self.morale, order);
+        apply(&mut self.owner, order);
+        apply(&mut self.kind, order);
+        apply(&mut self.flags, order);
+        apply(&mut self.row, order);
+        apply(&mut self.water_ticks, order);
+        apply(&mut self.order, order);
+        apply(&mut self.waypoint, order);
+        apply(&mut self.off_x, order);
+        apply(&mut self.off_y, order);
+        apply(&mut self.stuck, order);
+        apply(&mut self.slot, order);
+        apply(&mut self.calm, order);
+        apply(&mut self.starve, order);
+        apply(&mut self.pocket, order);
+        for (k, &s) in self.slot.iter().enumerate() {
+            self.slot_index[s as usize] = k as u32;
+        }
+    }
+
     /// Current array index of a live unit, or `None` if the handle is stale.
     #[inline]
     pub fn index_of(&self, h: UnitHandle) -> Option<usize> {
@@ -210,5 +242,17 @@ mod tests {
         assert_eq!(s.index_of(a), None);
         assert_eq!(s.index_of(d), Some(2));
         assert_eq!(s.handle(2), d);
+    }
+
+    #[test]
+    fn permute_keeps_handles() {
+        let mut s = UnitStore::default();
+        let hs: Vec<UnitHandle> = (0..5).map(|k| s.push(1, UnitKind::Light, k * 10, 0, 100, 100)).collect();
+        s.permute(&[4, 2, 0, 3, 1]);
+        for (k, h) in hs.iter().enumerate() {
+            let i = s.index_of(*h).unwrap();
+            assert_eq!(s.pos_x[i], k as i32 * 10);
+        }
+        assert_eq!(s.pos_x, vec![40, 20, 0, 30, 10]);
     }
 }

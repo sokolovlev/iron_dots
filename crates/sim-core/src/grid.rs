@@ -31,7 +31,14 @@ pub struct Grid {
     /// `cell_units`, plus the end of the last cell.
     starts: Vec<u32>,
     /// Unit indices sorted by (block, cell); within a cell by ascending index.
-    cell_units: Vec<u32>,
+    pub cell_units: Vec<u32>,
+    /// Positions and teams in `cell_units` order: every cell row is one
+    /// contiguous slice, which is what the SIMD kernels scan.
+    pub sx: Vec<i32>,
+    pub sy: Vec<i32>,
+    pub steam: Vec<u8>,
+    /// Inverse of `cell_units`: position of unit `i` in grid order.
+    pub rank: Vec<u32>,
     /// Per unit: block and cell-within-block.
     unit_block: Vec<u32>,
     unit_cell: Vec<u16>,
@@ -77,7 +84,8 @@ impl Grid {
         (b, l as usize)
     }
 
-    pub fn rebuild(&mut self, pos_x: &[i32], pos_y: &[i32]) {
+    /// Rebuilds the grid. The team of unit `i` is `team_of[owner[i]]`.
+    pub fn rebuild(&mut self, pos_x: &[i32], pos_y: &[i32], owner: &[u8], team_of: &[u8]) {
         let n = pos_x.len();
         for &b in &self.occupied {
             self.block_slot[b as usize] = EMPTY;
@@ -138,10 +146,82 @@ impl Grid {
             self.starts[base] = if k == 0 { 0 } else { self.starts[base - 1] };
             self.starts[base + STRIDE - 1] = end;
         }
+        self.sx.resize(n, 0);
+        self.sy.resize(n, 0);
+        self.steam.resize(n, 0);
+        self.rank.resize(n, 0);
+        for (k, &i) in self.cell_units.iter().enumerate() {
+            let i = i as usize;
+            self.rank[i] = k as u32;
+            (self.sx[k], self.sy[k], self.steam[k]) = (pos_x[i], pos_y[i], team_of[owner[i] as usize]);
+        }
     }
 
-    /// Units of cells `x0..=x1` in row `cy`. Cells of one block row are
-    /// contiguous, so this is one slice per block touched (usually one).
+    /// Re-copies positions into cell order after units moved (cells stay as
+    /// built; the cell size has room for one tick of movement).
+    pub fn refresh_positions(&mut self, pos_x: &[i32], pos_y: &[i32]) {
+        use rayon::prelude::*;
+        const B: usize = 4096;
+        let units = &self.cell_units;
+        (self.sx.par_chunks_mut(B), self.sy.par_chunks_mut(B)).into_par_iter().enumerate().for_each(|(k, (sx, sy))| {
+            for (j, (x, y)) in sx.iter_mut().zip(sy.iter_mut()).enumerate() {
+                let i = units[k * B + j] as usize;
+                (*x, *y) = (pos_x[i], pos_y[i]);
+            }
+        });
+    }
+
+    /// Index ranges (into `cell_units`, `sx`, `sy`, `steam`) of cells
+    /// `x0..=x1` in row `cy`: one range per block touched (usually one).
+    #[inline]
+    fn row_ranges(&self, cy: u32, x0: u32, x1: u32, f: &mut impl FnMut(std::ops::Range<usize>)) {
+        let mut x = x0;
+        while x <= x1 {
+            let block_end = (x | (BLOCK - 1)).min(x1);
+            let (b, l0) = self.block_and_local(x, cy);
+            let slot = self.block_slot[b as usize];
+            if slot != EMPTY {
+                let base = slot as usize * STRIDE;
+                let l1 = l0 + (block_end - x) as usize;
+                let (a, z) = (self.starts[base + l0] as usize, self.starts[base + l1 + 1] as usize);
+                if a < z {
+                    f(a..z);
+                }
+            }
+            x = block_end + 1;
+        }
+    }
+
+    /// Cell coordinates of unit `i` (as of the last rebuild).
+    #[inline]
+    pub fn cell_of_unit(&self, i: usize) -> (u32, u32) {
+        let (b, l) = (self.unit_block[i], self.unit_cell[i] as u32);
+        let (bx, by) = (b % self.blocks_w, b / self.blocks_w);
+        ((bx << BLOCK_SHIFT) | (l & (BLOCK - 1)), (by << BLOCK_SHIFT) | (l >> BLOCK_SHIFT))
+    }
+
+    /// Calls `f(range)` for the slices covering the 3×3 cells around cell `(cx, cy)`.
+    #[inline]
+    pub fn ranges_around_cell(&self, cx: u32, cy: u32, mut f: impl FnMut(std::ops::Range<usize>)) {
+        let x0 = cx.saturating_sub(1);
+        let x1 = (cx + 1).min(self.cells_w - 1);
+        for gy in cy.saturating_sub(1)..=(cy + 1).min(self.cells_h - 1) {
+            self.row_ranges(gy, x0, x1, &mut f);
+        }
+    }
+
+    /// Calls `f(range)` for the slices covering the 3×3 cells around `(x, y)`.
+    #[inline]
+    pub fn ranges_near(&self, x: i32, y: i32, mut f: impl FnMut(std::ops::Range<usize>)) {
+        let (cx, cy) = self.cell_xy(x, y);
+        let x0 = cx.saturating_sub(1);
+        let x1 = (cx + 1).min(self.cells_w - 1);
+        for gy in cy.saturating_sub(1)..=(cy + 1).min(self.cells_h - 1) {
+            self.row_ranges(gy, x0, x1, &mut f);
+        }
+    }
+
+    /// Units of cells `x0..=x1` in row `cy`.
     #[inline]
     fn row(&self, cy: u32, x0: u32, x1: u32, f: &mut impl FnMut(usize)) {
         let mut x = x0;
@@ -198,7 +278,7 @@ mod tests {
         assert_eq!(g.cell_size(), 2 * ONE);
         let xs = [ONE, ONE * 2, ONE * 10, ONE * 63];
         let ys = [ONE, ONE, ONE * 10, ONE * 63];
-        g.rebuild(&xs, &ys);
+        g.rebuild(&xs, &ys, &[0; 4], &[0]);
         let mut near = Vec::new();
         g.for_each_near(ONE, ONE, |j| near.push(j));
         near.sort();
@@ -219,8 +299,9 @@ mod tests {
             let xs: Vec<i32> = pts.iter().map(|p| p.0).collect();
             let ys: Vec<i32> = pts.iter().map(|p| p.1).collect();
             // Rebuild twice to exercise clearing of the previous tick.
-            g.rebuild(&ys, &xs);
-            g.rebuild(&xs, &ys);
+            let teams = vec![0u8; xs.len()];
+            g.rebuild(&ys, &xs, &teams, &[0]);
+            g.rebuild(&xs, &ys, &teams, &[0]);
             let cs = g.cell_size();
             let mut got = Vec::new();
             g.for_each_near(qx, qy, |j| got.push(j));
@@ -229,7 +310,21 @@ mod tests {
             let want: Vec<usize> = (0..xs.len())
                 .filter(|&j| (cell(xs[j]) - cell(qx)).abs() <= 1 && (cell(ys[j]) - cell(qy)).abs() <= 1)
                 .collect();
-            prop_assert_eq!(got, want);
+            prop_assert_eq!(&got, &want);
+            // The range API covers the same units, and the sorted copies match.
+            let mut by_range = Vec::new();
+            g.ranges_near(qx, qy, |r| {
+                for k in r {
+                    by_range.push(g.cell_units[k] as usize);
+                    assert_eq!((g.sx[k], g.sy[k]), (xs[g.cell_units[k] as usize], ys[g.cell_units[k] as usize]));
+                }
+            });
+            by_range.sort();
+            prop_assert_eq!(by_range, want);
+            for i in 0..xs.len() {
+                prop_assert_eq!(g.cell_units[g.rank[i] as usize] as usize, i);
+                prop_assert_eq!(g.cell_of_unit(i), ((xs[i] / cs) as u32, (ys[i] / cs) as u32));
+            }
         }
     }
 }

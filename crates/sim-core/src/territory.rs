@@ -81,6 +81,8 @@ pub fn paint_candidates(
                 continue;
             }
             let (cx, cy) = ((x << 16) + ONE / 2, (y << 16) + ONE / 2);
+            // Any enemy within the radius of the tile centre. Scalar on
+            // purpose: the early exit beats the SIMD kernel here (measured).
             if enemies.iter().any(|&(ex, ey)| dist2(ex, ey, cx, cy) <= r2) {
                 continue;
             }
