@@ -40,7 +40,8 @@ fixed-point SoA core, spatial grid, movement, combat with morale, replays, golde
 - [x] Scalar reference kernels; property tests prove bit-identical results at every level; Miri in CI
 - [x] Neighbour searches run on contiguous grid-ordered slices; units are re-sorted spatially every 8 ticks
 - [x] The hash is identical at every SIMD level (tested) and on 1–16 threads
-- 10 000 units on 1024² with 4 threads: 1.4 ms marching, 2.5 ms on a full front line. The weak-PC target (≤ 3 ms) is met; ≤ 1 ms on the 12-thread reference PC still has to be shown ([details](ARCHITECTURE.md#performance-stage-4-parallel--simd))
+- 10 000 units on 1024² with 4 threads: 1.3 ms marching, 2.5 ms on a full front line. The weak-PC target (≤ 3 ms) is met; ≤ 1 ms on the 12-thread reference PC still has to be shown ([details](ARCHITECTURE.md#performance-stage-4-parallel--simd))
+- Measure any machine with `cargo run --release -p headless -- scaling` (Markdown table, 1…N threads)
 
 Next: stage 5, hierarchical flow-field pathfinding, 4096² maps, sandbox mode and rendering LOD.
 

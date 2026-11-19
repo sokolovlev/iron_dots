@@ -7,8 +7,7 @@
 //!   every [`SUPPLY_INTERVAL`] ticks. Supply limits are counted per pocket.
 
 use crate::fx::{ONE, dist2};
-use crate::grid::Grid;
-use crate::map::{CHUNK_SHIFT, Map, Terrain};
+use crate::map::{CHUNK, CHUNK_SHIFT, Map, Terrain};
 use crate::unit::UnitStore;
 
 /// Pockets and supply are recomputed every this many ticks (spec 5.3).
@@ -23,72 +22,77 @@ pub const PAINT_INTERVAL: u32 = 4;
 /// Tiles unit `i` would claim, judged on the map as it is now: within
 /// `radius`, not the unit's own or an ally's, not a city, and with no enemy
 /// unit within `radius` of the tile. Appends `(x, y, owner)` to `out`.
-/// `hot = false` means no enemy can be near (sleeping chunk); the enemy
-/// search is skipped then.
+///
+/// `presence` (chunk-major like the map planes) holds, for every tile of a
+/// warm chunk, the team bits of all units within `radius` of the tile
+/// centre; `my_bit` is the unit's team bit. `hot = false` means no enemy
+/// can be near (sleeping chunk), so no check is needed.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_candidates(
     map: &Map,
     units: &UnitStore,
-    grid: &Grid,
     team: &[u8],
     radius: u32,
     i: usize,
     hot: bool,
-    enemies: &mut Vec<(i32, i32)>,
+    presence: &[u8],
+    my_bit: u8,
     out: &mut Vec<(u16, u16, u8)>,
 ) {
     let r = radius as i32;
-    let r_raw = r * ONE;
-    let r2 = (r_raw as i64) * (r_raw as i64);
     let (w, h) = (map.width() as i32, map.height() as i32);
     let me = units.owner[i];
     let my_team = team[me as usize];
-    let (ux, uy) = (units.pos_x[i], units.pos_y[i]);
-    let (tx, ty) = (ux >> 16, uy >> 16);
-    let claimable = |x: i32, y: i32| -> bool {
-        if x < 0 || y < 0 || x >= w || y >= h {
-            return false;
-        }
-        let o = map.owner(x as u32, y as u32);
-        !(o != 0 && team[o as usize] == my_team) && map.terrain(x as u32, y as u32) != Terrain::City
-    };
-    // Quick pass: anything in reach that is not ours or an ally's?
-    let mut needs = false;
-    'scan: for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy <= r * r && claimable(tx + dx, ty + dy) {
-                needs = true;
-                break 'scan;
-            }
-        }
-    }
-    if !needs {
-        return;
-    }
-    // Enemies that could be within the radius of any tile we touch.
-    enemies.clear();
-    if hot {
-        grid.for_each_in_range(ux, uy, 2 * r_raw + ONE, |j| {
-            if team[units.owner[j] as usize] != my_team {
-                enemies.push((units.pos_x[j], units.pos_y[j]));
-            }
-        });
-    }
+    let (tx, ty) = (units.pos_x[i] >> 16, units.pos_y[i] >> 16);
     for dy in -r..=r {
         for dx in -r..=r {
             let (x, y) = (tx + dx, ty + dy);
-            if dx * dx + dy * dy > r * r || !claimable(x, y) {
+            if dx * dx + dy * dy > r * r || x < 0 || y < 0 || x >= w || y >= h {
                 continue;
             }
-            let (cx, cy) = ((x << 16) + ONE / 2, (y << 16) + ONE / 2);
-            // Any enemy within the radius of the tile centre. Scalar on
-            // purpose: the early exit beats the SIMD kernel here (measured).
-            if enemies.iter().any(|&(ex, ey)| dist2(ex, ey, cx, cy) <= r2) {
+            let (xu, yu) = (x as u32, y as u32);
+            let o = map.owner(xu, yu);
+            if (o != 0 && team[o as usize] == my_team) || map.terrain(xu, yu) == Terrain::City {
                 continue;
+            }
+            if hot && presence[map.index(xu, yu)] & !my_bit != 0 {
+                continue; // an enemy is within the radius of this tile
             }
             out.push((x as u16, y as u16, me));
         }
     }
+}
+
+/// Fills `plane` (the 4096 tiles of chunk `(cx, cy)`) with the team bits
+/// of units within `radius` of each tile centre (distance ≤ radius, the
+/// same test painting uses). `units_near` yields `(x, y, team_bit)` of every
+/// unit that may be that close (callers pass the grid neighbourhood).
+pub fn stamp_presence(
+    plane: &mut [u8],
+    cx: u32,
+    cy: u32,
+    radius: u32,
+    units_near: impl FnOnce(&mut dyn FnMut(i32, i32, u8)),
+) {
+    plane.fill(0);
+    let r_raw = radius as i32 * ONE;
+    let r2 = (r_raw as i64) * (r_raw as i64);
+    let (ox, oy) = ((cx * CHUNK) as i32, (cy * CHUNK) as i32);
+    let last = CHUNK as i32 - 1;
+    units_near(&mut |x, y, bit| {
+        let x0 = ((x - r_raw) >> 16).max(ox);
+        let x1 = ((x + r_raw) >> 16).min(ox + last);
+        let y0 = ((y - r_raw) >> 16).max(oy);
+        let y1 = ((y + r_raw) >> 16).min(oy + last);
+        for ty in y0..=y1 {
+            for tx in x0..=x1 {
+                let (ccx, ccy) = ((tx << 16) + ONE / 2, (ty << 16) + ONE / 2);
+                if dist2(x, y, ccx, ccy) <= r2 {
+                    plane[(((ty - oy) << CHUNK_SHIFT) | (tx - ox)) as usize] |= bit;
+                }
+            }
+        }
+    });
 }
 
 /// Applies candidate writes block by block, in order. A tile is skipped if

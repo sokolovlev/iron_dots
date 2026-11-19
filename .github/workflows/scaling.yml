@@ -1,0 +1,36 @@
+name: Scaling benchmark
+
+# Run by hand (Actions → Scaling benchmark → Run workflow) on any runner,
+# e.g. a self-hosted machine matching the spec 3 reference PC. The table
+# lands in the job summary.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (ubuntu-latest, windows-latest, self-hosted, a larger runner…)"
+        default: ubuntu-latest
+        required: true
+      simd:
+        description: "Force a SIMD level (scalar, sse4.2, avx2, avx512, neon); empty = best"
+        default: ""
+        required: false
+
+jobs:
+  scaling:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Scaling table
+        shell: bash
+        env:
+          IRON_DOTS_SIMD: ${{ inputs.simd }}
+        run: |
+          cargo run --release -p headless -- scaling > scaling.md
+          cat scaling.md >> "$GITHUB_STEP_SUMMARY"
+          cat scaling.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scaling-${{ inputs.runner }}
+          path: scaling.md

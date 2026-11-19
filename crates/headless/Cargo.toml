@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 sim-core.workspace = true
+simd-kernels.workspace = true
 ai.workspace = true
 
 tracing = { workspace = true, optional = true }

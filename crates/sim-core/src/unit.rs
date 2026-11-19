@@ -167,28 +167,53 @@ impl UnitStore {
     /// valid; only array indices change (spec 5.1, spatial sorting).
     pub fn permute(&mut self, order: &[u32]) {
         debug_assert_eq!(order.len(), self.len());
-        fn apply<T: Copy>(v: &mut Vec<T>, order: &[u32]) {
+        fn apply<T: Copy + Send + Sync>(v: &mut Vec<T>, order: &[u32]) {
             let old = std::mem::take(v);
             v.extend(order.iter().map(|&i| old[i as usize]));
         }
-        apply(&mut self.pos_x, order);
-        apply(&mut self.pos_y, order);
-        apply(&mut self.hp, order);
-        apply(&mut self.morale, order);
-        apply(&mut self.owner, order);
-        apply(&mut self.kind, order);
-        apply(&mut self.flags, order);
-        apply(&mut self.row, order);
-        apply(&mut self.water_ticks, order);
-        apply(&mut self.order, order);
-        apply(&mut self.waypoint, order);
-        apply(&mut self.off_x, order);
-        apply(&mut self.off_y, order);
-        apply(&mut self.stuck, order);
-        apply(&mut self.slot, order);
-        apply(&mut self.calm, order);
-        apply(&mut self.starve, order);
-        apply(&mut self.pocket, order);
+        // Large worlds: each array is permuted on its own task (in the
+        // caller's pool). Small ones: forking would cost more than it saves.
+        if self.len() < 32 * 1024 {
+            apply(&mut self.pos_x, order);
+            apply(&mut self.pos_y, order);
+            apply(&mut self.hp, order);
+            apply(&mut self.morale, order);
+            apply(&mut self.owner, order);
+            apply(&mut self.kind, order);
+            apply(&mut self.flags, order);
+            apply(&mut self.row, order);
+            apply(&mut self.water_ticks, order);
+            apply(&mut self.order, order);
+            apply(&mut self.waypoint, order);
+            apply(&mut self.off_x, order);
+            apply(&mut self.off_y, order);
+            apply(&mut self.stuck, order);
+            apply(&mut self.slot, order);
+            apply(&mut self.calm, order);
+            apply(&mut self.starve, order);
+            apply(&mut self.pocket, order);
+        } else {
+            rayon::scope(|s| {
+                s.spawn(|_| apply(&mut self.pos_x, order));
+                s.spawn(|_| apply(&mut self.pos_y, order));
+                s.spawn(|_| apply(&mut self.hp, order));
+                s.spawn(|_| apply(&mut self.morale, order));
+                s.spawn(|_| apply(&mut self.owner, order));
+                s.spawn(|_| apply(&mut self.kind, order));
+                s.spawn(|_| apply(&mut self.flags, order));
+                s.spawn(|_| apply(&mut self.row, order));
+                s.spawn(|_| apply(&mut self.water_ticks, order));
+                s.spawn(|_| apply(&mut self.order, order));
+                s.spawn(|_| apply(&mut self.waypoint, order));
+                s.spawn(|_| apply(&mut self.off_x, order));
+                s.spawn(|_| apply(&mut self.off_y, order));
+                s.spawn(|_| apply(&mut self.stuck, order));
+                s.spawn(|_| apply(&mut self.slot, order));
+                s.spawn(|_| apply(&mut self.calm, order));
+                s.spawn(|_| apply(&mut self.starve, order));
+                s.spawn(|_| apply(&mut self.pocket, order));
+            });
+        }
         for (k, &s) in self.slot.iter().enumerate() {
             self.slot_index[s as usize] = k as u32;
         }

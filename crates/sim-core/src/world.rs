@@ -3,8 +3,9 @@
 //!  1. apply commands (sorted by player, seq); Move runs the pathfinder
 //!  2. rebuild the spatial grid
 //!  3. (flow fields — stage 5; stage 2 plans routes when a command is applied)
-//!  4. intent: desired velocity from the current order
-//!  5. separation + integration + terrain blocking (pull: every unit writes only itself)
+//!  4. separation push of every unit (grid order, SIMD neighbour search)
+//!  5. one pass per unit: intent, integration, terrain blocking, waypoints,
+//!     water (pull: every unit writes only itself); then order transitions
 //!  6. combat: contacts → damage (combat, water, starvation) → HP/morale update
 //!  7. territory painting
 //!  8. supply: pockets every 15 ticks, starvation rates, healing
@@ -16,7 +17,7 @@ use crate::balance::{Balance, Rules, SHIP_ROW};
 use crate::command::{Command, CommandKind};
 use crate::fx::{Fx, FxPoint, ONE, dist2, isqrt_u64, length};
 use crate::grid::Grid;
-use crate::map::{Map, Terrain};
+use crate::map::{self, CHUNK_TILES, Map, Terrain};
 use crate::order::{MAX_PATH_POINTS, OrderPool};
 use crate::pathfind;
 use crate::rng::{Purpose, rand, stochastic_round_q16};
@@ -142,7 +143,7 @@ impl Hood {
 pub enum Phase {
     Commands,
     Grid,
-    Intent,
+    Separation,
     Move,
     Combat,
     Territory,
@@ -155,7 +156,7 @@ impl Phase {
     pub const ALL: [Phase; 9] = [
         Phase::Commands,
         Phase::Grid,
-        Phase::Intent,
+        Phase::Separation,
         Phase::Move,
         Phase::Combat,
         Phase::Territory,
@@ -168,7 +169,7 @@ impl Phase {
         match self {
             Phase::Commands => "commands",
             Phase::Grid => "grid",
-            Phase::Intent => "intent",
+            Phase::Separation => "separation",
             Phase::Move => "move",
             Phase::Combat => "combat",
             Phase::Territory => "territory",
@@ -220,10 +221,6 @@ pub struct World {
     /// Sandbox mode (spec 2.7): no upkeep, supply limits effectively unbounded.
     sandbox: bool,
     // Scratch buffers reused every tick (no allocations in steady state).
-    vel_x: Vec<i32>,
-    vel_y: Vec<i32>,
-    next_x: Vec<i32>,
-    next_y: Vec<i32>,
     arrive: Vec<bool>,
     contacts: Vec<u16>,
     dmg_in: Vec<u32>,
@@ -235,6 +232,10 @@ pub struct World {
     team_bit: [u8; MAX_PLAYERS + 1],
     chunk_mask: Vec<u8>,
     hot: Vec<bool>,
+    /// Hot chunks and their neighbours.
+    warm: Vec<bool>,
+    /// Per tile of warm chunks: team bits of units within the territory radius.
+    presence: Vec<u8>,
     pool: Arc<rayon::ThreadPool>,
     threads: usize,
     /// SIMD kernel table (chosen once per process; tests may pick a level).
@@ -296,10 +297,6 @@ impl World {
             dirty_chunks: vec![true; chunks],
             pending_spawns: Vec::new(),
             sandbox: false,
-            vel_x: Vec::new(),
-            vel_y: Vec::new(),
-            next_x: Vec::new(),
-            next_y: Vec::new(),
             arrive: Vec::new(),
             contacts: Vec::new(),
             dmg_in: Vec::new(),
@@ -310,6 +307,8 @@ impl World {
             team_bit,
             chunk_mask: Vec::new(),
             hot: Vec::new(),
+            warm: Vec::new(),
+            presence: Vec::new(),
             pool: Arc::new(make_pool(1)?),
             threads: 1,
             kernels: simd_kernels::kernels(),
@@ -563,11 +562,8 @@ impl World {
         self.prepare_scratch();
         phase!(Phase::Commands, self.apply_commands(commands));
         phase!(Phase::Grid, self.rebuild_grid());
-        phase!(Phase::Intent, self.phase_intent());
-        phase!(Phase::Move, {
-            self.phase_move();
-            self.phase_orders_and_terrain()
-        });
+        phase!(Phase::Separation, self.phase_separation());
+        phase!(Phase::Move, self.phase_move());
         phase!(Phase::Combat, self.phase_combat());
         phase!(Phase::Territory, self.phase_territory());
         phase!(Phase::Supply, self.phase_supply());
@@ -585,23 +581,20 @@ impl World {
     /// arrays almost sequentially. Grid order is spatial (blocks of 32×32
     /// cells, rows inside a block) and ties keep index order: deterministic.
     fn rebuild_grid(&mut self) {
-        let u = &self.units;
-        self.grid.rebuild(&u.pos_x, &u.pos_y, &u.owner, &self.team);
-        if self.tick % SORT_INTERVAL == 0 && !self.units.is_empty() {
-            let order = take(&mut self.grid.cell_units);
-            self.units.permute(&order);
-            self.grid.cell_units = order;
-            let u = &self.units;
-            self.grid.rebuild(&u.pos_x, &u.pos_y, &u.owner, &self.team);
-        }
+        let (grid, u, team, pool) = (&mut self.grid, &mut self.units, &self.team, &self.pool);
+        pool.install(|| {
+            grid.rebuild(&u.pos_x, &u.pos_y, &u.owner, team);
+            if self.tick % SORT_INTERVAL == 0 && !u.is_empty() {
+                let order = take(&mut grid.cell_units);
+                u.permute(&order);
+                grid.cell_units = order.clone();
+                grid.units_permuted(&order);
+            }
+        });
     }
 
     fn prepare_scratch(&mut self) {
         let n = self.units.len();
-        self.vel_x.resize(n, 0);
-        self.vel_y.resize(n, 0);
-        self.next_x.resize(n, 0);
-        self.next_y.resize(n, 0);
         self.arrive.resize(n, false);
         self.contacts.resize(n, 0);
         self.dmg_in.resize(n, 0);
@@ -818,49 +811,7 @@ impl World {
         Some((tx, ty))
     }
 
-    #[inline]
-    fn speed_of(&self, i: usize) -> i32 {
-        let kind = self.units.kind[i] as usize;
-        let row = self.units.row[i] as usize;
-        let mut s = self.rules.speed_per_tick[kind].mul_milli(self.rules.terrain_speed[row][kind]);
-        if self.units.flags[i] & flags::IN_COMBAT != 0 {
-            s = s.mul_milli(self.rules.engaged_speed);
-        }
-        s.0
-    }
-
-    /// Desired velocity of unit `i` and whether it reaches its waypoint now.
-    #[inline]
-    fn intent_of(&self, i: usize) -> (i32, i32, bool) {
-        let Some((tx, ty)) = self.waypoint_target(i) else { return (0, 0, false) };
-        let dx = tx - self.units.pos_x[i];
-        let dy = ty - self.units.pos_y[i];
-        let d = length(dx, dy);
-        let s = self.speed_of(i);
-        if d <= s {
-            (dx, dy, true)
-        } else {
-            ((dx as i64 * s as i64 / d as i64) as i32, (dy as i64 * s as i64 / d as i64) as i32, false)
-        }
-    }
-
-    fn phase_intent(&mut self) {
-        let (mut vx, mut vy, mut ar) = (take(&mut self.vel_x), take(&mut self.vel_y), take(&mut self.arrive));
-        let this = &*self;
-        this.pool.install(|| {
-            (vx.par_chunks_mut(BLOCK), vy.par_chunks_mut(BLOCK), ar.par_chunks_mut(BLOCK))
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(k, (vx, vy, ar))| {
-                    for j in 0..vx.len() {
-                        (vx[j], vy[j], ar[j]) = this.intent_of(k * BLOCK + j);
-                    }
-                });
-        });
-        (self.vel_x, self.vel_y, self.arrive) = (vx, vy, ar);
-    }
-
-    // ---------------------------------------------------------------- phase 5
+    // ---------------------------------------------------------------- phase 4-5
 
     /// Soft separation push for unit `i` (capped), pulled from neighbours'
     /// start-of-tick positions in `hood`.
@@ -913,89 +864,141 @@ impl World {
         (px as i32, py as i32)
     }
 
-    /// Position of unit `i` after walking and pushing by `(px, py)`, with
-    /// impassable tiles resolved.
-    #[inline]
-    fn move_of(&self, i: usize, (px, py): (i32, i32)) -> (i32, i32) {
-        let max_x = (self.map.width() as i32) * ONE - 1;
-        let max_y = (self.map.height() as i32) * ONE - 1;
-        let (x, y) = (self.units.pos_x[i], self.units.pos_y[i]);
-        let nx = (x as i64 + self.vel_x[i] as i64 + px as i64).clamp(0, max_x as i64) as i32;
-        let ny = (y as i64 + self.vel_y[i] as i64 + py as i64).clamp(0, max_y as i64) as i32;
-        // Impassable tiles: slide along an axis, otherwise stay.
-        let pass =
-            |x: i32, y: i32| self.rules.passable[self.map.terrain_raw((x >> 16) as u32, (y >> 16) as u32) as usize];
-        if pass(nx, ny) {
-            (nx, ny)
-        } else if pass(nx, y) {
-            (nx, y)
-        } else if pass(x, ny) {
-            (x, ny)
-        } else {
-            (x, y)
-        }
-    }
-
-    fn phase_move(&mut self) {
+    /// Separation (phase 5a): push of every unit, computed in grid order.
+    fn phase_separation(&mut self) {
         let mut push = take(&mut self.push_sorted);
         push.resize(self.units.len(), (0, 0));
         let separation = self.rules.separation_radius.0 > 0;
         self.par_by_grid(&mut push, |_| separation, |i, hood| hood.map_or((0, 0), |h| self.separation_of(i, h)));
-        let (mut nx, mut ny) = (take(&mut self.next_x), take(&mut self.next_y));
-        let this = &*self;
-        let rank = &this.grid.rank;
-        this.pool.install(|| {
-            (nx.par_chunks_mut(BLOCK), ny.par_chunks_mut(BLOCK)).into_par_iter().enumerate().for_each(
-                |(k, (nx, ny))| {
-                    for j in 0..nx.len() {
-                        let i = k * BLOCK + j;
-                        (nx[j], ny[j]) = this.move_of(i, push[rank[i] as usize]);
-                    }
-                },
-            );
-        });
-        (self.next_x, self.next_y, self.push_sorted) = (nx, ny, push);
+        self.push_sorted = push;
     }
 
-    fn phase_orders_and_terrain(&mut self) {
-        let stuck_limit = (2 * self.rules.tick_rate).min(250) as u8;
+    /// Phases 4 and 5 for every unit in one parallel pass: intent (desired
+    /// velocity), walking plus the separation push, impassable tiles,
+    /// waypoint progress and stuck detection, committing the position, water
+    /// and ships. Then the order transitions, which touch the shared order
+    /// pool, sequentially in unit order.
+    ///
+    /// Each unit reads only its own state (others' positions were read by
+    /// the separation pass), so fusing these steps changes no result; it
+    /// saves three fork/joins and three sweeps over memory per tick.
+    fn phase_move(&mut self) {
         let n = self.units.len();
-        // 5b. Waypoint progress and stuck detection (parallel, per unit).
-        // `arrive` becomes "advance to the next waypoint".
-        let (mut adv, mut stuck) = (take(&mut self.arrive), take(&mut self.units.stuck));
+        let stuck_limit = (2 * self.rules.tick_rate).min(250) as u8;
+        let max_x = (self.map.width() as i32) * ONE - 1;
+        let max_y = (self.map.height() as i32) * ONE - 1;
+        let u = &mut self.units;
+        let (mut px, mut py, mut wt, mut fl, mut row, mut stuck) = (
+            take(&mut u.pos_x),
+            take(&mut u.pos_y),
+            take(&mut u.water_ticks),
+            take(&mut u.flags),
+            take(&mut u.row),
+            take(&mut u.stuck),
+        );
+        let mut adv = take(&mut self.arrive);
+        adv.clear();
+        adv.resize(n, false);
         let this = &*self;
+        let rules = &this.rules;
         this.pool.install(|| {
-            (adv.par_chunks_mut(BLOCK), stuck.par_chunks_mut(BLOCK)).into_par_iter().enumerate().for_each(
-                |(k, (adv, stuck))| {
-                    for j in 0..adv.len() {
+            (
+                px.par_chunks_mut(BLOCK),
+                py.par_chunks_mut(BLOCK),
+                wt.par_chunks_mut(BLOCK),
+                fl.par_chunks_mut(BLOCK),
+                row.par_chunks_mut(BLOCK),
+                stuck.par_chunks_mut(BLOCK),
+                adv.par_chunks_mut(BLOCK),
+            )
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(k, (px, py, wt, fl, row, stuck, adv))| {
+                    for j in 0..px.len() {
                         let i = k * BLOCK + j;
-                        let Some((tx, ty)) = this.waypoint_target(i) else {
-                            adv[j] = false;
-                            continue;
+                        let (x, y) = (px[j], py[j]);
+                        let in_combat = fl[j] & flags::IN_COMBAT != 0;
+                        let target = this.waypoint_target(i);
+                        // Intent: speed from last tick's terrain and combat state.
+                        let (vx, vy, arrive) = match target {
+                            None => (0, 0, false),
+                            Some((tx, ty)) => {
+                                let kind = this.units.kind[i] as usize;
+                                let mut sp =
+                                    rules.speed_per_tick[kind].mul_milli(rules.terrain_speed[row[j] as usize][kind]);
+                                if in_combat {
+                                    sp = sp.mul_milli(rules.engaged_speed);
+                                }
+                                let s = sp.0;
+                                let (dx, dy) = (tx - x, ty - y);
+                                let d = length(dx, dy);
+                                if d <= s {
+                                    (dx, dy, true)
+                                } else {
+                                    (
+                                        (dx as i64 * s as i64 / d as i64) as i32,
+                                        (dy as i64 * s as i64 / d as i64) as i32,
+                                        false,
+                                    )
+                                }
+                            }
                         };
-                        let before = dist2(this.units.pos_x[i], this.units.pos_y[i], tx, ty);
-                        let after = dist2(this.next_x[i], this.next_y[i], tx, ty);
-                        let mut a = adv[j];
-                        if !a && this.units.flags[i] & flags::IN_COMBAT == 0 {
-                            if after >= before {
-                                stuck[j] = stuck[j].saturating_add(1);
-                                a = stuck[j] >= stuck_limit;
-                            } else {
+                        // Walk, pushed by neighbours; impassable tiles: slide
+                        // along an axis, otherwise stay.
+                        let (ppx, ppy) = this.push_sorted[this.grid.rank[i] as usize];
+                        let nx = (x as i64 + vx as i64 + ppx as i64).clamp(0, max_x as i64) as i32;
+                        let ny = (y as i64 + vy as i64 + ppy as i64).clamp(0, max_y as i64) as i32;
+                        let pass = |x: i32, y: i32| {
+                            rules.passable[this.map.terrain_raw((x >> 16) as u32, (y >> 16) as u32) as usize]
+                        };
+                        let (nx, ny) = if pass(nx, ny) {
+                            (nx, ny)
+                        } else if pass(nx, y) {
+                            (nx, y)
+                        } else if pass(x, ny) {
+                            (x, ny)
+                        } else {
+                            (x, y)
+                        };
+                        // Waypoint progress and stuck detection.
+                        if let Some((tx, ty)) = target {
+                            let before = dist2(x, y, tx, ty);
+                            let after = dist2(nx, ny, tx, ty);
+                            let mut a = arrive;
+                            if !a && !in_combat {
+                                if after >= before {
+                                    stuck[j] = stuck[j].saturating_add(1);
+                                    a = stuck[j] >= stuck_limit;
+                                } else {
+                                    stuck[j] = 0;
+                                }
+                            }
+                            if a {
                                 stuck[j] = 0;
                             }
+                            adv[j] = a;
                         }
-                        if a {
-                            stuck[j] = 0;
+                        // Commit; water and ships.
+                        (px[j], py[j]) = (nx, ny);
+                        let t = this.map.terrain_raw((nx >> 16) as u32, (ny >> 16) as u32);
+                        if t == Terrain::Water as u8 {
+                            wt[j] = wt[j].saturating_add(1);
+                            if wt[j] >= rules.ship_after_ticks {
+                                fl[j] |= flags::SHIP;
+                            }
+                        } else {
+                            wt[j] = 0;
+                            fl[j] &= !flags::SHIP;
                         }
-                        adv[j] = a;
+                        row[j] = if fl[j] & flags::SHIP != 0 { SHIP_ROW as u8 } else { t };
                     }
-                },
-            );
+                });
         });
-        self.units.stuck = stuck;
-        // 5c. Order transitions touch the shared order pool: sequential, in
+        let u = &mut self.units;
+        (u.pos_x, u.pos_y, u.water_ticks, u.flags, u.row, u.stuck) = (px, py, wt, fl, row, stuck);
+        // Order transitions touch the shared order pool: sequential, in
         // ascending unit order (same order of retains/releases as always).
-        for (i, &a) in adv.iter().enumerate().take(n) {
+        for (i, &a) in adv.iter().enumerate() {
             if !a {
                 continue;
             }
@@ -1012,42 +1015,6 @@ impl World {
             }
         }
         self.arrive = adv;
-        // 5d. Commit positions; water and ships (parallel).
-        let u = &mut self.units;
-        let (mut px, mut py, mut wt, mut fl, mut row) =
-            (take(&mut u.pos_x), take(&mut u.pos_y), take(&mut u.water_ticks), take(&mut u.flags), take(&mut u.row));
-        let this = &*self;
-        this.pool.install(|| {
-            (
-                px.par_chunks_mut(BLOCK),
-                py.par_chunks_mut(BLOCK),
-                wt.par_chunks_mut(BLOCK),
-                fl.par_chunks_mut(BLOCK),
-                row.par_chunks_mut(BLOCK),
-            )
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(k, (px, py, wt, fl, row))| {
-                    for j in 0..px.len() {
-                        let i = k * BLOCK + j;
-                        let (x, y) = (this.next_x[i], this.next_y[i]);
-                        (px[j], py[j]) = (x, y);
-                        let t = this.map.terrain_raw((x >> 16) as u32, (y >> 16) as u32);
-                        if t == Terrain::Water as u8 {
-                            wt[j] = wt[j].saturating_add(1);
-                            if wt[j] >= this.rules.ship_after_ticks {
-                                fl[j] |= flags::SHIP;
-                            }
-                        } else {
-                            wt[j] = 0;
-                            fl[j] &= !flags::SHIP;
-                        }
-                        row[j] = if fl[j] & flags::SHIP != 0 { SHIP_ROW as u8 } else { t };
-                    }
-                });
-        });
-        let u = &mut self.units;
-        (u.pos_x, u.pos_y, u.water_ticks, u.flags, u.row) = (px, py, wt, fl, row);
     }
 
     // ---------------------------------------------------------------- sleep
@@ -1083,6 +1050,21 @@ impl World {
             }
         }
         self.stats.hot_chunks = hot;
+        // Warm = hot or next to a hot chunk: where territory needs presence.
+        self.warm.clear();
+        self.warm.resize(cw * ch, false);
+        for cy in 0..ch {
+            for cx in 0..cw {
+                if !self.hot[cy * cw + cx] {
+                    continue;
+                }
+                for ny in cy.saturating_sub(1)..=(cy + 1).min(ch - 1) {
+                    for nx in cx.saturating_sub(1)..=(cx + 1).min(cw - 1) {
+                        self.warm[ny * cw + nx] = true;
+                    }
+                }
+            }
+        }
     }
 
     #[inline]
@@ -1092,8 +1074,6 @@ impl World {
 
     // ---------------------------------------------------------------- phase 6
 
-    /// Damage unit `b` pulls from enemies in contact this tick, plus water,
-    /// starvation and empty-treasury damage.
     /// Attacker's part of the damage formula for unit `a`, Q16 HP hundredths
     /// per tick times attack in thousandths.
     #[inline]
@@ -1107,7 +1087,9 @@ impl World {
         ((d * f_m) >> 16) * atk
     }
 
-    /// `hood` is the neighbourhood of `b`, given when `b` has contacts.
+    /// Damage unit `b` pulls from enemies in contact this tick, plus water,
+    /// starvation and empty-treasury damage. `hood` is the neighbourhood of
+    /// `b`, given when `b` has contacts.
     #[inline]
     fn damage_in(&self, b: usize, hood: Option<&Hood>) -> u32 {
         let r2 = self.rules.contact_r2;
@@ -1316,10 +1298,44 @@ impl World {
 
     // ---------------------------------------------------------------- phase 7
 
-    /// Territory: candidate tiles are found in parallel from the
-    /// start-of-phase map; writes are applied in ascending unit order with
-    /// the ally check repeated, which gives exactly the sequential result.
+    /// Territory: where hostile units are near (warm chunks), every tile
+    /// first gets the team bits of all units within the territory radius
+    /// (parallel per chunk), so a painting unit checks "is an enemy close to
+    /// this tile" with one lookup instead of scanning every nearby enemy.
+    /// Candidate tiles are found in parallel from the start-of-phase map;
+    /// writes are applied in ascending unit order with the ally check
+    /// repeated, which gives exactly the sequential result.
     fn phase_territory(&mut self) {
+        let radius = self.rules.territory_radius;
+        if self.stats.hot_chunks > 0 {
+            let mut presence = take(&mut self.presence);
+            presence.resize(self.map.terrain_plane().len(), 0);
+            let this = &*self;
+            let cw = this.map.chunks_w();
+            this.pool.install(|| {
+                presence.par_chunks_mut(CHUNK_TILES).enumerate().filter(|(c, _)| this.warm[*c]).for_each(
+                    |(c, plane)| {
+                        let (cx, cy) = (c as u32 % cw, c as u32 / cw);
+                        // Units whose stamp can reach this chunk.
+                        let half = ((map::CHUNK / 2 + radius + 1) as i32) << 16;
+                        let (mx, my) = (
+                            ((cx * map::CHUNK + map::CHUNK / 2) as i32) << 16,
+                            ((cy * map::CHUNK + map::CHUNK / 2) as i32) << 16,
+                        );
+                        let g = &this.grid;
+                        territory::stamp_presence(plane, cx, cy, radius, |stamp| {
+                            g.ranges_in_range(mx, my, half, |rg| {
+                                for k in rg {
+                                    let owner = this.units.owner[g.cell_units[k] as usize];
+                                    stamp(g.sx[k], g.sy[k], this.team_bit[owner as usize]);
+                                }
+                            });
+                        });
+                    },
+                );
+            });
+            self.presence = presence;
+        }
         let mut out = take(&mut self.paint_scratch);
         let this = &*self;
         let n = this.units.len();
@@ -1328,7 +1344,6 @@ impl World {
         this.pool.install(|| {
             out[..blocks].par_iter_mut().enumerate().for_each(|(k, out)| {
                 out.clear();
-                let mut enemies = Vec::new();
                 for i in k * BLOCK..((k + 1) * BLOCK).min(n) {
                     if (this.tick + this.units.slot[i]) % territory::PAINT_INTERVAL != 0 {
                         continue;
@@ -1337,12 +1352,12 @@ impl World {
                     territory::paint_candidates(
                         &this.map,
                         &this.units,
-                        &this.grid,
                         &this.team,
-                        this.rules.territory_radius,
+                        radius,
                         i,
                         hot,
-                        &mut enemies,
+                        &this.presence,
+                        this.team_bit[this.units.owner[i] as usize],
                         out,
                     );
                 }

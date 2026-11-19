@@ -12,6 +12,9 @@
 const BLOCK_SHIFT: u32 = 5;
 const BLOCK: u32 = 1 << BLOCK_SHIFT;
 const BLOCK_CELLS: usize = (BLOCK * BLOCK) as usize;
+/// Below this many units the per-unit passes run on one thread: forking
+/// costs more than it saves. A fixed threshold, so results never depend on it.
+const PAR_MIN: usize = 32 * 1024;
 /// Stride of one block's prefix-sum array (cells + 1 end marker).
 const STRIDE: usize = BLOCK_CELLS + 1;
 const EMPTY: u32 = u32::MAX;
@@ -94,12 +97,30 @@ impl Grid {
         self.unit_block.resize(n, 0);
         self.unit_cell.resize(n, 0);
         self.cell_units.resize(n, 0);
-        // Pass 1: which blocks are occupied, and where each unit goes.
+        // Pass 1 (parallel for large worlds): where each unit goes.
+        {
+            use rayon::prelude::*;
+            const B: usize = 4096;
+            let (mut ub, mut uc) = (std::mem::take(&mut self.unit_block), std::mem::take(&mut self.unit_cell));
+            let this = &*self;
+            let work = |k: usize, (ub, uc): (&mut [u32], &mut [u16])| {
+                for j in 0..ub.len() {
+                    let i = k * B + j;
+                    let (cx, cy) = this.cell_xy(pos_x[i], pos_y[i]);
+                    let (b, l) = this.block_and_local(cx, cy);
+                    (ub[j], uc[j]) = (b, l as u16);
+                }
+            };
+            if n >= PAR_MIN {
+                (ub.par_chunks_mut(B), uc.par_chunks_mut(B)).into_par_iter().enumerate().for_each(|(k, p)| work(k, p));
+            } else {
+                ub.chunks_mut(B).zip(uc.chunks_mut(B)).enumerate().for_each(|(k, p)| work(k, p));
+            }
+            (self.unit_block, self.unit_cell) = (ub, uc);
+        }
+        // Which blocks are occupied.
         for i in 0..n {
-            let (cx, cy) = self.cell_xy(pos_x[i], pos_y[i]);
-            let (b, l) = self.block_and_local(cx, cy);
-            self.unit_block[i] = b;
-            self.unit_cell[i] = l as u16;
+            let b = self.unit_block[i];
             if self.block_slot[b as usize] == EMPTY {
                 self.block_slot[b as usize] = 0; // mark; slot assigned below
                 self.occupied.push(b);
@@ -150,10 +171,45 @@ impl Grid {
         self.sy.resize(n, 0);
         self.steam.resize(n, 0);
         self.rank.resize(n, 0);
+        // Sorted copies (parallel gather for large worlds), then the inverse
+        // permutation.
+        {
+            use rayon::prelude::*;
+            const B: usize = 4096;
+            let units = &self.cell_units;
+            let work = |k: usize, (sx, sy, st): (&mut [i32], &mut [i32], &mut [u8])| {
+                for j in 0..sx.len() {
+                    let i = units[k * B + j] as usize;
+                    (sx[j], sy[j], st[j]) = (pos_x[i], pos_y[i], team_of[owner[i] as usize]);
+                }
+            };
+            if n >= PAR_MIN {
+                (self.sx.par_chunks_mut(B), self.sy.par_chunks_mut(B), self.steam.par_chunks_mut(B))
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(k, p)| work(k, p));
+            } else {
+                for (k, ((sx, sy), st)) in
+                    self.sx.chunks_mut(B).zip(self.sy.chunks_mut(B)).zip(self.steam.chunks_mut(B)).enumerate()
+                {
+                    work(k, (sx, sy, st));
+                }
+            }
+        }
         for (k, &i) in self.cell_units.iter().enumerate() {
-            let i = i as usize;
-            self.rank[i] = k as u32;
-            (self.sx[k], self.sy[k], self.steam[k]) = (pos_x[i], pos_y[i], team_of[owner[i] as usize]);
+            self.rank[i as usize] = k as u32;
+        }
+    }
+
+    /// After the units were permuted by `order` (the old `cell_units`), the
+    /// grid is the same with unit `k` now at grid position `k`: update the
+    /// per-unit indices instead of rebuilding.
+    pub fn units_permuted(&mut self, order: &[u32]) {
+        let (ub, uc) = (std::mem::take(&mut self.unit_block), std::mem::take(&mut self.unit_cell));
+        self.unit_block = order.iter().map(|&i| ub[i as usize]).collect();
+        self.unit_cell = order.iter().map(|&i| uc[i as usize]).collect();
+        for (k, (c, r)) in self.cell_units.iter_mut().zip(self.rank.iter_mut()).enumerate() {
+            (*c, *r) = (k as u32, k as u32);
         }
     }
 
@@ -207,6 +263,17 @@ impl Grid {
         let x1 = (cx + 1).min(self.cells_w - 1);
         for gy in cy.saturating_sub(1)..=(cy + 1).min(self.cells_h - 1) {
             self.row_ranges(gy, x0, x1, &mut f);
+        }
+    }
+
+    /// Calls `f(range)` for the slices covering every cell that overlaps the
+    /// square of half-size `range` (raw Q16.16) around `(x, y)`.
+    #[inline]
+    pub fn ranges_in_range(&self, x: i32, y: i32, range: i32, mut f: impl FnMut(std::ops::Range<usize>)) {
+        let (cx0, cy0) = self.cell_xy(x.saturating_sub(range), y.saturating_sub(range));
+        let (cx1, cy1) = self.cell_xy(x.saturating_add(range), y.saturating_add(range));
+        for gy in cy0..=cy1 {
+            self.row_ranges(gy, cx0, cx1, &mut f);
         }
     }
 

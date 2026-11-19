@@ -238,34 +238,55 @@ hills, which contradicts spec §2.3 ("slow and weak").
 
 ## Performance (stage 4: parallel + SIMD)
 
-`iron-dots-headless bench`, best of 3 runs, mean tick on a 4-vCPU cloud VM
-(Xeon 2.1 GHz with AVX-512). "Stage 3" is the previous commit (scalar code);
-the stage 4 columns are the same scenario with the kernels at a forced level
-(`IRON_DOTS_SIMD`).
+Run `iron-dots-headless scaling` to get this table for any machine: the three
+standard scenarios on 1, 2, 4, … up to every hardware thread, best of 3 runs,
+plus a check that every thread count ends in the same state. The
+**Scaling benchmark** workflow (Actions → Run workflow) runs it on any runner
+label and puts the table in the job summary.
 
-| Scenario | Threads | Stage 3 | Reference kernels | SSE4.2 | AVX2 | AVX-512 |
-|---|---|---|---|---|---|---|
-| 10 000 units, 1024², marching | 1 | 2.90 ms | 3.95 ms | 2.52 ms | 2.33 ms | 2.41 ms |
-| | 4 | 1.27 ms | 1.81 ms | 1.38 ms | 1.37 ms | 1.44 ms |
-| 10 000 units, one front | 1 | 7.25 ms | 8.41 ms | 5.80 ms | 5.79 ms | 5.82 ms |
-| | 4 | 2.77 ms | 3.48 ms | 2.63 ms | 2.53 ms | 2.66 ms |
-| 100 000 units, 4096², 8 players | 1 | 23.9 ms | 30.1 ms | 18.7 ms | 18.0 ms | 18.2 ms |
-| | 4 | 7.99 ms | 10.4 ms | 7.46 ms | 7.33 ms | 7.06 ms |
+Measured here on a 4-vCPU cloud VM (Xeon 2.1 GHz, AVX-512 level):
 
-Single-threaded, the vector kernels plus sorting cut the tick by 16–25%. On
-4 threads the gain is smaller (0–9%) because the remaining sequential work
-(grid rebuild, order transitions, territory writes) and memory bandwidth
-dominate. AVX-512 is not faster than AVX2 here: the inputs are about 60
-elements long.
+| Scenario | 1 thr | 2 thr | 4 thr | Speed-up |
+|---|---|---|---|---|
+| 10k units, 1024², marching | 2.39 ms | 1.55 ms | 1.26 ms | 1.9× |
+| 10k units, 1024², one front | 5.07 ms | 3.42 ms | 2.45 ms | 2.1× |
+| 100k units, 4096², 8 players | 16.50 ms | 10.55 ms | 6.47 ms | 2.6× |
+
+For comparison, stage 3 (scalar, no sorting) measured 2.90 / 7.25 / 23.9 ms on
+1 thread and 1.27 / 2.77 / 7.99 ms on 4 threads. The VM is noisy: repeated runs
+vary by about ±10%.
+
+What brought the 4-thread numbers down after the first SIMD version:
+
+- **One pass for movement.** Intent, walking, terrain blocking, waypoint
+  progress, committing positions and water handling run as a single
+  per-unit parallel pass after the separation pass, instead of four. This
+  means fewer fork/joins and fewer sweeps over memory. Results are
+  bit-identical.
+- **Cheaper re-sorting.** Units are permuted in parallel (large worlds), and
+  the grid is updated in place afterwards instead of being rebuilt. Cell
+  computation and the grid-ordered copies run in parallel for large worlds.
+  Below 32k units these stay sequential, because forking cost more than it
+  saved.
+- **Territory at the front.** Near hostile units (hot chunks and their
+  neighbours), every tile first gets the team bits of all units within the
+  territory radius. This is stamped in parallel per 64×64 chunk with the
+  same distance test as before. A painting unit then checks a tile with one
+  lookup instead of scanning every nearby enemy. Same results; territory
+  dropped from 2.2 to 1.7 ms single-threaded in the front-line case.
+
+Tried and dropped because the benchmark showed no gain: 16×16-cell grid
+blocks (and they change the unit order, i.e. results), and collecting
+enemies for territory with the SIMD kernel.
 
 Against the spec 3 targets for 10 000 units on 1024²:
 
-- **Weak PC (4 cores, SSE4.2): ≤ 3 ms.** Met on this 4-vCPU VM at the SSE4.2
-  level in both scenarios (1.38 ms, 2.63 ms).
-- **Average PC (6 cores / 12 threads, AVX2): ≤ 1 ms.** Not demonstrated
-  here; 4 threads give 1.37 ms marching, 2.53 ms on a full front. This has
-  to be measured on the reference machine. The obvious next steps are a
-  parallel grid rebuild and cheaper territory painting near fronts.
+- **Weak PC (4 cores, SSE4.2): ≤ 3 ms.** Met on this VM: 1.3 ms marching,
+  2.5 ms on a full front.
+- **Average PC (6 cores / 12 threads, AVX2): ≤ 1 ms.** Not measurable here.
+  Scaling from 2 to 4 threads is still 1.2–1.6×, so 12 threads should bring
+  marching under 1 ms, but the full front line likely stays above it. Run
+  `iron-dots-headless scaling` on the reference machine to settle it.
 
 In normal (non-sandbox) matches, pocket labelling floods the whole map every
 15 ticks. That is fine up to 1024² but is replaced by union-find over the chunk

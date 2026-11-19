@@ -6,6 +6,8 @@
 //! iron-dots-headless hash   [opts]              print the final state hash
 //! iron-dots-headless bench  [opts]              tick timings: p50 / p99 / max
 //! iron-dots-headless match  [opts] [--out FILE] bots play a standard match to the end
+//! iron-dots-headless scaling [--threads MAX]    thread-scaling table (Markdown) for the
+//!                                               spec 3 targets, up to all hardware threads
 //!
 //! opts: --map N (tiles, default 256)  --units N (per player, default 200)
 //!       --players N (default 2)       --seed N (default 1)
@@ -140,23 +142,36 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{:016x}", r.final_hash().unwrap_or(0));
         }
         "bench" => bench(&o, &b)?,
+        "scaling" => scaling(&o, &b)?,
         "match" => play_match(&o, &b)?,
         _ => return Err(usage()),
     }
     Ok(())
 }
 
-fn bench(o: &Opts, b: &Balance) -> Result<(), String> {
-    let spec = scenario(o)?;
+/// Result of running one scenario.
+struct Measured {
+    mean: Duration,
+    p50: Duration,
+    p99: Duration,
+    max: Duration,
+    phases: [Duration; Phase::ALL.len()],
+    peak_combat: u32,
+    units_left: usize,
+    hash: u64,
+}
+
+/// Runs `spec` for `ticks` with scripted players on `threads` threads and
+/// times every tick and phase (outside the simulation: it never reads a clock).
+fn measure(spec: &ScenarioSpec, b: &Balance, threads: usize, ticks: u32) -> Result<Measured, String> {
     let mut world: World = spec.build(b)?;
-    world.set_threads(o.threads)?;
+    world.set_threads(threads)?;
     let mut bots: Vec<ScriptedPlayer> = (1..=world.player_count()).map(ScriptedPlayer::new).collect();
-    let start_units = world.units().len();
-    let mut times: Vec<Duration> = Vec::with_capacity(o.ticks as usize);
+    let mut times: Vec<Duration> = Vec::with_capacity(ticks as usize);
     let mut peak_combat = 0;
-    let mut phase_time = [Duration::ZERO; Phase::ALL.len()];
+    let mut phases = [Duration::ZERO; Phase::ALL.len()];
     let mut cmds = Vec::new();
-    for _ in 0..o.ticks {
+    for _ in 0..ticks {
         cmds.clear();
         for bot in &mut bots {
             cmds.extend(bot.think(&world));
@@ -165,7 +180,7 @@ fn bench(o: &Opts, b: &Balance) -> Result<(), String> {
         let mut last = t;
         world.step_with(&cmds, &mut |p| {
             let now = Instant::now();
-            phase_time[p as usize] += now - last;
+            phases[p as usize] += now - last;
             last = now;
         });
         times.push(t.elapsed());
@@ -173,30 +188,123 @@ fn bench(o: &Opts, b: &Balance) -> Result<(), String> {
     }
     times.sort();
     let pct = |p: usize| times[(times.len() - 1) * p / 100];
-    let total: Duration = times.iter().sum();
+    let n = ticks.max(1);
+    Ok(Measured {
+        mean: times.iter().sum::<Duration>() / n,
+        p50: pct(50),
+        p99: pct(99),
+        max: times.last().copied().unwrap_or_default(),
+        phases: phases.map(|d| d / n),
+        peak_combat,
+        units_left: world.units().len(),
+        hash: world.state_hash(),
+    })
+}
+
+fn bench(o: &Opts, b: &Balance) -> Result<(), String> {
+    let spec = scenario(o)?;
+    let start_units = spec.spawns.len();
+    let m = measure(&spec, b, o.threads, o.ticks)?;
     println!(
-        "map {m}x{m}, {start_units} units ({} left), {} ticks, {} threads, peak in combat {peak_combat}",
-        world.units().len(),
+        "map {map}x{map}, {start_units} units ({} left), {} ticks, {} threads, simd {}, peak in combat {}",
+        m.units_left,
         o.ticks,
         o.threads,
-        m = o.map
+        simd_kernels::kernels().level().name(),
+        m.peak_combat,
+        map = o.map
     );
-    println!(
-        "tick: mean {:.3?}  p50 {:.3?}  p99 {:.3?}  max {:.3?}",
-        total / o.ticks.max(1),
-        pct(50),
-        pct(99),
-        times.last().copied().unwrap_or_default()
-    );
-    let total_phases: Duration = phase_time.iter().sum();
+    println!("tick: mean {:.3?}  p50 {:.3?}  p99 {:.3?}  max {:.3?}", m.mean, m.p50, m.p99, m.max);
+    let total: Duration = m.phases.iter().sum();
     let mut line = String::from("phases:");
     for p in Phase::ALL {
-        let d = phase_time[p as usize];
-        let pct = d.as_nanos() * 100 / total_phases.as_nanos().max(1);
-        line += &format!("  {} {:.2?} ({pct}%)", p.name(), d / o.ticks.max(1));
+        let d = m.phases[p as usize];
+        let pct = d.as_nanos() * 100 / total.as_nanos().max(1);
+        line += &format!("  {} {:.2?} ({pct}%)", p.name(), d);
     }
     println!("{line}");
-    println!("final hash {:016x}", world.state_hash());
+    println!("final hash {:016x}", m.hash);
+    Ok(())
+}
+
+fn cpu_name() -> String {
+    if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+        if let Some(l) = info.lines().find(|l| l.starts_with("model name")) {
+            return l.split(':').nth(1).unwrap_or("").trim().to_string();
+        }
+    }
+    std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "unknown CPU".into())
+}
+
+/// Thread-scaling table for the spec 3 targets: the three standard
+/// scenarios on 1, 2, 4, … threads up to every hardware thread, best of
+/// `repeats` runs each. Prints Markdown, ready to paste into an issue.
+fn scaling(o: &Opts, b: &Balance) -> Result<(), String> {
+    let hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let max_threads = if o.threads > 1 { o.threads } else { hw };
+    let mut counts: Vec<usize> =
+        std::iter::successors(Some(1usize), |&t| Some(t * 2)).take_while(|&t| t < max_threads).collect();
+    counts.push(max_threads);
+    let repeats = 3;
+    let scenarios: [(&str, ScenarioSpec, u32); 3] = [
+        ("10k units, 1024², marching", ScenarioSpec::battle(1024, 5000, 2, 1)?, 600),
+        ("10k units, 1024², one front", ScenarioSpec::front(1024, 5000, 1)?, 300),
+        ("100k units, 4096², 8 players", ScenarioSpec::battle(4096, 12_500, 8, 1)?, 150),
+    ];
+    println!("# Iron Dots scaling");
+    println!();
+    println!(
+        "CPU: {} · {hw} hardware threads · SIMD level: {} · sim version {}",
+        cpu_name(),
+        simd_kernels::kernels().level().name(),
+        sim_core::SIM_CODE_VERSION
+    );
+    println!();
+    print!("| Scenario |");
+    for t in &counts {
+        print!(" {t} thr |");
+    }
+    println!(" Speed-up |");
+    print!("|---|");
+    for _ in &counts {
+        print!("---|");
+    }
+    println!("---|");
+    let mut hashes = Vec::new();
+    for (name, spec, ticks) in &scenarios {
+        let mut row = Vec::new();
+        for &t in &counts {
+            let mut best: Option<Measured> = None;
+            for _ in 0..repeats {
+                let m = measure(spec, b, t, *ticks)?;
+                if best.as_ref().is_none_or(|bm| m.mean < bm.mean) {
+                    best = Some(m);
+                }
+            }
+            let m = best.expect("at least one run");
+            hashes.push((name.to_string(), t, m.hash));
+            row.push(m.mean);
+            eprintln!("{name}: {t} threads → {:.3?}", m.mean);
+        }
+        print!("| {name} |");
+        for d in &row {
+            print!(" {:.2} ms |", d.as_secs_f64() * 1000.0);
+        }
+        let speedup = row[0].as_secs_f64() / row.last().copied().unwrap_or(row[0]).as_secs_f64();
+        println!(" {speedup:.1}× |");
+    }
+    println!();
+    // Every thread count must give the same final state.
+    for (name, spec_hashes) in scenarios.iter().map(|(n, _, _)| (n, hashes.iter().filter(move |h| h.0 == **n))) {
+        let mut hs: Vec<u64> = spec_hashes.map(|h| h.2).collect();
+        hs.dedup();
+        let verdict = if hs.len() == 1 { "identical on all thread counts" } else { "DIFFERS between thread counts" };
+        println!("- {name}: final hash {:016x}, {verdict}", hs[0]);
+    }
+    println!();
+    println!(
+        "Spec 3 targets for 10 000 units on 1024²: ≤ 1 ms (6 cores / 12 threads, AVX2), ≤ 3 ms (4 cores, SSE4.2)."
+    );
     Ok(())
 }
 
@@ -233,7 +341,7 @@ fn play_match(o: &Opts, b: &Balance) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: iron-dots-headless <record|verify|hash|bench|match> [--map N] [--units N] [--players N] \
+    "usage: iron-dots-headless <record|verify|hash|bench|match|scaling> [--map N] [--units N] [--players N] \
      [--seed N] [--ticks N] [--balance FILE] [--out FILE] [FILE]"
         .into()
 }
