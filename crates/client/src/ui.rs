@@ -46,7 +46,7 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                 egui::ComboBox::from_id_salt("map").selected_text(format!("{0}×{0}", m.settings.map_size)).show_ui(
                     ui,
                     |ui| {
-                        for s in [128, 256, 512, 1024] {
+                        for s in [128, 256, 512, 1024, 2048, 4096] {
                             ui.selectable_value(&mut m.settings.map_size, s, format!("{s}×{s}"));
                         }
                     },
@@ -67,6 +67,18 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                 ui.label("Map seed");
                 ui.add(egui::DragValue::new(&mut m.settings.seed));
                 ui.end_row();
+                ui.label("Sandbox");
+                ui.checkbox(&mut m.settings.sandbox, "huge armies, no upkeep or supply limits");
+                ui.end_row();
+                if m.settings.sandbox {
+                    ui.label("Units per side");
+                    ui.add(egui::Slider::new(&mut m.settings.units_per_player, 100..=12_500).logarithmic(true));
+                    ui.end_row();
+                    let total = m.settings.units_per_player as u64 * (m.settings.opponents as u64 + 1);
+                    ui.label("");
+                    ui.weak(format!("{total} units in total"));
+                    ui.end_row();
+                }
             });
             ui.add_space(16.0);
             if ui.button(RichText::new("  Play vs AI  ").size(20.0)).clicked() {

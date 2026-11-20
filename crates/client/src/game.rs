@@ -18,13 +18,27 @@ pub struct MatchSettings {
     pub opponents: u8,
     pub difficulty: Difficulty,
     pub seed: u64,
+    /// Sandbox (spec 2.7): big armies from the start, no upkeep or supply
+    /// limits; `units_per_player` per faction.
+    pub sandbox: bool,
+    pub units_per_player: u32,
 }
 
 impl Default for MatchSettings {
     fn default() -> Self {
-        MatchSettings { map_size: 256, opponents: 1, difficulty: Difficulty::Normal, seed: 1 }
+        MatchSettings {
+            map_size: 256,
+            opponents: 1,
+            difficulty: Difficulty::Normal,
+            seed: 1,
+            sandbox: false,
+            units_per_player: 2_000,
+        }
     }
 }
+
+/// Below this zoom (pixels per tile) units are drawn as density markers.
+pub const LOD_SCALE: f32 = 2.0;
 
 /// Game speeds (spec 2.9): ×0.5, ×1, ×2, ×4.
 pub const SPEEDS: [f32; 4] = [0.5, 1.0, 2.0, 4.0];
@@ -66,7 +80,11 @@ impl Game {
     pub fn new(settings: MatchSettings) -> Result<Game, String> {
         let balance = Balance::default_balance();
         let players = settings.opponents + 1;
-        let spec = ScenarioSpec::standard_match(settings.map_size, players, settings.seed, &balance)?;
+        let spec = if settings.sandbox {
+            ScenarioSpec::battle(settings.map_size, settings.units_per_player, players, settings.seed)?
+        } else {
+            ScenarioSpec::standard_match(settings.map_size, players, settings.seed, &balance)?
+        };
         let mut world = spec.build(&balance)?;
         // Leave one core for rendering and the UI; results do not depend on
         // the thread count.
@@ -75,7 +93,8 @@ impl Game {
         let me = 1;
         let bots = (2..=players).map(|p| Bot::new(p, settings.difficulty)).collect();
         let cap = world.cities().iter().find(|c| c.capital_of == me).map(|c| c.center()).unwrap_or_default();
-        let camera = Camera { center: [fx(cap.x), fx(cap.y)], scale: 10.0 };
+        let scale = if settings.sandbox { 3.0 } else { 10.0 };
+        let camera = Camera { center: [fx(cap.x), fx(cap.y)], scale };
         Ok(Game {
             world,
             me,
@@ -379,16 +398,57 @@ impl Game {
 
     // ------------------------------------------------------------- view
 
-    /// Builds markers for units and cities (cities first, units on top).
-    pub fn markers(&self, out: &mut Vec<Marker>) {
+    /// Builds markers for what is on screen: cities first, units on top.
+    /// Zoomed far out (below [`LOD_SCALE`]) units are aggregated into
+    /// density markers, one per few screen pixels, coloured by the side
+    /// with most units there.
+    pub fn markers(&self, out: &mut Vec<Marker>, viewport: [f32; 2]) {
         out.clear();
         let rules = self.world.rules();
+        let a = self.camera.screen_to_world([0.0, 0.0], viewport);
+        let b = self.camera.screen_to_world(viewport, viewport);
+        let margin = 2.0;
+        let visible = |p: [f32; 2]| {
+            p[0] >= a[0] - margin && p[0] <= b[0] + margin && p[1] >= a[1] - margin && p[1] <= b[1] + margin
+        };
         for c in self.world.cities() {
             let p = c.center();
-            let progress = c.capture_ticks as f32 / rules.capture_ticks as f32;
-            out.push(Marker::city([fx(p.x), fx(p.y)], c.owner, c.capital_of != 0, progress));
+            let pos = [fx(p.x), fx(p.y)];
+            if visible(pos) {
+                let progress = c.capture_ticks as f32 / rules.capture_ticks as f32;
+                out.push(Marker::city(pos, c.owner, c.capital_of != 0, progress));
+            }
         }
         let u = self.world.units();
+        if self.camera.scale < LOD_SCALE {
+            // Bins of about 6 screen pixels.
+            let bin = (6.0 / self.camera.scale).max(1.0);
+            let (x0, y0) = (a[0] - margin, a[1] - margin);
+            let cols = (((b[0] - a[0]) + 2.0 * margin) / bin).ceil().max(1.0) as usize;
+            let rows = (((b[1] - a[1]) + 2.0 * margin) / bin).ceil().max(1.0) as usize;
+            let mut counts = vec![[0u32; 10]; cols * rows]; // 9 owners + "in combat"
+            for i in 0..u.len() {
+                let p = [u.pos_x[i] as f32 / 65536.0, u.pos_y[i] as f32 / 65536.0];
+                let (cx, cy) = (((p[0] - x0) / bin).floor(), ((p[1] - y0) / bin).floor());
+                if cx < 0.0 || cy < 0.0 || cx >= cols as f32 || cy >= rows as f32 {
+                    continue;
+                }
+                let cell = &mut counts[cy as usize * cols + cx as usize];
+                cell[u.owner[i] as usize] += 1;
+                cell[9] |= (u.flags[i] & flags::IN_COMBAT != 0) as u32;
+            }
+            for (k, cell) in counts.iter().enumerate() {
+                let total: u32 = cell[..9].iter().sum();
+                if total == 0 {
+                    continue;
+                }
+                let owner = (1..9).max_by_key(|&o| (cell[o], std::cmp::Reverse(o))).unwrap_or(1) as u8;
+                let pos = [x0 + (k % cols) as f32 * bin + bin / 2.0, y0 + (k / cols) as f32 * bin + bin / 2.0];
+                let radius = (1.5 + (total as f32).sqrt() * 0.8).min(4.0) as u8;
+                out.push(Marker::density(pos, owner, radius, cell[9] != 0));
+            }
+            return;
+        }
         let mut selected = vec![false; u.len()];
         for h in &self.selection {
             if let Some(i) = u.index_of(*h) {
@@ -396,6 +456,10 @@ impl Game {
             }
         }
         for (i, &sel) in selected.iter().enumerate() {
+            let pos = self.unit_pos(i);
+            if !visible(pos) {
+                continue;
+            }
             let mut f = 0;
             if u.kind[i] == UnitKind::Heavy as u8 {
                 f |= mflags::HEAVY;
@@ -410,7 +474,7 @@ impl Game {
                 f |= mflags::SELECTED;
             }
             out.push(Marker::unit(
-                self.unit_pos(i),
+                pos,
                 u.owner[i],
                 f,
                 u.hp[i] as f32 / rules.max_hp as f32,

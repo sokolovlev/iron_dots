@@ -6,6 +6,7 @@
 //! iron-dots --screenshot FILE [opts] [--ticks N] [--size WxH] [--zoom PX] [--no-hud]
 //!                                   render a bot-vs-bot frame to PNG, no window
 //! opts: --map N  --opponents N  --difficulty easy|normal|hard  --seed N
+//!       --sandbox [--units N]   (spec 2.7: N units per side, no upkeep/supply)
 //! ```
 
 mod app;
@@ -36,6 +37,8 @@ fn parse() -> Result<(Option<String>, bool, offscreen::ShotOptions), String> {
             "--screenshot" => shot = Some(val()?),
             "--play" => play = true,
             "--map" => o.settings.map_size = num(val()?)? as u32,
+            "--sandbox" => o.settings.sandbox = true,
+            "--units" => o.settings.units_per_player = num(val()?)?.clamp(1, 12_500) as u32,
             "--opponents" => o.settings.opponents = num(val()?)?.clamp(1, 7) as u8,
             "--seed" => o.settings.seed = num(val()?)?,
             "--ticks" => o.ticks = num(val()?)? as u32,

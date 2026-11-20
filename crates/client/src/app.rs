@@ -319,7 +319,7 @@ impl App {
             for (cx, cy) in map_changed {
                 r.upload_chunk(queue, g.world.map(), cx, cy);
             }
-            g.markers(&mut self.markers);
+            g.markers(&mut self.markers, vp);
             g.overlay(&mut self.overlay, vp);
             r.set_markers(device, queue, &self.markers);
             r.set_overlay(device, queue, &self.overlay.vertices);

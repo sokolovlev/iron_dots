@@ -43,7 +43,15 @@ fixed-point SoA core, spatial grid, movement, combat with morale, replays, golde
 - Reference PC (6 cores / 12 threads, AVX2): 10 000 units 0.56 ms marching, 0.98 ms with all of them fighting on one front, 100 000 units 3.12 ms. All spec 3 tick targets met; hashes identical on Windows and Linux ([details](ARCHITECTURE.md#performance-stage-4-parallel--simd))
 - Measure any machine with `cargo run --release -p headless -- scaling` (Markdown table, 1…N threads)
 
-Next: stage 5, hierarchical flow-field pathfinding, 4096² maps, sandbox mode and rendering LOD.
+**Stage 5: pathfinding and scale** ✓ (reference-PC measurement pending)
+
+- [x] `pathing` crate: chunk portal graph per unit type, shared coarse fields per target, direction fields per chunk where units are
+- [x] Units follow fields around mountains, lakes and costly terrain; formations kept on open ground; A* removed from commands
+- [x] Fields computed in tick phase 3 with a fixed budget (deterministic), unused ones collected
+- [x] Sandbox in the menu: maps up to 4096², up to 8 sides × 12 500 units, no upkeep or supply limits
+- [x] Rendering LOD: density markers when zoomed far out, on-screen culling
+
+Next: stage 6, multiplayer (lockstep, relay server, lobbies, reconnection, desync detection).
 
 ## Play
 
@@ -55,6 +63,12 @@ Or jump straight into a match:
 
 ```bash
 cargo run --release -p client -- --play --map 256 --opponents 1 --difficulty normal
+```
+
+Or the sandbox (spec 2.7), 8 sides × 12 500 units on a 4096² map:
+
+```bash
+cargo run --release -p client -- --play --sandbox --map 4096 --opponents 7 --units 12500
 ```
 
 | Action | Input |
@@ -99,13 +113,14 @@ pass `--balance FILE` to the headless runner to try another one.
 | Crate | What it is |
 |---|---|
 | `crates/simd-kernels` | SIMD kernels with scalar references and runtime CPU dispatch (the only `unsafe`) |
-| `crates/sim-core` | Deterministic simulation: world, tick phases, commands, pathfinding, replays |
+| `crates/pathing` | Hierarchical flow fields: chunk portal graph, coarse and chunk fields |
+| `crates/sim-core` | Deterministic simulation: world, tick phases, commands, flow-field steering, replays |
 | `crates/ai` | Bots: read the world, issue ordinary commands; deterministic |
 | `crates/render` | wgpu renderer: map, territory, borders, instanced markers, overlay |
 | `crates/client` | `iron-dots`: window, input, egui UI, offscreen screenshots |
 | `crates/headless` | `iron-dots-headless`: matches, replays, determinism checks, benchmarks |
 
-Later stages add `pathing` (flow fields), `net`, `relay-server`
+Later stages add `net`, `relay-server`
 and `editor`. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Contributing

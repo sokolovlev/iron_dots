@@ -64,7 +64,7 @@ pub fn screenshot(opts: &ShotOptions, path: &str) -> Result<String, String> {
     let mut r = Renderer::new(&gpu.device, &gpu.queue, format, game.world.map());
     let mut markers: Vec<Marker> = Vec::new();
     let mut overlay = Overlay::default();
-    game.markers(&mut markers);
+    game.markers(&mut markers, vp);
     game.overlay(&mut overlay, vp);
     r.set_markers(&gpu.device, &gpu.queue, &markers);
     r.set_overlay(&gpu.device, &gpu.queue, &overlay.vertices);

@@ -106,7 +106,8 @@ struct Marker {
     // bits 0-3 owner, 4 heavy, 5 ship, 6 selected, 7 in combat,
     // 8-9 shape (0 unit, 1 city, 2 capital)
     @location(1) info: u32,
-    // bits 0-7 HP, 8-15 morale, 16-23 capture progress (all 0..255)
+    // bits 0-7 HP, 8-15 morale, 16-23 capture progress (all 0..255),
+    // 24-31 fixed radius in screen pixels (density markers; 0 = normal)
     @location(2) stats: u32,
 };
 
@@ -129,6 +130,10 @@ fn vs_marker(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32, m
     var radius = max(0.45, 4.0 / cam.scale);
     if (shape != 0u) {
         radius = max(0.75, 7.0 / cam.scale);
+    }
+    let fixed_px = f32(m.stats >> 24u);
+    if (fixed_px > 0.0) {
+        radius = fixed_px / cam.scale;
     }
     var pos = m.pos;
     if ((m.info & 0x80u) != 0u && shape == 0u) {
@@ -191,7 +196,7 @@ fn fs_marker(in: MarkerOut) -> @location(0) vec4<f32> {
             col = mix(col, vec4<f32>(1.0, 1.0, 1.0, 1.0), sel);
         }
         // HP and morale bars above the dot when zoomed in enough.
-        if (in.px_per_unit > 4.0 && p.x > -1.0 && p.x < 1.0) {
+        if (in.px_per_unit > 4.0 && (in.stats >> 24u) == 0u && p.x > -1.0 && p.x < 1.0) {
             let x = (p.x + 1.0) * 0.5;
             if (p.y > -1.75 && p.y < -1.5) {
                 let c = select(vec3<f32>(0.2, 0.2, 0.2), vec3<f32>(0.25, 0.8, 0.3), x < hp);

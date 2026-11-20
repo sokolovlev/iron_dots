@@ -73,7 +73,8 @@ pub struct Marker {
     pub pos: [f32; 2],
     /// Bits 0-3 owner, 4-7 [`mflags`], 8-9 [`shape`].
     pub info: u32,
-    /// Bits 0-7 HP, 8-15 morale, 16-23 capture progress (0..=255 each).
+    /// Bits 0-7 HP, 8-15 morale, 16-23 capture progress (0..=255 each),
+    /// 24-31 fixed on-screen radius in pixels (0 = normal size).
     pub stats: u32,
 }
 
@@ -83,6 +84,17 @@ impl Marker {
             pos,
             info: (owner as u32 & 0xF) | (flags & 0xF0) | (shape::UNIT << 8),
             stats: unit_byte(hp) | (unit_byte(morale) << 8),
+        }
+    }
+
+    /// An aggregate of many units seen from far away (rendering LOD): a dot
+    /// of `radius_px` screen pixels in the owner's colour.
+    pub fn density(pos: [f32; 2], owner: u8, radius_px: u8, in_combat: bool) -> Marker {
+        let f = if in_combat { mflags::IN_COMBAT } else { 0 };
+        Marker {
+            pos,
+            info: (owner as u32 & 0xF) | f | (shape::UNIT << 8),
+            stats: 0xFFFF | ((radius_px.max(1) as u32) << 24),
         }
     }
 

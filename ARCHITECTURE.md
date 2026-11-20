@@ -25,9 +25,9 @@ parallel without changing results.
 
 | # | Phase | Stage |
 |---|---|---|
-| 1 | Apply this tick's commands, sorted by `(player, seq)`; Move plans an A* route | 1–2 ✓ |
+| 1 | Apply this tick's commands, sorted by `(player, seq)` | 1 ✓ |
 | 2 | Rebuild the spatial grid (counting sort) | 1 ✓ |
-| 3 | Pathfinding: hierarchical flow fields | 5 |
+| 3 | Pathfinding: flow fields requested last tick, fixed budget | 5 ✓ |
 | 4 | Intent: desired velocity from the current order | 1 ✓ |
 | 5 | Separation + integration + terrain blocking; waypoints, water/ships | 1 ✓ |
 | 6 | Combat: contacts → pulled damage (combat, water, starvation) → HP and morale | 1–2 ✓ |
@@ -185,12 +185,52 @@ Stage 2 had to pin down details that spec §2 describes only in words:
   defender resets the progress; attackers from two hostile teams freeze it.
 - **Sandbox** (benchmarks, spec §2.7): no upkeep and no supply limits, so
   pocket labelling is skipped entirely.
-- **Pathfinding:** A* only when the straight segment would cross mountains
-  or terrain costlier than its endpoints. The search window is the bounding
-  box of start and goal grown by the route length (max 512 tiles per side),
-  with at most 20 000 nodes per search and 200 000 per tick. Commands beyond
-  the budget walk straight. Waypoints inserted by A* are followed exactly;
-  the player's own points keep the formation offset.
+- **Pathfinding** (see the next section): within 24 tiles of its target a
+  unit walks straight if the line is clear (re-checked every 8 ticks);
+  otherwise it follows a flow field, but keeps its own heading while the
+  field direction is within 45° of it, so formations survive open ground.
+  A unit following a field counts as stuck only if it does not move at all.
+
+## Pathfinding (stage 5)
+
+Hierarchical flow fields (spec 5.4), in the `pathing` crate (which knows
+nothing about the simulation: it reads a chunk-major terrain plane and a cost
+table) and the `sim_core::flow` module.
+
+- **Portal graph**, one per unit type, built at match setup (parallel per
+  chunk). Each 64×64 chunk is split into 4-connected passable components.
+  With no corner cutting, 4-connectivity is exactly reachability. Runs of
+  passable tile pairs across a chunk border (≤ 32 tiles, split where a
+  component changes) become portals, one node per side. Nodes of one
+  component are joined with their **exact** travel cost, from a local
+  Dijkstra per portal. It uses a cyclic bucket queue as wide as the cheapest
+  step (exact, linear time) on a padded 66×66 cost array.
+- **Coarse field** per target region (chunk + component) and unit type: a
+  reverse Dijkstra over the graph giving every portal its cost to the
+  target and the next portal (a tree). It is shared by every unit going
+  there.
+- **Chunk field**: the direction byte per tile for one chunk, computed only
+  where units stand. It is a multi-source Dijkstra seeded at the exits whose
+  next hop in the tree leaves the chunk. Because the tree has no cycles,
+  every border crossing lowers the cost to go and units never bounce
+  between chunks. (The first version seeded every border tile with a
+  lower-bound estimate; units oscillated at borders, which is why intra
+  edges are exact now.)
+- **Exact field** for the last stretch: inside the target's region, a chunk
+  field seeded at the target tile.
+- **Requests and budget.** A unit whose field is missing walks straight and
+  files a request. Phase 3 of the next tick serves the requests sorted, at
+  most 4 new coarse fields and 64 chunk/exact fields per tick, in parallel.
+  When a field appears never depends on timing or threads. Every 150 ticks,
+  coarse fields no unit uses are dropped. Above 8192 chunk fields (32 MiB),
+  those in chunks without users are dropped too.
+
+Costs on a 4096² generated map (4 threads, per unit type): graph 32 412
+portals, built in ~1.1 s at setup; coarse field ~5 ms; chunk field ~0.4 ms.
+On 1024²: 70 ms, 0.3 ms, 0.4 ms. Routes are within ~15% of the true
+shortest path (hierarchy cost; tested on an open map). In the benchmarks
+flow fields add about 8–9% to the tick, almost all of it the per-unit
+lookups in the movement pass. Phase 3 itself is ~3%.
 
 ## Bots
 
@@ -220,7 +260,12 @@ each level reliably stronger (spec v1.0 target: ≥ 70%) is stage 7 work.
    selection ring and combat tremble are drawn in the shader.
 3. **Overlay:** coloured triangles in tile space for paths and the selection box.
 
-The client interpolates unit positions between the last two ticks. Colours
+The client interpolates unit positions between the last two ticks and
+only builds markers for what is on screen. Zoomed out below 2 pixels per
+tile (stage 5 LOD), units are aggregated into density markers about 6
+pixels apart: one dot per cell in the colour of the side with most units
+there, sized by the count, trembling if any of them fights. A 4096² map
+with 100 000 units is then a few thousand instances instead of 100 000. Colours
 are authored in sRGB and converted for the sRGB swapchain. Player colours
 come from a colour-blind-safe palette (`render::palette`).
 
