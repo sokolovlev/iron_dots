@@ -100,6 +100,21 @@ impl App {
         }
     }
 
+    fn start_online(&mut self, s: crate::online::Started) {
+        match Game::online(s) {
+            Ok(game) => {
+                if let Some(gfx) = &self.gfx {
+                    self.renderer =
+                        Some(Renderer::new(&gfx.gpu.device, &gfx.gpu.queue, gfx.config.format, game.world.map()));
+                }
+                self.game = Some(game);
+                self.esc_menu = false;
+                self.menu.error = None;
+            }
+            Err(e) => self.menu.error = Some(e),
+        }
+    }
+
     /// Saves the current match to `replays/<unix time>.idr` (spec 2.10).
     fn save_replay(&self) {
         let Some(g) = &self.game else { return };
@@ -165,9 +180,10 @@ impl App {
                     g.camera.center = c;
                 }
             }
-            KeyCode::Space => g.paused = !g.paused,
-            KeyCode::Equal | KeyCode::NumpadAdd => g.speed = (g.speed + 1).min(SPEEDS.len() - 1),
-            KeyCode::Minus | KeyCode::NumpadSubtract => g.speed = g.speed.saturating_sub(1),
+            // Network matches run at the relay's pace.
+            KeyCode::Space if g.online.is_none() => g.paused = !g.paused,
+            KeyCode::Equal | KeyCode::NumpadAdd if g.online.is_none() => g.speed = (g.speed + 1).min(SPEEDS.len() - 1),
+            KeyCode::Minus | KeyCode::NumpadSubtract if g.online.is_none() => g.speed = g.speed.saturating_sub(1),
             _ => {}
         }
         let _ = (vp, shift);
@@ -249,6 +265,11 @@ impl App {
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
         let vp = self.viewport();
+        if self.game.is_none() {
+            if let Some(started) = self.menu.online.update(dt) {
+                self.start_online(started);
+            }
+        }
         let Some(gfx) = &mut self.gfx else { return };
 
         // Edge scrolling.

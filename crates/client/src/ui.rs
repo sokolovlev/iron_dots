@@ -17,6 +17,7 @@ pub enum UiAction {
 pub struct Menu {
     pub settings: MatchSettings,
     pub error: Option<String>,
+    pub online: crate::online::OnlineMenu,
 }
 
 /// Dark, high-contrast style used by every screen.
@@ -35,6 +36,15 @@ fn hud_frame(ui: &egui::Ui) -> egui::Frame {
 
 pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
     let mut action = UiAction::None;
+    if m.online.open {
+        egui::CentralPanel::default().show(root, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.12);
+                m.online.ui(ui);
+            });
+        });
+        return action;
+    }
     egui::CentralPanel::default().show(root, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.2);
@@ -85,6 +95,10 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                 action = UiAction::StartMatch(m.settings.clone());
             }
             ui.add_space(8.0);
+            if ui.button(RichText::new("  Online  ").size(20.0)).clicked() {
+                m.online.open = true;
+            }
+            ui.add_space(8.0);
             if ui.button("Quit").clicked() {
                 action = UiAction::Quit;
             }
@@ -92,7 +106,7 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                 ui.colored_label(Color32::LIGHT_RED, e);
             }
             ui.add_space(24.0);
-            ui.weak("Online, replays, editor and tutorial arrive in later stages.");
+            ui.weak("Replays viewer, editor and tutorial arrive in later stages.");
         });
     });
     action
@@ -132,7 +146,14 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                 }
             });
             let secs = w.tick() / w.rules().tick_rate;
-            let speed = if g.paused { "paused".to_string() } else { format!("×{}", SPEEDS[g.speed]) };
+            let speed = match &g.online {
+                Some(o) => {
+                    let (behind, buffer) = o.delay();
+                    format!("online, delay {behind}/{buffer} ticks")
+                }
+                None if g.paused => "paused".to_string(),
+                None => format!("×{}", SPEEDS[g.speed]),
+            };
             ui.weak(format!("{}:{:02}  {speed}  ·  {} selected", secs / 60, secs % 60, g.selection.len()));
         });
     });
@@ -160,6 +181,21 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
         });
     }
 
+    if let Some(o) = &g.online {
+        let text = match (&o.desync, &o.status) {
+            (Some(path), _) => Some((Color32::LIGHT_RED, format!("Out of sync with the other players. Dump: {path}"))),
+            (None, Some(s)) => Some((Color32::LIGHT_YELLOW, s.clone())),
+            _ => None,
+        };
+        if let Some((col, text)) = text {
+            egui::Area::new(egui::Id::unique("net")).anchor(Align2::CENTER_TOP, [0.0, 48.0]).show(ctx, |ui| {
+                hud_frame(ui).show(ui, |ui| {
+                    ui.colored_label(col, text);
+                });
+            });
+        }
+    }
+
     if let Some((msg, _)) = &g.message {
         egui::Area::new(egui::Id::unique("msg")).anchor(Align2::CENTER_TOP, [0.0, 12.0]).show(ctx, |ui| {
             hud_frame(ui).show(ui, |ui| {
@@ -179,7 +215,7 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                 ui.label(format!("Match length {}:{:02}", secs / 60, secs % 60));
                 end_charts(ui, g);
                 ui.horizontal(|ui| {
-                    if ui.button("Rematch").clicked() {
+                    if g.online.is_none() && ui.button("Rematch").clicked() {
                         action = UiAction::StartMatch(g.settings.clone());
                     }
                     if ui.button("Main menu").clicked() {
@@ -194,7 +230,8 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                 if ui.button("Resume").clicked() {
                     *menu_open = false;
                 }
-                if ui.button("Surrender").clicked() {
+                let leave = if g.online.is_some() { "Leave match" } else { "Surrender" };
+                if ui.button(leave).clicked() {
                     action = UiAction::ToMenu;
                 }
                 if ui.button("Quit game").clicked() {

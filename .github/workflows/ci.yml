@@ -93,6 +93,8 @@ jobs:
       - run: cargo build --release -p headless --features tracy
       # Stage 2 exit criterion, automated: bots play a full match to victory.
       - run: cargo run --release -p headless -- match --map 256 --players 2 --seed 1 --ticks 45000
+      # Stage 6 exit check, shortened: 3v3 over QUIC with 10% loss, 100 ms jitter and a rejoin.
+      - run: cargo run --release -p headless -- netsim --matches 4 --parallel 2 --ticks 900
 
   # Renders a real frame (map, units, HUD) with a software Vulkan driver and
   # keeps it as an artifact, so rendering regressions are visible in PRs.

@@ -1,0 +1,28 @@
+[package]
+name = "relay-server"
+description = "Iron Dots relay: lobbies, lockstep tick clock, desync detection, rejoin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "iron-dots-relay"
+path = "src/main.rs"
+
+[dependencies]
+sim-core.workspace = true
+net.workspace = true
+quinn.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+ai.workspace = true
+
+[lints]
+workspace = true

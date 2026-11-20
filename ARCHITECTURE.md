@@ -247,6 +247,68 @@ shortest path (hierarchy cost; tested on an open map). In the benchmarks
 flow fields add about 8–9% to the tick, almost all of it the per-unit
 lookups in the movement pass. Phase 3 itself is ~3%.
 
+## Multiplayer (stage 6)
+
+Deterministic lockstep (spec 6.2). Only player commands cross the network;
+traffic does not depend on the number of units.
+
+**Relay.** `relay-server` is the clock. Clients send `Commands { kinds }`;
+the relay stamps them with the next tick and the sender's player id (a
+client cannot act as someone else), and broadcasts one `TickPacket` per
+tick to everyone in the game, an empty one if nobody did anything. A client
+simulates tick `t` only once it holds packet `t`, so every client applies
+the same commands at the same tick. Bots are not players on the network:
+the `GameStart` message lists them and every client runs them locally, which
+is deterministic. The server logic (`Relay`) is a pure state machine:
+connections, messages and clock ticks in, messages out. Tests drive it
+directly; the tokio/quinn layer around it is thin. The relay never simulates,
+so one small server holds many games.
+
+**Transport.** QUIC (quinn) with one reliable bidirectional stream per
+client, u32-length-prefixed bitcode frames. QUIC retransmits lost packets,
+so loss shows up as delay, which the jitter buffer absorbs. The server makes
+a self-signed certificate at start-up; clients accept any certificate (the
+link is encrypted but the server is not authenticated, fine for typed-in and
+LAN addresses; official servers will use Steam tickets, spec 6.6). `Hello`
+carries the protocol version and `sim_version` (code version + balance
+hash); mismatches are refused.
+
+**Input delay.** Commands take effect at the tick the relay is at when they
+arrive, i.e. after one network trip plus the client's buffer. The client
+keeps 2–6 ticks of packets in hand, sized from measured arrival jitter
+(`net::lockstep`), and runs slightly faster or slower to stay at that
+buffer, or at full speed after a hiccup or a rejoin. A player who falls more
+than 150 ticks (5 s) behind pauses the game for everyone (`Stall`) until
+they catch up; a player who disconnects does not.
+
+**Desync detection.** Every 30 ticks each client sends its state hash. When
+all connected players have reported a tick the relay compares them; agreed
+hashes are kept (one u64 per second of play) so a rejoining client is
+checked as it replays. On a mismatch the relay broadcasts `Desync`, and the
+client writes `desyncs/game<id>-p<player>-t<tick>.idr`: a replay of the
+match with every hash that client computed, so dumps from two machines show
+exactly where they diverged.
+
+**Rejoin.** The relay keeps the whole command history of each game (a few
+bytes per tick). A client that lost its connection redials automatically,
+sends `Rejoin { game, token }` and gets the scenario plus every packet so
+far, then re-simulates at full speed (bounded by how fast the machine
+simulates). While it catches up it is not waited for.
+
+**LAN.** "Host LAN game" runs the same relay on a thread inside the client
+and announces it by UDP broadcast on port 27961 once a second; other clients
+list what they hear.
+
+**Bad network test.** `relay_server::netsim` runs a relay, puts
+`net::netem` in front of it (a UDP proxy that drops 10% of datagrams in both
+directions and delays each by 20–120 ms, which also reorders them), and
+connects six real QUIC clients on their own threads, each with its own world
+and a hard bot playing its player through the network. One client drops out
+at a third of the match and rejoins with a fresh world. At the end every
+client's hash list must be identical. `headless netsim --matches 20` (1800
+ticks each, 3v3 on 256²) passed 20 of 20 with no stall; a shorter run is in
+CI, and a 900-tick match runs in `cargo test`.
+
 ## Bots
 
 `crates/ai` reads the world and returns ordinary commands, so the same bots

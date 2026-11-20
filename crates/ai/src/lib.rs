@@ -91,6 +91,10 @@ impl Bot {
         Bot { player, difficulty, seq: 0, assigned: BTreeMap::new(), bought: 0 }
     }
 
+    pub fn difficulty(&self) -> Difficulty {
+        self.difficulty
+    }
+
     pub fn player(&self) -> u8 {
         self.player
     }

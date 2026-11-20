@@ -51,7 +51,17 @@ fixed-point SoA core, spatial grid, movement, combat with morale, replays, golde
 - [x] Sandbox in the menu: maps up to 4096², up to 8 sides × 12 500 units, no upkeep or supply limits
 - [x] Rendering LOD: density markers when zoomed far out, on-screen culling
 
-Next: stage 6, multiplayer (lockstep, relay server, lobbies, reconnection, desync detection).
+**Stage 6: multiplayer** ✓ — 20 matches 3v3 over a network with 10% packet loss and 100 ms jitter, one player dropping out and rejoining in each, ended in sync
+
+- [x] Deterministic lockstep: only commands travel, the relay server stamps them with a tick, every client simulates the same ticks
+- [x] `relay-server` (QUIC via quinn, bitcode messages): lobbies with slots, teams and bots; dedicated binary `iron-dots-relay`
+- [x] Adaptive input delay of 2–6 ticks from measured jitter; catch-up after hiccups; the game waits for a player who falls 5 s behind
+- [x] Reconnect: the client redials and re-simulates the match from the command history
+- [x] Desync detector: state hashes every 30 ticks compared by the relay; on mismatch each client saves a dump (replay with all its hashes) to `desyncs/`
+- [x] LAN without a server: "Host LAN game" runs the relay inside the game and announces it to the local network
+- [x] `headless netsim`: the stage exit test (QUIC through a lossy UDP proxy, 6 bot-driven clients)
+
+Next: stage 7, content and polish.
 
 ## Play
 
@@ -83,6 +93,18 @@ cargo run --release -p client -- --play --sandbox --map 4096 --opponents 7 --uni
 | Pause / speed | Space / + and − (×0.5 … ×4) |
 | Menu | Esc |
 
+**Online.** Main menu → Online. Either type a server address and Connect, or
+press *Host LAN game*: your game becomes the server and appears under "Games
+on your network" for everyone on the same LAN (UDP ports 27960 and 27961).
+The host fills slots with players or bots, sets teams and starts once all
+players are ready. In a network match there is no pause or speed control,
+and the HUD shows the current input delay. If the host of a LAN game quits,
+the match ends for everyone; a dedicated server avoids that:
+
+```bash
+cargo run --release -p relay-server -- --port 27960
+```
+
 Keys are matched by physical position, so they work on any keyboard layout.
 Linux needs a Vulkan or GL driver and `libxkbcommon-x11-0` (or Wayland) at runtime.
 
@@ -104,8 +126,14 @@ cargo run --release -p headless -- bench --map 4096 --units 12500 --players 8 --
 cargo run --release -p client -- --screenshot frame.png --map 256 --ticks 4500
 ```
 
-The last one renders a bot-vs-bot frame without a window (CI uses Mesa's
-software Vulkan driver). Balance lives in [`assets/balance.ron`](assets/balance.ron);
+```bash
+cargo run --release -p headless -- netsim --matches 20
+```
+
+The screenshot command renders a bot-vs-bot frame without a window (CI uses
+Mesa's software Vulkan driver). `netsim` plays networked 3v3 matches through
+a proxy that drops 10% of packets and adds up to 100 ms of jitter, and fails
+on any desync. Balance lives in [`assets/balance.ron`](assets/balance.ron);
 pass `--balance FILE` to the headless runner to try another one.
 
 ## Workspace
@@ -117,11 +145,12 @@ pass `--balance FILE` to the headless runner to try another one.
 | `crates/sim-core` | Deterministic simulation: world, tick phases, commands, flow-field steering, replays |
 | `crates/ai` | Bots: read the world, issue ordinary commands; deterministic |
 | `crates/render` | wgpu renderer: map, territory, borders, instanced markers, overlay |
-| `crates/client` | `iron-dots`: window, input, egui UI, offscreen screenshots |
+| `crates/net` | Protocol, framing, QUIC client, lockstep scheduling, LAN discovery, network emulator |
+| `crates/relay-server` | Lobbies, tick clock, desync detection, rejoin; `iron-dots-relay` binary; `netsim` harness |
+| `crates/client` | `iron-dots`: window, input, egui UI, online menu, offscreen screenshots |
 | `crates/headless` | `iron-dots-headless`: matches, replays, determinism checks, benchmarks |
 
-Later stages add `net`, `relay-server`
-and `editor`. See [ARCHITECTURE.md](ARCHITECTURE.md).
+A later stage adds `editor`. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Contributing
 

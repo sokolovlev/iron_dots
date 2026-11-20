@@ -2,7 +2,11 @@
 //! turned into commands, and what the renderer should show. No windowing
 //! here, so the same code drives the window and offscreen screenshots.
 
+use crate::online::{Hosting, Started};
 use ai::{Bot, Difficulty};
+use net::lockstep::Lockstep;
+use net::proto::{ClientMsg, ServerMsg};
+use net::{NetClient, NetEvent};
 use render::{Camera, Marker, Overlay, mflags};
 use sim_core::command::{Command, CommandKind};
 use sim_core::fx::{Fx, FxPoint};
@@ -10,6 +14,7 @@ use sim_core::replay::Replay;
 use sim_core::scenario::{Controller, ScenarioSpec};
 use sim_core::unit::{NO_ORDER, flags};
 use sim_core::{Balance, UnitHandle, UnitKind, World};
+use std::net::SocketAddr;
 
 /// Settings chosen in the menu.
 #[derive(Clone, Debug, PartialEq)]
@@ -74,7 +79,50 @@ pub struct Game {
     pub message: Option<(String, f32)>,
     /// Per-second history for the end-of-match charts: (units, cities, money) per player.
     pub history: Vec<[(u32, u32, i64); 9]>,
+    /// Set in a network match.
+    pub online: Option<Online>,
 }
+
+/// State of a network match (lockstep through a relay, spec 6.2).
+pub struct Online {
+    net: NetClient,
+    lock: Lockstep,
+    addr: SocketAddr,
+    name: String,
+    pub game: u32,
+    token: u64,
+    tick_rate: u32,
+    /// Hashes this client computed, for the relay and the desync dump.
+    checkpoints: Vec<(u32, u64)>,
+    last_progress: u32,
+    cmd_seq: u32,
+    /// Reconnecting: time of the next attempt and attempts so far.
+    retry: Option<(f32, u32)>,
+    /// What to tell the player (connection trouble, stalls).
+    pub status: Option<String>,
+    /// Set once the relay saw diverging hashes; the dump's path.
+    pub desync: Option<String>,
+    /// Keeps the LAN relay running while we play.
+    _hosting: Option<Hosting>,
+}
+
+impl Online {
+    /// Ticks received but not yet simulated, and the jitter buffer.
+    pub fn delay(&self) -> (u32, u32) {
+        (self.lock.available(), self.lock.buffer())
+    }
+}
+
+fn bot_difficulty(d: u8) -> Difficulty {
+    match d {
+        0 => Difficulty::Easy,
+        1 => Difficulty::Normal,
+        _ => Difficulty::Hard,
+    }
+}
+
+/// Reconnect attempts before giving up.
+const MAX_RETRIES: u32 = 20;
 
 impl Game {
     pub fn new(settings: MatchSettings) -> Result<Game, String> {
@@ -85,13 +133,53 @@ impl Game {
         } else {
             ScenarioSpec::standard_match(settings.map_size, players, settings.seed, &balance)?
         };
-        let mut world = spec.build(&balance)?;
-        // Leave one core for rendering and the UI; results do not depend on
-        // the thread count.
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        world.set_threads(cores.saturating_sub(1).max(1))?;
-        let me = 1;
         let bots = (2..=players).map(|p| Bot::new(p, settings.difficulty)).collect();
+        Game::build(settings, spec, balance, 1, bots)
+    }
+
+    /// A network match handed over by the online menu.
+    pub fn online(s: Started) -> Result<Game, String> {
+        let balance = Balance::default_balance();
+        let settings = MatchSettings {
+            map_size: 0,
+            opponents: s.scenario.players.len().saturating_sub(1) as u8,
+            seed: s.scenario.seed,
+            ..MatchSettings::default()
+        };
+        let bots = s.bots.iter().map(|&(p, d)| Bot::new(p, bot_difficulty(d))).collect();
+        let mut g = Game::build(settings, s.scenario, balance, s.you, bots)?;
+        g.settings.map_size = g.world.map().width();
+        let mut lock = Lockstep::new(s.tick_rate);
+        for p in s.early {
+            lock.receive(p, 0.0);
+        }
+        g.online = Some(Online {
+            net: s.net,
+            lock,
+            addr: s.addr,
+            name: s.name,
+            game: s.game,
+            token: s.token,
+            tick_rate: s.tick_rate,
+            checkpoints: Vec::new(),
+            last_progress: 0,
+            cmd_seq: 0,
+            retry: None,
+            status: None,
+            desync: None,
+            _hosting: s.hosting,
+        });
+        Ok(g)
+    }
+
+    fn build(
+        settings: MatchSettings,
+        spec: ScenarioSpec,
+        balance: Balance,
+        me: u8,
+        bots: Vec<Bot>,
+    ) -> Result<Game, String> {
+        let world = Game::make_world(&spec, &balance)?;
         let cap = world.cities().iter().find(|c| c.capital_of == me).map(|c| c.center()).unwrap_or_default();
         let scale = if settings.sandbox { 3.0 } else { 10.0 };
         let camera = Camera { center: [fx(cap.x), fx(cap.y)], scale };
@@ -118,7 +206,17 @@ impl Game {
             time: 0.0,
             message: None,
             history: Vec::new(),
+            online: None,
         })
+    }
+
+    fn make_world(spec: &ScenarioSpec, balance: &Balance) -> Result<World, String> {
+        let mut world = spec.build(balance)?;
+        // Leave one core for rendering and the UI; results do not depend on
+        // the thread count.
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        world.set_threads(cores.saturating_sub(1).max(1))?;
+        Ok(world)
     }
 
     /// Replaces the local player with a bot (for screenshots and demos).
@@ -139,6 +237,10 @@ impl Game {
                 self.message = None;
             }
         }
+        if self.online.is_some() {
+            self.update_online(dt);
+            return;
+        }
         if self.paused {
             return;
         }
@@ -158,6 +260,16 @@ impl Game {
     /// One simulation tick with local and bot commands.
     pub fn step(&mut self) {
         let tick = self.world.tick();
+        let mut cmds: Vec<Command> = Vec::new();
+        for kind in self.pending.drain(..) {
+            cmds.push(Command { tick, player: self.me, seq: self.seq, kind });
+            self.seq += 1;
+        }
+        self.apply(cmds);
+    }
+
+    /// One tick with the given commands plus the bots'.
+    fn apply(&mut self, mut cmds: Vec<Command>) {
         // Remember positions for interpolation.
         let u = self.world.units();
         for i in 0..u.len() {
@@ -166,11 +278,6 @@ impl Game {
                 self.prev_pos.resize(s + 1, (0, 0, u32::MAX));
             }
             self.prev_pos[s] = (u.pos_x[i], u.pos_y[i], u.handle(i).generation);
-        }
-        let mut cmds: Vec<Command> = Vec::new();
-        for kind in self.pending.drain(..) {
-            cmds.push(Command { tick, player: self.me, seq: self.seq, kind });
-            self.seq += 1;
         }
         for b in &mut self.bots {
             cmds.extend(b.think(&self.world));
@@ -202,6 +309,140 @@ impl Game {
             if self.world.cities()[c].owner != self.me {
                 self.selected_city = None;
             }
+        }
+    }
+
+    // ------------------------------------------------------------ online
+
+    fn update_online(&mut self, dt: f32) {
+        let now = self.time as f64;
+        let mut restart = None;
+        let mut desync = None;
+        // Ticks after a rejoin's GameStart belong to the rebuilt world.
+        let mut after_restart = Vec::new();
+        let events = self.online.as_ref().expect("online").net.poll();
+        let o = self.online.as_mut().expect("online");
+        for ev in events {
+            match ev {
+                NetEvent::Connected => {}
+                NetEvent::Disconnected(e) => {
+                    if o.retry.is_none() {
+                        o.retry = Some((self.time + 1.0, 0));
+                        o.status = Some(format!("Connection lost ({e}), reconnecting…"));
+                    }
+                }
+                NetEvent::Msg(m) => match m {
+                    ServerMsg::Tick(p) if restart.is_some() => after_restart.push(p),
+                    ServerMsg::Tick(p) => o.lock.receive(p, now),
+                    ServerMsg::Desync { tick, .. } => desync = Some(tick),
+                    ServerMsg::Stall { waiting_for } => {
+                        o.status = Some(format!("Waiting for player(s) {waiting_for:?}…"));
+                    }
+                    ServerMsg::Resume => o.status = None,
+                    ServerMsg::PlayerLeft(p) => self.message = Some((format!("Player {p} disconnected"), 4.0)),
+                    ServerMsg::PlayerBack(p) => self.message = Some((format!("Player {p} is back"), 4.0)),
+                    ServerMsg::Error(e) => o.status = Some(e),
+                    ServerMsg::GameStart { scenario, tick_rate, .. } => {
+                        // Back in after a reconnect: rebuild and replay.
+                        o.retry = None;
+                        o.status = Some("Catching up…".into());
+                        restart = Some((scenario, tick_rate));
+                    }
+                    _ => {}
+                },
+            }
+        }
+        if let Some(tick) = desync {
+            let path = self.dump_desync(tick);
+            self.message = Some((format!("Desync at tick {tick}; dump saved to {path}"), 30.0));
+            self.online.as_mut().expect("online").desync = Some(path);
+        }
+        if let Some((spec, tick_rate)) = restart {
+            if let Err(e) = self.restart_online(*spec, tick_rate) {
+                self.message = Some((e, 10.0));
+            }
+            let o = self.online.as_mut().expect("online");
+            for p in after_restart {
+                o.lock.receive(p, now);
+            }
+        }
+        let o = self.online.as_mut().expect("online");
+        if let Some((at, n)) = o.retry {
+            if self.time >= at {
+                if n >= MAX_RETRIES {
+                    o.status = Some("Cannot reach the server any more".into());
+                    o.retry = Some((f32::INFINITY, n));
+                } else {
+                    o.net = NetClient::connect(o.addr);
+                    o.net.send(ClientMsg::Hello {
+                        name: o.name.clone(),
+                        protocol: net::proto::PROTOCOL_VERSION,
+                        sim_version: sim_core::sim_version(&self.balance),
+                    });
+                    o.net.send(ClientMsg::Rejoin { game: o.game, token: o.token });
+                    o.retry = Some((self.time + 3.0, n + 1));
+                }
+            }
+            return;
+        }
+        if !self.pending.is_empty() {
+            o.cmd_seq += 1;
+            o.net.send(ClientMsg::Commands { seq: o.cmd_seq, kinds: std::mem::take(&mut self.pending) });
+        }
+        let n = o.lock.due(dt as f64, 240);
+        for _ in 0..n {
+            let o = self.online.as_mut().expect("online");
+            let Some((_, cmds)) = o.lock.take() else { break };
+            self.apply(cmds);
+            let t = self.world.tick();
+            let o = self.online.as_mut().expect("online");
+            if t % net::HASH_INTERVAL == 0 {
+                let hash = self.world.state_hash();
+                o.checkpoints.push((t, hash));
+                o.net.send(ClientMsg::Hash { tick: t, hash });
+            }
+        }
+        let o = self.online.as_mut().expect("online");
+        let t = self.world.tick();
+        if t >= o.last_progress + 10 {
+            o.last_progress = t;
+            o.net.send(ClientMsg::Progress { tick: t });
+        }
+        if o.status.as_deref() == Some("Catching up…") && o.lock.available() <= o.lock.buffer() + 1 {
+            o.status = None;
+        }
+        self.acc = o.lock.phase() as f32 * self.tick_seconds();
+    }
+
+    fn restart_online(&mut self, spec: ScenarioSpec, tick_rate: u32) -> Result<(), String> {
+        self.world = Game::make_world(&spec, &self.balance)?;
+        self.spec = spec;
+        self.bots = self.bots.iter().map(|b| Bot::new(b.player(), b.difficulty())).collect();
+        self.log.clear();
+        self.history.clear();
+        self.prev_pos.clear();
+        self.selection.clear();
+        self.selected_city = None;
+        self.pending.clear();
+        let o = self.online.as_mut().expect("online");
+        o.lock = Lockstep::new(tick_rate);
+        o.tick_rate = tick_rate;
+        o.checkpoints.clear();
+        o.last_progress = 0;
+        Ok(())
+    }
+
+    /// Writes the match so far, with every hash we computed, to
+    /// `desyncs/`; replaying it on another machine shows who diverged.
+    fn dump_desync(&self, tick: u32) -> String {
+        let o = self.online.as_ref().expect("online");
+        let dir = std::path::Path::new("desyncs");
+        let path = dir.join(format!("game{}-p{}-t{tick}.idr", o.game, self.me));
+        let mut r = self.replay();
+        r.checkpoints = o.checkpoints.clone();
+        match std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, r.encode())) {
+            Ok(()) => path.display().to_string(),
+            Err(e) => format!("could not write {}: {e}", path.display()),
         }
     }
 
@@ -603,5 +844,118 @@ mod tests {
         let r = g.replay();
         let w = r.verify(&Balance::default_balance()).unwrap();
         assert_eq!(w.state_hash(), g.world.state_hash());
+    }
+
+    /// Starts a 1v1 (plus a bot) on a local relay; returns both games.
+    fn online_pair() -> (relay_server::LocalServer, Game, Game) {
+        use net::proto::{LobbySettings, PROTOCOL_VERSION, SlotKind};
+        let server =
+            relay_server::spawn_local("127.0.0.1:0".parse().unwrap(), relay_server::Config::default()).unwrap();
+        let wait = |c: &NetClient, f: &dyn Fn(&ServerMsg) -> bool| loop {
+            match c.recv_timeout(std::time::Duration::from_secs(20)) {
+                Some(NetEvent::Msg(m)) if f(&m) => return m,
+                Some(NetEvent::Disconnected(e)) | Some(NetEvent::Msg(ServerMsg::Error(e))) => panic!("{e}"),
+                None => panic!("timed out"),
+                _ => {}
+            }
+        };
+        let sim_version = sim_core::sim_version(&Balance::default_balance());
+        let clients: Vec<NetClient> = (0..2)
+            .map(|k| {
+                let c = NetClient::connect(server.addr);
+                c.send(ClientMsg::Hello { name: format!("p{k}"), protocol: PROTOCOL_VERSION, sim_version });
+                wait(&c, &|m| matches!(m, ServerMsg::Welcome { .. }));
+                c
+            })
+            .collect();
+        clients[0].send(ClientMsg::CreateLobby {
+            name: "t".into(),
+            settings: LobbySettings { map_size: 128, seed: 2, slots: 3 },
+        });
+        let ServerMsg::Lobby(l) = wait(&clients[0], &|m| matches!(m, ServerMsg::Lobby(_))) else { unreachable!() };
+        clients[1].send(ClientMsg::JoinLobby { lobby: l.id });
+        clients[1].send(ClientMsg::SetReady(true));
+        wait(
+            &clients[1],
+            &|m| matches!(m, ServerMsg::Lobby(l) if l.slots.iter().any(|s| matches!(s.kind, SlotKind::Human { ready: true, .. }))),
+        );
+        clients[0].send(ClientMsg::SetSlot { slot: 2, kind: SlotKind::Bot { difficulty: 2 } });
+        clients[0].send(ClientMsg::Start);
+        let mut games = clients.into_iter().map(|c| {
+            let ServerMsg::GameStart { game, token, you, scenario, bots, tick_rate } =
+                wait(&c, &|m| matches!(m, ServerMsg::GameStart { .. }))
+            else {
+                unreachable!()
+            };
+            let s = Started {
+                net: c,
+                addr: server.addr,
+                name: "p".into(),
+                game,
+                token,
+                you,
+                scenario: *scenario,
+                bots,
+                tick_rate,
+                hosting: None,
+                early: Vec::new(),
+            };
+            Game::online(s).unwrap()
+        });
+        let a = games.next().unwrap();
+        let b = games.next().unwrap();
+        (server, a, b)
+    }
+
+    #[test]
+    fn online_games_stay_in_sync() {
+        let (_server, mut a, mut b) = online_pair();
+        assert_eq!((a.me, b.me), (1, 2));
+        assert_eq!(a.bots.len(), 1, "the bot slot runs locally");
+        let vp = [1280.0, 720.0];
+        a.camera.scale = 2.0;
+        a.box_select = Some(([0.0, 0.0], vp));
+        a.finish_box(vp, false);
+        let cap = a.capital_center().unwrap();
+        a.order_move(&[[cap[0] + 10.0, cap[1]]], false);
+        let start = std::time::Instant::now();
+        while a.world.tick() < 200 || b.world.tick() < 200 {
+            assert!(start.elapsed().as_secs() < 60, "stuck at {} / {}", a.world.tick(), b.world.tick());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            a.update(0.01);
+            b.update(0.01);
+        }
+        // Player 1's order travelled through the relay to both worlds.
+        assert!(b.log.iter().any(|c| c.player == 1 && matches!(c.kind, CommandKind::Move { .. })));
+        let ca = &a.online.as_ref().unwrap().checkpoints;
+        let cb = &b.online.as_ref().unwrap().checkpoints;
+        let n = ca.len().min(cb.len());
+        assert!(n >= 6, "{n}");
+        assert_eq!(ca[..n], cb[..n]);
+        assert!(a.online.as_ref().unwrap().desync.is_none());
+    }
+
+    #[test]
+    fn online_game_reconnects_and_catches_up() {
+        let (_server, mut a, mut b) = online_pair();
+        let run = |a: &mut Game, b: &mut Game, until: u32| {
+            let start = std::time::Instant::now();
+            while a.world.tick() < until || b.world.tick() < until {
+                assert!(start.elapsed().as_secs() < 60, "stuck at {} / {}", a.world.tick(), b.world.tick());
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                a.update(0.01);
+                b.update(0.01);
+            }
+        };
+        run(&mut a, &mut b, 90);
+        // Cut b off: its connection drops and the first redial fails.
+        b.online.as_mut().unwrap().net = NetClient::connect("127.0.0.1:9".parse().unwrap());
+        run(&mut a, &mut b, 300);
+        assert!(b.online.as_ref().unwrap().retry.is_none(), "rejoined");
+        let ca = &a.online.as_ref().unwrap().checkpoints;
+        let cb = &b.online.as_ref().unwrap().checkpoints;
+        let n = ca.len().min(cb.len());
+        assert!(n >= 9, "{n}");
+        assert_eq!(ca[..n], cb[..n]);
     }
 }

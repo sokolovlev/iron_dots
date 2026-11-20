@@ -8,6 +8,9 @@
 //! iron-dots-headless match  [opts] [--out FILE] bots play a standard match to the end
 //! iron-dots-headless scaling [--threads MAX]    thread-scaling table (Markdown) for the
 //!                                               spec 3 targets, up to all hardware threads
+//! iron-dots-headless netsim [--matches N]       3v3 matches over QUIC through a proxy with
+//!                                               10% loss and 100 ms jitter, one rejoin per
+//!                                               match; fails on any desync (spec 6.2)
 //!
 //! opts: --map N (tiles, default 256)  --units N (per player, default 200)
 //!       --players N (default 2)       --seed N (default 1)
@@ -16,6 +19,8 @@
 //!       --scenario battle|front (armies around the map / one long front line)
 //!       --difficulty easy|normal|hard (match; default normal, or a list per
 //!       player like easy,hard)
+//!       --matches N --parallel N --tick-rate N --clean (netsim; defaults 20, 4,
+//!       30, impaired network)
 //! ```
 
 use sim_core::replay::Replay;
@@ -35,6 +40,10 @@ struct Opts {
     difficulty: Vec<ai::Difficulty>,
     threads: usize,
     scenario: String,
+    matches: u32,
+    parallel: u32,
+    tick_rate: u32,
+    clean: bool,
     positional: Vec<String>,
 }
 
@@ -50,6 +59,10 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         difficulty: Vec::new(),
         threads: 1,
         scenario: "battle".into(),
+        matches: 20,
+        parallel: 4,
+        tick_rate: 30,
+        clean: false,
         positional: Vec::new(),
     };
     let mut it = args.iter();
@@ -65,6 +78,10 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--balance" => o.balance = Some(val("--balance")?),
             "--out" => o.out = Some(val("--out")?),
             "--scenario" => o.scenario = val("--scenario")?,
+            "--matches" => o.matches = num(val("--matches")?)? as u32,
+            "--parallel" => o.parallel = num(val("--parallel")?)?.max(1) as u32,
+            "--tick-rate" => o.tick_rate = num(val("--tick-rate")?)?.clamp(1, 240) as u32,
+            "--clean" => o.clean = true,
             "--threads" => o.threads = num(val("--threads")?)?.max(1) as usize,
             "--difficulty" => {
                 o.difficulty = val("--difficulty")?
@@ -144,6 +161,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "bench" => bench(&o, &b)?,
         "scaling" => scaling(&o, &b)?,
         "match" => play_match(&o, &b)?,
+        "netsim" => netsim(&o)?,
         _ => return Err(usage()),
     }
     Ok(())
@@ -340,8 +358,83 @@ fn play_match(o: &Opts, b: &Balance) -> Result<(), String> {
     Ok(())
 }
 
+fn net_bot(player: u8, difficulty: u8) -> Box<dyn Controller + Send> {
+    let d = match difficulty {
+        0 => ai::Difficulty::Easy,
+        1 => ai::Difficulty::Normal,
+        _ => ai::Difficulty::Hard,
+    };
+    Box::new(ai::Bot::new(player, d))
+}
+
+/// Networked 3v3 matches (spec 8, stage 6 exit criterion).
+fn netsim(o: &Opts) -> Result<(), String> {
+    use relay_server::netsim::{self, Options};
+    let network = if o.clean { "clean network" } else { "10% loss, 100 ms jitter" };
+    println!(
+        "{} matches 3v3, map {}, {} ticks at {} ticks/s, {network}, one rejoin per match",
+        o.matches, o.map, o.ticks, o.tick_rate
+    );
+    let next = std::sync::atomic::AtomicU32::new(0);
+    let failures = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..o.parallel.min(o.matches) {
+            scope.spawn(|| {
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= o.matches {
+                        return;
+                    }
+                    let seed = o.seed + k as u64;
+                    let mut opts = Options::three_vs_three(seed, o.ticks);
+                    opts.map_size = o.map;
+                    opts.tick_rate = o.tick_rate;
+                    if o.clean {
+                        opts.network = None;
+                    }
+                    let line = match netsim::run(&opts, net_bot) {
+                        Ok(r) => {
+                            let ok = r.desync.is_none() && !r.relay_desync && r.ticks == o.ticks && r.rejoined;
+                            if !ok {
+                                failures.lock().expect("lock").push(k + 1);
+                            }
+                            format!(
+                                "match {:>2} seed {seed}: {} ticks, {} hash checks, {}, rejoin {}, stalls {}, {:.0} s{}",
+                                k + 1,
+                                r.ticks,
+                                r.checkpoints,
+                                match (&r.desync, r.relay_desync) {
+                                    (None, false) => "in sync".to_string(),
+                                    (Some((t, _)), _) => format!("DESYNC at tick {t}"),
+                                    (None, true) => "DESYNC reported by relay".to_string(),
+                                },
+                                if r.rejoined { "ok" } else { "MISSING" },
+                                r.stalls,
+                                r.seconds,
+                                r.winner.map_or(String::new(), |w| format!(", team {w} won")),
+                            )
+                        }
+                        Err(e) => {
+                            failures.lock().expect("lock").push(k + 1);
+                            format!("match {:>2} seed {seed}: FAILED: {e}", k + 1)
+                        }
+                    };
+                    println!("{line}");
+                }
+            });
+        }
+    });
+    let failures = failures.into_inner().expect("lock");
+    if failures.is_empty() {
+        println!("all {} matches in sync", o.matches);
+        Ok(())
+    } else {
+        Err(format!("matches failed: {failures:?}"))
+    }
+}
+
 fn usage() -> String {
-    "usage: iron-dots-headless <record|verify|hash|bench|match|scaling> [--map N] [--units N] [--players N] \
+    "usage: iron-dots-headless <record|verify|hash|bench|match|scaling|netsim> [--map N] [--units N] [--players N] \
      [--seed N] [--ticks N] [--balance FILE] [--out FILE] [FILE]"
         .into()
 }

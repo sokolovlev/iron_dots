@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/simd-kernels", "crates/pathing", "crates/sim-core", "crates/ai", "crates/render", "crates/client", "crates/headless"]
+members = ["crates/simd-kernels", "crates/pathing", "crates/sim-core", "crates/ai", "crates/render", "crates/client", "crates/headless", "crates/net", "crates/relay-server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,8 @@ rust-version = "1.85"
 sim-core = { path = "crates/sim-core" }
 simd-kernels = { path = "crates/simd-kernels" }
 pathing = { path = "crates/pathing" }
+net = { path = "crates/net" }
+relay-server = { path = "crates/relay-server" }
 ai = { path = "crates/ai" }
 render = { path = "crates/render" }
 wgpu = "30"
@@ -23,6 +25,10 @@ egui-winit = "0.37"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
 png = "0.18"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
 bitcode = { version = "0.6", features = ["serde"] }

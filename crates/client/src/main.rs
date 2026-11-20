@@ -13,6 +13,7 @@ mod app;
 mod game;
 mod gpu;
 mod offscreen;
+mod online;
 mod ui;
 
 use game::MatchSettings;
