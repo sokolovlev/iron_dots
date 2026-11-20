@@ -225,6 +225,21 @@ table) and the `sim_core::flow` module.
   coarse fields no unit uses are dropped. Above 8192 chunk fields (32 MiB),
   those in chunks without users are dropped too.
 
+Measured by the project owner with sim version 6 (flow fields) on a
+4-core / 4-thread Intel desktop with AVX2, a machine weaker than the spec 3
+reference PC:
+
+| Scenario | 1 thr | 2 thr | 4 thr | Speed-up |
+|---|---|---|---|---|
+| 10k units, 1024², marching | 2.96 ms | 1.55 ms | **0.97 ms** | 3.1× |
+| 10k units, 1024², one front | 5.26 ms | 2.88 ms | **1.64 ms** | 3.2× |
+| 100k units, 4096², 8 players | 21.63 ms | 11.98 ms | **6.82 ms** | 3.2× |
+
+The stage 5 exit criterion (100 000 units, tick ≤ 8 ms on the reference
+PC) is met even on this 4-core machine, and so is the weak-PC target (≤ 3 ms
+for 10 000 units). Final hashes (`a0c767a5…`, `5aa56467…`, `ab879546…`)
+were identical on Windows and on the Linux VM.
+
 Costs on a 4096² generated map (4 threads, per unit type): graph 32 412
 portals, built in ~1.1 s at setup; coarse field ~5 ms; chunk field ~0.4 ms.
 On 1024²: 70 ms, 0.3 ms, 0.4 ms. Routes are within ~15% of the true

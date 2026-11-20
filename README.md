@@ -43,7 +43,7 @@ fixed-point SoA core, spatial grid, movement, combat with morale, replays, golde
 - Reference PC (6 cores / 12 threads, AVX2): 10 000 units 0.56 ms marching, 0.98 ms with all of them fighting on one front, 100 000 units 3.12 ms. All spec 3 tick targets met; hashes identical on Windows and Linux ([details](ARCHITECTURE.md#performance-stage-4-parallel--simd))
 - Measure any machine with `cargo run --release -p headless -- scaling` (Markdown table, 1…N threads)
 
-**Stage 5: pathfinding and scale** ✓ (reference-PC measurement pending)
+**Stage 5: pathfinding and scale** ✓ — 100 000 units: 6.8 ms per tick even on a 4-core PC (target ≤ 8 ms on the 12-thread reference)
 
 - [x] `pathing` crate: chunk portal graph per unit type, shared coarse fields per target, direction fields per chunk where units are
 - [x] Units follow fields around mountains, lakes and costly terrain; formations kept on open ground; A* removed from commands
