@@ -34,13 +34,13 @@ fixed-point SoA core, spatial grid, movement, combat with morale, replays, golde
 - [x] Per-phase profiling in `bench`, optional Tracy spans (`--features tracy`)
 - 100 000 units on 4096²: 24 ms → 8 ms per tick with 4 threads (see [ARCHITECTURE.md](ARCHITECTURE.md#performance-stage-3-parallel-still-scalar))
 
-**Stage 4: SIMD** ✓ (with an open performance question, see below)
+**Stage 4: SIMD** ✓
 
 - [x] `simd-kernels` crate: auto-vectorised integer kernels compiled for SSE4.2 / AVX2 / AVX-512 / NEON, picked once at start-up
 - [x] Scalar reference kernels; property tests prove bit-identical results at every level; Miri in CI
 - [x] Neighbour searches run on contiguous grid-ordered slices; units are re-sorted spatially every 8 ticks
 - [x] The hash is identical at every SIMD level (tested) and on 1–16 threads
-- Reference PC (6 cores / 12 threads, AVX2): 10 000 units 0.57 ms marching, 1.08 ms with all of them fighting on one front; 100 000 units 3.55 ms. Hashes identical on Windows and Linux ([details](ARCHITECTURE.md#performance-stage-4-parallel--simd))
+- Reference PC (6 cores / 12 threads, AVX2): 10 000 units 0.56 ms marching, 0.98 ms with all of them fighting on one front, 100 000 units 3.12 ms. All spec 3 tick targets met; hashes identical on Windows and Linux ([details](ARCHITECTURE.md#performance-stage-4-parallel--simd))
 - Measure any machine with `cargo run --release -p headless -- scaling` (Markdown table, 1…N threads)
 
 Next: stage 5, hierarchical flow-field pathfinding, 4096² maps, sandbox mode and rendering LOD.

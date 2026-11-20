@@ -277,6 +277,17 @@ Changes after that measurement, aimed at the front line (sim version 5):
 Tried and dropped: folding the damage formula to one division per defender
 (no measurable gain; combat cost is the neighbour search, not divisions).
 
+The same reference PC with sim version 5:
+
+| Scenario | 1 thr | 2 thr | 4 thr | 8 thr | 12 thr | Speed-up |
+|---|---|---|---|---|---|---|
+| 10k units, 1024², marching | 1.50 ms | 0.99 ms | 0.70 ms | 0.57 ms | **0.56 ms** | 2.7× |
+| 10k units, 1024², one front | 3.27 ms | 2.09 ms | 1.30 ms | 1.05 ms | **0.98 ms** | 3.3× |
+| 100k units, 4096², 8 players | 12.50 ms | 7.27 ms | 4.62 ms | 3.47 ms | **3.12 ms** | 4.0× |
+
+Final hashes (`4d514b28…`, `4139d8f7…`, `6e6d0aea…`) were again identical on
+Windows and on the Linux VM.
+
 Measured here on a 4-vCPU cloud VM (Xeon 2.1 GHz, AVX-512 level):
 
 | Scenario | 1 thr | 2 thr | 4 thr | Speed-up |
@@ -316,9 +327,9 @@ Against the spec 3 targets for 10 000 units on 1024²:
 
 - **Weak PC (4 cores, SSE4.2): ≤ 3 ms.** Met on this VM: 1.3 ms marching,
   2.5 ms on a full front.
-- **Average PC (6 cores / 12 threads, AVX2): ≤ 1 ms.** Met while marching
-  (0.57 ms on the reference PC). A full front line with all 10 000 units
-  fighting measured 1.08 ms with sim version 4; version 5 targets that case.
+- **Average PC (6 cores / 12 threads, AVX2): ≤ 1 ms.** Met on the reference
+  PC: 0.56 ms marching, 0.98 ms with all 10 000 units fighting on one front
+  (the worst case, just under the limit). 100 000 units: 3.12 ms.
 
 In normal (non-sandbox) matches, pocket labelling floods the whole map every
 15 ticks. That is fine up to 1024² but is replaced by union-find over the chunk
