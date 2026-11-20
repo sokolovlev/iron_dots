@@ -1,0 +1,17 @@
+[package]
+name = "pathing"
+description = "Iron Dots pathfinding: chunk portal graph and shared flow fields"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rayon.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

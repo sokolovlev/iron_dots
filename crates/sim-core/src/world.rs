@@ -1,8 +1,8 @@
 //! The world state and the fixed-order tick (spec 4.3).
 //!
-//!  1. apply commands (sorted by player, seq); Move runs the pathfinder
+//!  1. apply commands (sorted by player, seq)
 //!  2. rebuild the spatial grid
-//!  3. (flow fields — stage 5; stage 2 plans routes when a command is applied)
+//!  3. pathing: flow fields requested last tick (`flow`, `pathing` crate)
 //!  4. separation push of every unit (grid order, SIMD neighbour search)
 //!  5. one pass per unit: intent, integration, terrain blocking, waypoints,
 //!     water (pull: every unit writes only itself); then order transitions
@@ -15,6 +15,7 @@
 
 use crate::balance::{Balance, Rules, SHIP_ROW};
 use crate::command::{Command, CommandKind};
+use crate::flow::{self, Flow, Steer};
 use crate::fx::{Fx, FxPoint, ONE, dist2, isqrt_u64, length};
 use crate::grid::Grid;
 use crate::map::{self, Map, Terrain};
@@ -143,6 +144,7 @@ impl Hood {
 pub enum Phase {
     Commands,
     Grid,
+    Pathing,
     Separation,
     Move,
     Combat,
@@ -153,9 +155,10 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub const ALL: [Phase; 9] = [
+    pub const ALL: [Phase; 10] = [
         Phase::Commands,
         Phase::Grid,
+        Phase::Pathing,
         Phase::Separation,
         Phase::Move,
         Phase::Combat,
@@ -169,6 +172,7 @@ impl Phase {
         match self {
             Phase::Commands => "commands",
             Phase::Grid => "grid",
+            Phase::Pathing => "pathing",
             Phase::Separation => "separation",
             Phase::Move => "move",
             Phase::Combat => "combat",
@@ -226,7 +230,10 @@ pub struct World {
     dmg_in: Vec<u32>,
     cmd_order: Vec<u32>,
     stack_scratch: Vec<(u32, u32)>,
-    path_scratch: pathfind::Scratch,
+    /// Flow-field cache and pending field requests (phase 3).
+    flow: Flow,
+    /// Terrain costs per unit kind (straight-line checks).
+    path_costs: [[u32; Terrain::COUNT]; UnitKind::COUNT],
     paint_scratch: Vec<Vec<(u16, u16, u8)>>,
     /// Bit of each player's team (teams numbered in ascending id order).
     team_bit: [u8; MAX_PLAYERS + 1],
@@ -254,6 +261,8 @@ impl World {
             return Err(format!("need 1..={MAX_PLAYERS} players, got {}", players.len()));
         }
         let rules = Rules::new(balance);
+        let path_costs =
+            [pathfind::terrain_costs(&rules, UnitKind::Light), pathfind::terrain_costs(&rules, UnitKind::Heavy)];
         let mut team = [0u8; MAX_PLAYERS + 1];
         for (k, p) in players.iter().enumerate() {
             team[k + 1] = p.team;
@@ -301,7 +310,8 @@ impl World {
             dmg_in: Vec::new(),
             cmd_order: Vec::new(),
             stack_scratch: Vec::new(),
-            path_scratch: pathfind::Scratch::default(),
+            flow: Flow::default(),
+            path_costs,
             paint_scratch: Vec::new(),
             team_bit,
             chunk_mask: Vec::new(),
@@ -464,6 +474,8 @@ impl World {
                 self.city_area[(ny * w + nx) as usize] = idx + 1;
             }
         }
+        // Terrain changed: pathfinding graphs are rebuilt when next needed.
+        self.flow.reset();
         self.cities.push(City {
             x: x as u16,
             y: y as u16,
@@ -560,6 +572,7 @@ impl World {
         self.prepare_scratch();
         phase!(Phase::Commands, self.apply_commands(commands));
         phase!(Phase::Grid, self.rebuild_grid());
+        phase!(Phase::Pathing, self.phase_pathing());
         phase!(Phase::Separation, self.phase_separation());
         phase!(Phase::Move, self.phase_move());
         phase!(Phase::Combat, self.phase_combat());
@@ -591,6 +604,24 @@ impl World {
         });
     }
 
+    /// Phase 3: flow fields requested last tick (see [`flow`]).
+    fn phase_pathing(&mut self) {
+        let (flow, map, rules, units, tick) = (&mut self.flow, &self.map, &self.rules, &mut self.units, self.tick);
+        self.pool.install(|| flow.process(map, rules, units, tick));
+    }
+
+    /// Builds the pathfinding graphs now (end of match setup) so the first
+    /// move orders do not pay for it during play. Results are unaffected.
+    pub fn prepare_pathfinding(&mut self) {
+        let (flow, map, rules, pool) = (&mut self.flow, &self.map, &self.rules, &self.pool);
+        pool.install(|| flow.build_graphs(map, rules));
+    }
+
+    /// Live flow fields and coarse fields (debug panels, tests).
+    pub fn flow_stats(&self) -> (usize, usize) {
+        self.flow.stats()
+    }
+
     fn prepare_scratch(&mut self) {
         let n = self.units.len();
         self.arrive.resize(n, false);
@@ -601,7 +632,6 @@ impl World {
     // ---------------------------------------------------------------- phase 1
 
     fn apply_commands(&mut self, commands: &[Command]) {
-        self.path_scratch.budget = pathfind::TICK_BUDGET;
         let mut order = std::mem::take(&mut self.cmd_order);
         order.clear();
         order.extend(commands.iter().enumerate().filter(|(_, c)| c.tick == self.tick).map(|(k, _)| k as u32));
@@ -642,8 +672,9 @@ impl World {
                 let max_y = Fx((self.map.height() as i32) * ONE - 1);
                 let path: Vec<FxPoint> =
                     path.iter().map(|p| FxPoint::new(p.x.clamp(Fx::ZERO, max_x), p.y.clamp(Fx::ZERO, max_y))).collect();
-                let (points, via) = self.plan_route(&idx, &path);
-                self.apply_move(&idx, points, via, *queue);
+                // Routes come from flow fields as units walk (phase 3).
+                let via = vec![false; path.len()];
+                self.apply_move(&idx, path, via, *queue);
                 true
             }
             CommandKind::Stop { units } => {
@@ -677,46 +708,6 @@ impl World {
                 !idx.is_empty()
             }
         }
-    }
-
-    /// Inserts pathfinder waypoints where a straight segment of the requested
-    /// path would cross mountains or costlier terrain than its endpoints
-    /// (spec 2.9: "segments through mountains are routed around").
-    fn plan_route(&mut self, idx: &[usize], path: &[FxPoint]) -> (Vec<FxPoint>, Vec<bool>) {
-        const MAX_POINTS: usize = u8::MAX as usize;
-        let heavy = idx.iter().any(|&i| self.units.kind[i] == UnitKind::Heavy as u8);
-        let kind = if heavy { UnitKind::Heavy } else { UnitKind::Light };
-        let costs = pathfind::terrain_costs(&self.rules, kind);
-        let n = idx.len() as i64;
-        let cx = idx.iter().map(|&i| self.units.pos_x[i] as i64).sum::<i64>() / n;
-        let cy = idx.iter().map(|&i| self.units.pos_y[i] as i64).sum::<i64>() / n;
-        let tile = |x: i64, y: i64| ((x >> 16) as u32, (y >> 16) as u32);
-        let cost = |t: (u32, u32)| costs[self.map.terrain_raw(t.0, t.1) as usize];
-        let mut prev = tile(cx, cy);
-        let (mut points, mut via) = (Vec::new(), Vec::new());
-        for p in path {
-            let target = tile(p.x.0 as i64, p.y.0 as i64);
-            let limit = cost(prev).max(cost(target)).max(1000);
-            if !pathfind::clear_line(&self.map, &costs, prev, target, limit) {
-                if let Some(route) = pathfind::find_route(&self.map, &costs, prev, target, &mut self.path_scratch) {
-                    let wps = pathfind::smooth(&self.map, &costs, &route);
-                    for &(x, y) in &wps[1..wps.len() - 1] {
-                        points.push(FxPoint::tile_center(x as i32, y as i32));
-                        via.push(true);
-                    }
-                }
-            }
-            points.push(*p);
-            via.push(false);
-            prev = target;
-        }
-        // Order waypoints are indexed by u8: keep the last MAX_POINTS.
-        if points.len() > MAX_POINTS {
-            let cut = points.len() - MAX_POINTS;
-            points.drain(..cut);
-            via.drain(..cut);
-        }
-        (points, via)
     }
 
     fn apply_buy(&mut self, player: u8, city: usize, kind: UnitKind) -> bool {
@@ -899,7 +890,7 @@ impl World {
         adv.resize(n, false);
         let this = &*self;
         let rules = &this.rules;
-        this.pool.install(|| {
+        let requests = this.pool.install(|| {
             (
                 px.par_chunks_mut(BLOCK),
                 py.par_chunks_mut(BLOCK),
@@ -911,15 +902,18 @@ impl World {
             )
                 .into_par_iter()
                 .enumerate()
-                .for_each(|(k, (px, py, wt, fl, row, stuck, adv))| {
+                .map(|(k, (px, py, wt, fl, row, stuck, adv))| {
+                    let mut reqs: Vec<flow::Request> = Vec::new();
                     for j in 0..px.len() {
                         let i = k * BLOCK + j;
                         let (x, y) = (px[j], py[j]);
                         let in_combat = fl[j] & flags::IN_COMBAT != 0;
                         let target = this.waypoint_target(i);
-                        // Intent: speed from last tick's terrain and combat state.
-                        let (vx, vy, arrive) = match target {
-                            None => (0, 0, false),
+                        // Intent: speed from last tick's terrain and combat
+                        // state; direction straight at the target, or from a
+                        // flow field when far away or the line is blocked.
+                        let (vx, vy, arrive, fielded) = match target {
+                            None => (0, 0, false, false),
                             Some((tx, ty)) => {
                                 let kind = this.units.kind[i] as usize;
                                 let mut sp =
@@ -931,13 +925,58 @@ impl World {
                                 let (dx, dy) = (tx - x, ty - y);
                                 let d = length(dx, dy);
                                 if d <= s {
-                                    (dx, dy, true)
+                                    (dx, dy, true, false)
                                 } else {
-                                    (
+                                    let straight = (
                                         (dx as i64 * s as i64 / d as i64) as i32,
                                         (dy as i64 * s as i64 / d as i64) as i32,
-                                        false,
-                                    )
+                                    );
+                                    let (ut, gt) =
+                                        (((x >> 16) as u32, (y >> 16) as u32), ((tx >> 16) as u32, (ty >> 16) as u32));
+                                    let near = ut.0.abs_diff(gt.0).max(ut.1.abs_diff(gt.1)) <= flow::NEAR;
+                                    if near && (this.tick + this.units.slot[i]) % flow::LOS_INTERVAL == 0 {
+                                        let costs = &this.path_costs[kind];
+                                        let at = |t: (u32, u32)| costs[this.map.terrain_raw(t.0, t.1) as usize];
+                                        let limit = at(ut).max(at(gt)).max(1000);
+                                        if pathfind::clear_line(&this.map, costs, ut, gt, limit) {
+                                            fl[j] &= !flags::LOS_BLOCKED;
+                                        } else {
+                                            fl[j] |= flags::LOS_BLOCKED;
+                                        }
+                                    }
+                                    if near && fl[j] & flags::LOS_BLOCKED == 0 {
+                                        (straight.0, straight.1, false, false)
+                                    } else {
+                                        let h = this.units.handle(i);
+                                        match this.flow.direction(h, kind, this.units.path[i], ut, gt) {
+                                            Steer::Dir(k) => {
+                                                let (ddx, ddy) = pathing::DIRS[k as usize];
+                                                // Within 45° of the straight line the unit keeps
+                                                // its own heading (formations stay intact);
+                                                // otherwise it turns onto the field, around an
+                                                // obstacle. cos 45°: dot² ≥ |a|²|b|² / 2.
+                                                let dot = dx as i128 * ddx as i128 + dy as i128 * ddy as i128;
+                                                let la = dx as i128 * dx as i128 + dy as i128 * dy as i128;
+                                                let lb = (ddx * ddx + ddy * ddy) as i128;
+                                                if dot > 0 && 2 * dot * dot >= la * lb {
+                                                    (straight.0, straight.1, false, true)
+                                                } else {
+                                                    // Diagonals at 1/√2 (46341/65536) per axis.
+                                                    let axis = if ddx != 0 && ddy != 0 {
+                                                        ((s as i64 * 46_341) >> 16) as i32
+                                                    } else {
+                                                        s
+                                                    };
+                                                    (ddx * axis, ddy * axis, false, true)
+                                                }
+                                            }
+                                            Steer::Straight => (straight.0, straight.1, false, false),
+                                            Steer::Need(r) => {
+                                                reqs.push(r);
+                                                (straight.0, straight.1, false, false)
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         };
@@ -964,11 +1003,14 @@ impl World {
                             let after = dist2(nx, ny, tx, ty);
                             let mut a = arrive;
                             if !a && !in_combat {
-                                if after >= before {
+                                // Following a field may lead away from the target
+                                // for a while: there, only standing still is stuck.
+                                let progressing = if fielded { (nx, ny) != (x, y) } else { after < before };
+                                if progressing {
+                                    stuck[j] = 0;
+                                } else {
                                     stuck[j] = stuck[j].saturating_add(1);
                                     a = stuck[j] >= stuck_limit;
-                                } else {
-                                    stuck[j] = 0;
                                 }
                             }
                             if a {
@@ -990,10 +1032,16 @@ impl World {
                         }
                         row[j] = if fl[j] & flags::SHIP != 0 { SHIP_ROW as u8 } else { t };
                     }
-                });
+                    reqs
+                })
+                .collect::<Vec<Vec<flow::Request>>>()
         });
         let u = &mut self.units;
         (u.pos_x, u.pos_y, u.water_ticks, u.flags, u.row, u.stuck) = (px, py, wt, fl, row, stuck);
+        // Field requests, in block (= unit) order, for the next tick's phase 3.
+        for r in requests.into_iter().flatten() {
+            self.flow.requests.push(r);
+        }
         // Order transitions touch the shared order pool: sequential, in
         // ascending unit order (same order of retains/releases as always).
         for (i, &a) in adv.iter().enumerate() {

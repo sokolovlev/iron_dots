@@ -14,6 +14,7 @@ bitcode.workspace = true
 xxhash-rust.workspace = true
 rayon.workspace = true
 simd-kernels.workspace = true
+pathing.workspace = true
 tracing = { workspace = true, optional = true }
 
 [features]
@@ -22,6 +23,8 @@ tracing = ["dep:tracing"]
 
 [dev-dependencies]
 proptest.workspace = true
+pathing.workspace = true
+rayon.workspace = true
 simd-kernels.workspace = true
 
 [lints]

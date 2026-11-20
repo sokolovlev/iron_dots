@@ -81,6 +81,7 @@ impl ScenarioSpec {
         for s in &self.spawns {
             w.spawn(s.owner, s.kind, s.at)?;
         }
+        w.prepare_pathfinding();
         Ok(w)
     }
 

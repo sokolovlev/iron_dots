@@ -246,3 +246,36 @@ fn attacker_with_broken_morale_stops() {
     // but if morale hit zero the order must be gone.
     let _ = saw_break;
 }
+
+#[test]
+fn flow_fields_lead_around_a_long_wall() {
+    // A wall across most of a 256² map with one gap at the far end: the
+    // way round is ~5× longer than the straight line.
+    let mut m = Map::new(256, 256, Terrain::Plain).unwrap();
+    for y in 0..240 {
+        m.set_terrain(128, y, Terrain::Mountain);
+    }
+    let mut w = world(m);
+    let a = w.spawn(1, UnitKind::Light, pt(100, 20)).unwrap();
+    let cmds = [mv(0, 1, 0, &[a], &[pt(160, 20)])];
+    let mut arrived = None;
+    for _ in 0..400 * TPS {
+        w.step(&cmds);
+        let i = w.units().index_of(a).unwrap();
+        assert_ne!(
+            w.map().terrain((w.units().pos_x[i] >> 16) as u32, (w.units().pos_y[i] >> 16) as u32),
+            Terrain::Mountain
+        );
+        if w.units().order[i] == u32::MAX {
+            arrived = Some(w.tick());
+            break;
+        }
+    }
+    let t = arrived.expect("order never finished");
+    let (x, y) = pos(&w, a);
+    assert_eq!((x >> 16, y >> 16), (160, 20), "gave up instead of arriving (after {t} ticks)");
+    // ≈ 2 × 220 + 60 tiles at 2 tiles/s ≈ 250 s.
+    assert!(t < 320 * TPS, "took {} s", t / TPS);
+    let (fields, coarse) = w.flow_stats();
+    assert!(fields > 0 && coarse > 0);
+}

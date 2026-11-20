@@ -1952,6 +1952,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathing"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rayon",
+]
+
+[[package]]
 name = "peniko"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2517,6 +2525,7 @@ name = "sim-core"
 version = "0.1.0"
 dependencies = [
  "bitcode",
+ "pathing",
  "proptest",
  "rayon",
  "ron",

@@ -33,6 +33,9 @@ pub mod flags {
     pub const IN_COMBAT: u8 = 1 << 1;
     /// In combat while having a movement order (takes more damage, loses more morale).
     pub const ATTACKING: u8 = 1 << 2;
+    /// The straight line to the target was blocked at the last check: follow
+    /// the flow field even when near.
+    pub const LOS_BLOCKED: u8 = 1 << 3;
 }
 
 /// "No order" marker in [`UnitStore::order`].
@@ -76,6 +79,8 @@ pub struct UnitStore {
     pub starve: Vec<u32>,
     /// Supply pocket of the unit, or `territory::NO_POCKET`.
     pub pocket: Vec<u32>,
+    /// Coarse flow field the unit follows (`flow::NO_PATH` if none).
+    pub path: Vec<u32>,
 
     slot_generation: Vec<u32>,
     slot_index: Vec<u32>,
@@ -127,6 +132,7 @@ impl UnitStore {
         self.calm.push(u16::MAX);
         self.starve.push(0);
         self.pocket.push(u32::MAX);
+        self.path.push(u32::MAX);
         UnitHandle { slot, generation: self.slot_generation[slot as usize] }
     }
 
@@ -157,6 +163,7 @@ impl UnitStore {
         self.calm.swap_remove(i);
         self.starve.swap_remove(i);
         self.pocket.swap_remove(i);
+        self.path.swap_remove(i);
         self.slot_generation[slot as usize] = self.slot_generation[slot as usize].wrapping_add(1);
         self.slot_index[slot as usize] = FREE;
         self.free_slots.push(slot);
@@ -192,6 +199,7 @@ impl UnitStore {
             apply(&mut self.calm, order);
             apply(&mut self.starve, order);
             apply(&mut self.pocket, order);
+            apply(&mut self.path, order);
         } else {
             rayon::scope(|s| {
                 s.spawn(|_| apply(&mut self.pos_x, order));
@@ -212,6 +220,7 @@ impl UnitStore {
                 s.spawn(|_| apply(&mut self.calm, order));
                 s.spawn(|_| apply(&mut self.starve, order));
                 s.spawn(|_| apply(&mut self.pocket, order));
+                s.spawn(|_| apply(&mut self.path, order));
             });
         }
         for (k, &s) in self.slot.iter().enumerate() {

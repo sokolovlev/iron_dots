@@ -1,0 +1,15 @@
+# sim-core must be bit-for-bit deterministic on every OS, CPU, thread count and SIMD level.
+# See ARCHITECTURE.md, "Determinism rules".
+disallowed-types = [
+  { path = "f32", reason = "floats are not deterministic across targets; use fx::Fx (Q16.16)" },
+  { path = "f64", reason = "floats are not deterministic across targets; use fx::Fx (Q16.16)" },
+  { path = "std::collections::HashMap", reason = "iteration order is random; use Vec or BTreeMap" },
+  { path = "std::collections::HashSet", reason = "iteration order is random; use Vec or BTreeSet" },
+  { path = "std::time::Instant", reason = "wall-clock time must not influence the simulation" },
+  { path = "std::time::SystemTime", reason = "wall-clock time must not influence the simulation" },
+]
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "wall-clock time must not influence the simulation" },
+  { path = "std::time::SystemTime::now", reason = "wall-clock time must not influence the simulation" },
+  { path = "std::thread::current", reason = "results must not depend on which thread runs the code" },
+]
