@@ -17,7 +17,7 @@ use crate::balance::{Balance, Rules, SHIP_ROW};
 use crate::command::{Command, CommandKind};
 use crate::fx::{Fx, FxPoint, ONE, dist2, isqrt_u64, length};
 use crate::grid::Grid;
-use crate::map::{self, CHUNK_TILES, Map, Terrain};
+use crate::map::{self, Map, Terrain};
 use crate::order::{MAX_PATH_POINTS, OrderPool};
 use crate::pathfind;
 use crate::rng::{Purpose, rand, stochastic_round_q16};
@@ -33,7 +33,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 /// Units per parallel work item. A fixed size (never derived from the
 /// thread count) keeps every result independent of how many threads run.
-pub const BLOCK: usize = 1024;
+pub const BLOCK: usize = 256;
 
 /// Units are re-sorted into spatial (grid) order every this many ticks.
 pub const SORT_INTERVAL: u32 = 8;
@@ -232,10 +232,9 @@ pub struct World {
     team_bit: [u8; MAX_PLAYERS + 1],
     chunk_mask: Vec<u8>,
     hot: Vec<bool>,
-    /// Hot chunks and their neighbours.
-    warm: Vec<bool>,
-    /// Per tile of warm chunks: team bits of units within the territory radius.
-    presence: Vec<u8>,
+    /// Per chunk (filled for hot chunks that paint this tick): team bits of
+    /// units within the territory radius of each tile, see `stamp_presence`.
+    presence: Vec<Vec<u8>>,
     pool: Arc<rayon::ThreadPool>,
     threads: usize,
     /// SIMD kernel table (chosen once per process; tests may pick a level).
@@ -307,7 +306,6 @@ impl World {
             team_bit,
             chunk_mask: Vec::new(),
             hot: Vec::new(),
-            warm: Vec::new(),
             presence: Vec::new(),
             pool: Arc::new(make_pool(1)?),
             threads: 1,
@@ -1050,21 +1048,6 @@ impl World {
             }
         }
         self.stats.hot_chunks = hot;
-        // Warm = hot or next to a hot chunk: where territory needs presence.
-        self.warm.clear();
-        self.warm.resize(cw * ch, false);
-        for cy in 0..ch {
-            for cx in 0..cw {
-                if !self.hot[cy * cw + cx] {
-                    continue;
-                }
-                for ny in cy.saturating_sub(1)..=(cy + 1).min(ch - 1) {
-                    for nx in cx.saturating_sub(1)..=(cx + 1).min(cw - 1) {
-                        self.warm[ny * cw + nx] = true;
-                    }
-                }
-            }
-        }
     }
 
     #[inline]
@@ -1298,65 +1281,76 @@ impl World {
 
     // ---------------------------------------------------------------- phase 7
 
-    /// Territory: where hostile units are near (warm chunks), every tile
-    /// first gets the team bits of all units within the territory radius
-    /// (parallel per chunk), so a painting unit checks "is an enemy close to
-    /// this tile" with one lookup instead of scanning every nearby enemy.
-    /// Candidate tiles are found in parallel from the start-of-phase map;
-    /// writes are applied in ascending unit order with the ally check
-    /// repeated, which gives exactly the sequential result.
+    /// Territory. Units paint every 4 ticks, a quarter of the chunks per
+    /// tick ([`territory::chunk_paints`]). For each painting chunk that is
+    /// hot, every tile of the chunk (plus a margin of the radius) first gets
+    /// the team bits of all units within the radius — stamped in parallel
+    /// per chunk — so a unit checks "is an enemy close to this tile" with
+    /// one lookup. Candidate tiles are found in parallel from the
+    /// start-of-phase map; writes are applied in ascending unit order with
+    /// the ally check repeated, which gives exactly the sequential result.
     fn phase_territory(&mut self) {
         let radius = self.rules.territory_radius;
+        let cw = self.map.chunks_w();
+        let tick = self.tick;
+        let painting_hot = |c: usize| self.hot[c] && territory::chunk_paints(c as u32 % cw, c as u32 / cw, tick);
         if self.stats.hot_chunks > 0 {
             let mut presence = take(&mut self.presence);
-            presence.resize(self.map.terrain_plane().len(), 0);
+            presence.resize_with(self.hot.len(), Vec::new);
             let this = &*self;
-            let cw = this.map.chunks_w();
+            // Collect first: the selected chunks cluster on the map, and a
+            // list splits evenly across threads where an index range would not.
+            let selected: Vec<(usize, &mut Vec<u8>)> =
+                presence.iter_mut().enumerate().filter(|(c, _)| painting_hot(*c)).collect();
             this.pool.install(|| {
-                presence.par_chunks_mut(CHUNK_TILES).enumerate().filter(|(c, _)| this.warm[*c]).for_each(
-                    |(c, plane)| {
-                        let (cx, cy) = (c as u32 % cw, c as u32 / cw);
-                        // Units whose stamp can reach this chunk.
-                        let half = ((map::CHUNK / 2 + radius + 1) as i32) << 16;
-                        let (mx, my) = (
-                            ((cx * map::CHUNK + map::CHUNK / 2) as i32) << 16,
-                            ((cy * map::CHUNK + map::CHUNK / 2) as i32) << 16,
-                        );
-                        let g = &this.grid;
-                        territory::stamp_presence(plane, cx, cy, radius, |stamp| {
-                            g.ranges_in_range(mx, my, half, |rg| {
-                                for k in rg {
-                                    let owner = this.units.owner[g.cell_units[k] as usize];
-                                    stamp(g.sx[k], g.sy[k], this.team_bit[owner as usize]);
-                                }
-                            });
+                selected.into_par_iter().for_each(|(c, plane)| {
+                    let (cx, cy) = (c as u32 % cw, c as u32 / cw);
+                    // Units whose stamp can reach the grown chunk.
+                    let half = ((map::CHUNK / 2 + 2 * radius + 1) as i32) << 16;
+                    let (mx, my) = (
+                        ((cx * map::CHUNK + map::CHUNK / 2) as i32) << 16,
+                        ((cy * map::CHUNK + map::CHUNK / 2) as i32) << 16,
+                    );
+                    let g = &this.grid;
+                    territory::stamp_presence(plane, cx, cy, radius, |stamp| {
+                        g.ranges_in_range(mx, my, half, |rg| {
+                            for k in rg {
+                                let owner = this.units.owner[g.cell_units[k] as usize];
+                                stamp(g.sx[k], g.sy[k], this.team_bit[owner as usize]);
+                            }
                         });
-                    },
-                );
+                    });
+                });
             });
             self.presence = presence;
         }
+        // Painting units cluster in a few chunks (and so in a few runs of
+        // the spatially sorted unit arrays): small blocks balance the work.
+        // Writes are applied in unit order whatever the block size.
+        const PAINT_BLOCK: usize = 256;
         let mut out = take(&mut self.paint_scratch);
         let this = &*self;
         let n = this.units.len();
-        let blocks = n.div_ceil(BLOCK);
+        let blocks = n.div_ceil(PAINT_BLOCK);
         out.resize_with(blocks.max(out.len()), Vec::new);
         this.pool.install(|| {
             out[..blocks].par_iter_mut().enumerate().for_each(|(k, out)| {
                 out.clear();
-                for i in k * BLOCK..((k + 1) * BLOCK).min(n) {
-                    if (this.tick + this.units.slot[i]) % territory::PAINT_INTERVAL != 0 {
+                for i in k * PAINT_BLOCK..((k + 1) * PAINT_BLOCK).min(n) {
+                    let (x, y) = (this.units.pos_x[i], this.units.pos_y[i]);
+                    let (cx, cy) = ((x >> 22) as u32, (y >> 22) as u32);
+                    if !territory::chunk_paints(cx, cy, tick) {
                         continue;
                     }
-                    let hot = this.is_hot(this.units.pos_x[i], this.units.pos_y[i]);
+                    let c = (cy * cw + cx) as usize;
+                    let presence = this.hot[c].then(|| this.presence[c].as_slice());
                     territory::paint_candidates(
                         &this.map,
                         &this.units,
                         &this.team,
                         radius,
                         i,
-                        hot,
-                        &this.presence,
+                        presence,
                         this.team_bit[this.units.owner[i] as usize],
                         out,
                     );

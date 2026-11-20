@@ -214,17 +214,17 @@ impl<'de> Deserialize<'de> for Milli {
     }
 }
 
-/// Integer square root of a `u64` (floor). Deterministic, no floats: the
-/// standard library's exact integer algorithm (several times faster than a
-/// Newton iteration with 64-bit divisions).
+/// Integer square root of a `u64` (floor): exact and identical on every
+/// CPU (see [`simd_kernels::isqrt`], which corrects a hardware estimate
+/// with integer arithmetic; the simulation itself stays float-free).
 #[inline]
-pub const fn isqrt_u64(n: u64) -> u64 {
-    n.isqrt()
+pub fn isqrt_u64(n: u64) -> u64 {
+    simd_kernels::isqrt(n)
 }
 
 /// Length of the vector `(dx, dy)` in [`Fx`] units (floor).
 #[inline]
-pub const fn length(dx: i32, dy: i32) -> i32 {
+pub fn length(dx: i32, dy: i32) -> i32 {
     let d2 = dx as i64 * dx as i64 + dy as i64 * dy as i64;
     isqrt_u64(d2 as u64) as i32
 }

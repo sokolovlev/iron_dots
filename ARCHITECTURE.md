@@ -244,6 +244,39 @@ plus a check that every thread count ends in the same state. The
 **Scaling benchmark** workflow (Actions → Run workflow) runs it on any runner
 label and puts the table in the job summary.
 
+**Reference PC** (spec 3 "average PC": Intel 12th gen, 6 cores / 12 threads,
+AVX2, Windows), sim version 4, measured by the project owner:
+
+| Scenario | 1 thr | 2 thr | 4 thr | 8 thr | 12 thr | Speed-up |
+|---|---|---|---|---|---|---|
+| 10k units, 1024², marching | 1.71 ms | 1.05 ms | 0.74 ms | 0.64 ms | **0.57 ms** | 3.0× |
+| 10k units, 1024², one front | 3.73 ms | 2.33 ms | 1.59 ms | 1.26 ms | **1.08 ms** | 3.5× |
+| 100k units, 4096², 8 players | 13.11 ms | 8.13 ms | 4.99 ms | 3.74 ms | **3.55 ms** | 3.7× |
+
+The final hashes on Windows were identical to those on the Linux VM, which
+confirms cross-platform determinism on real hardware. On 12 threads the
+front-line tick split as follows: combat 456 µs, territory 261 µs,
+separation 208 µs, grid 121 µs, move 83 µs.
+
+Changes after that measurement, aimed at the front line (sim version 5):
+
+- **Painting staggered by chunk, not by unit.** Each tick a quarter of the
+  chunks (a 2×2 checkerboard) paint. Presence planes (chunk plus a margin of
+  the radius) are stamped only for hot painting chunks, roughly a quarter of
+  the previous stamping. Territory: 1.8 → 1.1 ms single-threaded on the VM.
+- **Row spans for stamping.** One exact square root per row gives the span of
+  tiles inside the circle (tested against the per-tile distance check).
+- **Fast exact square root.** `simd_kernels::isqrt` takes the hardware `f64`
+  estimate and corrects it with integer arithmetic. It is bit-identical to
+  `u64::isqrt` (property-tested) and was 10% of the front-line profile before.
+- **Smaller parallel blocks** (1024 → 256 units, painting 256). With 10 000
+  units, 1024-unit blocks gave only 10 work items: on 12 threads two threads
+  always idled and the rest were unevenly loaded. Results do not depend on
+  the block size (merges follow unit order).
+
+Tried and dropped: folding the damage formula to one division per defender
+(no measurable gain; combat cost is the neighbour search, not divisions).
+
 Measured here on a 4-vCPU cloud VM (Xeon 2.1 GHz, AVX-512 level):
 
 | Scenario | 1 thr | 2 thr | 4 thr | Speed-up |
@@ -283,10 +316,9 @@ Against the spec 3 targets for 10 000 units on 1024²:
 
 - **Weak PC (4 cores, SSE4.2): ≤ 3 ms.** Met on this VM: 1.3 ms marching,
   2.5 ms on a full front.
-- **Average PC (6 cores / 12 threads, AVX2): ≤ 1 ms.** Not measurable here.
-  Scaling from 2 to 4 threads is still 1.2–1.6×, so 12 threads should bring
-  marching under 1 ms, but the full front line likely stays above it. Run
-  `iron-dots-headless scaling` on the reference machine to settle it.
+- **Average PC (6 cores / 12 threads, AVX2): ≤ 1 ms.** Met while marching
+  (0.57 ms on the reference PC). A full front line with all 10 000 units
+  fighting measured 1.08 ms with sim version 4; version 5 targets that case.
 
 In normal (non-sandbox) matches, pocket labelling floods the whole map every
 15 ticks. That is fine up to 1024² but is replaced by union-find over the chunk

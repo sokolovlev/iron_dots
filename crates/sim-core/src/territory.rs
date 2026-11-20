@@ -6,7 +6,7 @@
 //! * Pockets: 4-connected components of each player's territory, recomputed
 //!   every [`SUPPLY_INTERVAL`] ticks. Supply limits are counted per pocket.
 
-use crate::fx::{ONE, dist2};
+use crate::fx::{ONE, isqrt_u64};
 use crate::map::{CHUNK, CHUNK_SHIFT, Map, Terrain};
 use crate::unit::UnitStore;
 
@@ -14,19 +14,33 @@ use crate::unit::UnitStore;
 pub const SUPPLY_INTERVAL: u32 = 15;
 /// "No pocket": unit is not on or next to its own land.
 pub const NO_POCKET: u32 = u32::MAX;
-/// Each unit paints every this many ticks, staggered by its slot (spec 5.3:
-/// spread work over ticks). A unit moves at most ~0.3 tiles in that time,
-/// far less than the territory radius, so no gaps appear.
+/// Units paint every this many ticks, staggered by chunk in a 2×2
+/// checkerboard (spec 5.3: spread work over ticks). A unit moves at most
+/// ~0.3 tiles in that time, far less than the territory radius, so no gaps
+/// appear; each tick a quarter of the chunks paint, so the load stays even.
 pub const PAINT_INTERVAL: u32 = 4;
+
+/// Whether units in chunk `(cx, cy)` paint on `tick`.
+#[inline]
+pub fn chunk_paints(cx: u32, cy: u32, tick: u32) -> bool {
+    ((cx & 1) | ((cy & 1) << 1)) == tick % PAINT_INTERVAL
+}
+
+/// Side of a presence plane: a chunk plus the radius on every side, so
+/// every tile a unit of the chunk can claim is covered.
+#[inline]
+pub fn presence_side(radius: u32) -> usize {
+    (CHUNK + 2 * radius) as usize
+}
 
 /// Tiles unit `i` would claim, judged on the map as it is now: within
 /// `radius`, not the unit's own or an ally's, not a city, and with no enemy
 /// unit within `radius` of the tile. Appends `(x, y, owner)` to `out`.
 ///
-/// `presence` (chunk-major like the map planes) holds, for every tile of a
-/// warm chunk, the team bits of all units within `radius` of the tile
-/// centre; `my_bit` is the unit's team bit. `hot = false` means no enemy
-/// can be near (sleeping chunk), so no check is needed.
+/// `presence`, given when the unit's chunk is hot, is that chunk's plane
+/// from [`stamp_presence`]: the team bits of all units within `radius` of
+/// each tile centre. `my_bit` is the unit's team bit. Without it (sleeping
+/// chunk) no enemy can be near, so no check is needed.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_candidates(
     map: &Map,
@@ -34,8 +48,7 @@ pub fn paint_candidates(
     team: &[u8],
     radius: u32,
     i: usize,
-    hot: bool,
-    presence: &[u8],
+    presence: Option<&[u8]>,
     my_bit: u8,
     out: &mut Vec<(u16, u16, u8)>,
 ) {
@@ -44,6 +57,9 @@ pub fn paint_candidates(
     let me = units.owner[i];
     let my_team = team[me as usize];
     let (tx, ty) = (units.pos_x[i] >> 16, units.pos_y[i] >> 16);
+    // Origin of the presence plane of this unit's chunk.
+    let side = presence_side(radius) as i32;
+    let (px0, py0) = ((tx & !(CHUNK as i32 - 1)) - r, (ty & !(CHUNK as i32 - 1)) - r);
     for dy in -r..=r {
         for dx in -r..=r {
             let (x, y) = (tx + dx, ty + dy);
@@ -55,41 +71,54 @@ pub fn paint_candidates(
             if (o != 0 && team[o as usize] == my_team) || map.terrain(xu, yu) == Terrain::City {
                 continue;
             }
-            if hot && presence[map.index(xu, yu)] & !my_bit != 0 {
-                continue; // an enemy is within the radius of this tile
+            if let Some(p) = presence {
+                if p[((y - py0) * side + (x - px0)) as usize] & !my_bit != 0 {
+                    continue; // an enemy is within the radius of this tile
+                }
             }
             out.push((x as u16, y as u16, me));
         }
     }
 }
 
-/// Fills `plane` (the 4096 tiles of chunk `(cx, cy)`) with the team bits
-/// of units within `radius` of each tile centre (distance ≤ radius, the
-/// same test painting uses). `units_near` yields `(x, y, team_bit)` of every
-/// unit that may be that close (callers pass the grid neighbourhood).
+/// Fills `plane` (chunk `(cx, cy)` grown by `radius` tiles on every side,
+/// [`presence_side`]² tiles, row-major) with the team bits of units within
+/// `radius` of each tile centre (distance ≤ radius, the same test painting
+/// uses). `units_near` yields `(x, y, team_bit)` of every unit that may be
+/// that close (callers pass the grid neighbourhood).
 pub fn stamp_presence(
-    plane: &mut [u8],
+    plane: &mut Vec<u8>,
     cx: u32,
     cy: u32,
     radius: u32,
     units_near: impl FnOnce(&mut dyn FnMut(i32, i32, u8)),
 ) {
-    plane.fill(0);
+    let side = presence_side(radius);
+    plane.clear();
+    plane.resize(side * side, 0);
     let r_raw = radius as i32 * ONE;
     let r2 = (r_raw as i64) * (r_raw as i64);
-    let (ox, oy) = ((cx * CHUNK) as i32, (cy * CHUNK) as i32);
-    let last = CHUNK as i32 - 1;
+    let (ox, oy) = ((cx * CHUNK) as i32 - radius as i32, (cy * CHUNK) as i32 - radius as i32);
+    let last = side as i32 - 1;
     units_near(&mut |x, y, bit| {
-        let x0 = ((x - r_raw) >> 16).max(ox);
-        let x1 = ((x + r_raw) >> 16).min(ox + last);
         let y0 = ((y - r_raw) >> 16).max(oy);
         let y1 = ((y + r_raw) >> 16).min(oy + last);
         for ty in y0..=y1 {
+            // Tiles of this row whose centre is within the radius: |cx - x|
+            // ≤ isqrt(r² - dy²) (exact for integers), i.e. one span.
+            let dy = ((ty << 16) + ONE / 2 - y) as i64;
+            let rem = r2 - dy * dy;
+            if rem < 0 {
+                continue;
+            }
+            let reach = isqrt_u64(rem as u64) as i64;
+            // Centre (tx << 16) + ONE/2 must lie in [x - reach, x + reach].
+            let lo = (x as i64 - reach - (ONE / 2) as i64 + (ONE - 1) as i64).div_euclid(ONE as i64) as i32;
+            let hi = (x as i64 + reach - (ONE / 2) as i64).div_euclid(ONE as i64) as i32;
+            let (x0, x1) = (lo.max(ox), hi.min(ox + last));
+            let row = (ty - oy) as usize * side;
             for tx in x0..=x1 {
-                let (ccx, ccy) = ((tx << 16) + ONE / 2, (ty << 16) + ONE / 2);
-                if dist2(x, y, ccx, ccy) <= r2 {
-                    plane[(((ty - oy) << CHUNK_SHIFT) | (tx - ox)) as usize] |= bit;
-                }
+                plane[row + (tx - ox) as usize] |= bit;
             }
         }
     });
@@ -187,6 +216,37 @@ pub fn unit_pocket(map: &Map, labels: &[u32], owner: u8, x: i32, y: i32, radius:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fx::dist2;
+
+    /// The span-based stamp marks exactly the tiles whose centre is within
+    /// the radius (the test painting uses).
+    #[test]
+    fn stamp_matches_distance_test() {
+        let mut s = 0x9e37_79b9u64;
+        for _ in 0..2000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let x = (s % (70 << 16)) as i32 - (3 << 16);
+            let y = ((s >> 24) % (70 << 16)) as i32 - (3 << 16);
+            for radius in [1u32, 3, 5] {
+                let mut plane = Vec::new();
+                stamp_presence(&mut plane, 0, 0, radius, |f| f(x, y, 1));
+                let (r, side) = ((radius as i64) << 16, presence_side(radius) as i32);
+                for ly in 0..side {
+                    for lx in 0..side {
+                        let (tx, ty) = (lx - radius as i32, ly - radius as i32);
+                        let want = dist2(x, y, (tx << 16) + ONE / 2, (ty << 16) + ONE / 2) <= r * r;
+                        assert_eq!(
+                            plane[(ly * side + lx) as usize] == 1,
+                            want,
+                            "x={x} y={y} r={radius} tile {tx},{ty}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn labels_split_by_enemy_land() {

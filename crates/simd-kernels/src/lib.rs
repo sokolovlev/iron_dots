@@ -196,6 +196,25 @@ pub fn kernels() -> &'static Kernels {
     })
 }
 
+/// Exact integer square root (floor) of `n`, bit-identical to
+/// [`u64::isqrt`] on every CPU but several times faster: the hardware
+/// double-precision square root gives an estimate within ±1 (IEEE 754
+/// requires it to be correctly rounded everywhere), and integer arithmetic
+/// fixes the last unit. The result never depends on floating-point details.
+#[inline]
+pub fn isqrt(n: u64) -> u64 {
+    let mut r = (n as f64).sqrt() as u64;
+    // r may be one too high (rounding up near a perfect square) or, for
+    // n ≥ 2^52, slightly off either way: correct with exact integer tests.
+    while r.checked_mul(r).is_none_or(|sq| sq > n) {
+        r -= 1;
+    }
+    while (r + 1).checked_mul(r + 1).is_some_and(|sq| sq <= n) {
+        r += 1;
+    }
+    r
+}
+
 /// Scalar reference implementations: the definition of what every kernel
 /// computes. Written for obviousness, not speed.
 pub mod reference {
@@ -406,6 +425,18 @@ mod tests {
     }
 
     #[test]
+    fn isqrt_edges() {
+        for n in (0u64..100_000).chain([u64::MAX, u64::MAX - 1, 1 << 63, (1 << 32) - 1, 1 << 32]) {
+            assert_eq!(isqrt(n), n.isqrt(), "{n}");
+        }
+        for r in [1u64 << 20, (1 << 26) + 3, (1 << 31) - 1, (1 << 32) - 1] {
+            for n in [r * r - 1, r * r, r * r + 1] {
+                assert_eq!(isqrt(n), n.isqrt(), "{n}");
+            }
+        }
+    }
+
+    #[test]
     fn edge_cases() {
         for k in levels() {
             // Exactly on the radius is not "within" (strict).
@@ -451,6 +482,12 @@ mod tests {
             for k in levels() {
                 prop_assert_eq!(k.enemies_within(&xs, &ys, &ts, team, qx, qy, r2), want, "{}", k.level().name());
             }
+        }
+
+        #[test]
+        fn isqrt_matches_std(n in any::<u64>(), small in 0u64..(1 << 34)) {
+            prop_assert_eq!(isqrt(n), n.isqrt());
+            prop_assert_eq!(isqrt(small), small.isqrt());
         }
 
         #[test]
