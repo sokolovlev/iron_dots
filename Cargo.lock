@@ -431,6 +431,8 @@ dependencies = [
  "pollster",
  "relay-server",
  "render",
+ "ron",
+ "serde",
  "sim-core",
  "tracing",
  "tracing-subscriber",

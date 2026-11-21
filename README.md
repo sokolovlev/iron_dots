@@ -110,6 +110,11 @@ Maps are wide like the screen (close to 16:9): from Small 320×192 to
 Colossal 4096×2304. Sides are multiples of the 64-tile chunk, so exact 16:9
 starts at 1024×576. `--map` takes `WxH` or a single number for a square map.
 
+All keys can be rebound in Settings (main menu or Esc), along with full
+screen, VSync, FPS limit, interface scale, edge scrolling and camera/zoom
+speed. Settings live in `%APPDATA%\IronDots\settings.ron` on Windows and
+`~/.config/iron-dots/settings.ron` elsewhere. Arrow keys move the camera.
+
 Keys are matched by physical position, so they work on any keyboard layout.
 Linux needs a Vulkan or GL driver and `libxkbcommon-x11-0` (or Wayland) at runtime.
 

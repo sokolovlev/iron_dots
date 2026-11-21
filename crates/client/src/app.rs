@@ -2,6 +2,7 @@
 
 use crate::game::{Game, MatchSettings, SPEEDS};
 use crate::gpu::Gpu;
+use crate::settings::{Action, Settings};
 use crate::ui::{self, Menu, UiAction};
 use render::{Marker, Overlay, Renderer};
 use sim_core::UnitKind;
@@ -50,13 +51,22 @@ pub struct App {
     markers: Vec<Marker>,
     overlay: Overlay,
     focused: bool,
-    pub edge_scroll: bool,
+    settings: Settings,
+    /// The settings window is open; `Some(action)` while waiting for a key.
+    settings_open: bool,
+    rebinding: Option<Action>,
+    /// Camera keys held: left, right, up, down.
+    camera_keys: [bool; 4],
+    /// Start of the current frame, for the FPS cap.
+    frame_start: Instant,
     pending_start: Option<MatchSettings>,
     /// Borderless full screen (default) or a normal window; F11 / Alt+Enter.
     fullscreen: bool,
 }
 
-pub fn run(start: Option<MatchSettings>, fullscreen: bool) -> Result<(), String> {
+pub fn run(start: Option<MatchSettings>, windowed: bool) -> Result<(), String> {
+    let settings = Settings::load();
+    let fullscreen = settings.fullscreen && !windowed;
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
@@ -72,10 +82,16 @@ pub fn run(start: Option<MatchSettings>, fullscreen: bool) -> Result<(), String>
         markers: Vec::new(),
         overlay: Overlay::default(),
         focused: true,
-        edge_scroll: true,
+        settings_open: false,
+        rebinding: None,
+        camera_keys: [false; 4],
+        frame_start: Instant::now(),
         pending_start: None,
         fullscreen,
+        settings,
     };
+    app.menu.online.name = app.settings.name.clone();
+    app.menu.online.address = app.settings.server.clone();
     if let Some(s) = start {
         app.menu.settings = s.clone();
         app.pending_start = Some(s);
@@ -104,6 +120,11 @@ impl App {
     }
 
     fn start_online(&mut self, s: crate::online::Started) {
+        if self.settings.name != self.menu.online.name || self.settings.server != self.menu.online.address {
+            self.settings.name = self.menu.online.name.clone();
+            self.settings.server = self.menu.online.address.clone();
+            self.settings.save();
+        }
         match Game::online(s) {
             Ok(game) => {
                 if let Some(gfx) = &self.gfx {
@@ -115,6 +136,32 @@ impl App {
                 self.menu.error = None;
             }
             Err(e) => self.menu.error = Some(e),
+        }
+    }
+
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.rebinding = None;
+        self.settings.sanitize();
+        self.settings.save();
+        self.apply_settings();
+    }
+
+    /// Pushes settings that live outside `Settings` into the window and GPU.
+    fn apply_settings(&mut self) {
+        if self.fullscreen != self.settings.fullscreen {
+            self.fullscreen = self.settings.fullscreen;
+            if let Some(gfx) = &self.gfx {
+                gfx.window.set_fullscreen(self.fullscreen.then_some(Fullscreen::Borderless(None)));
+            }
+        }
+        if let Some(gfx) = &mut self.gfx {
+            let mode = if self.settings.vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+            if gfx.config.present_mode != mode {
+                gfx.config.present_mode = mode;
+                gfx.surface.configure(&gfx.gpu.device, &gfx.config);
+            }
+            gfx.egui_ctx.set_zoom_factor(self.settings.ui_scale);
         }
     }
 
@@ -137,15 +184,20 @@ impl App {
         let vp = self.viewport();
         let ctrl = self.mods.control_key() || self.mods.super_key();
         let shift = self.mods.shift_key();
-        if code == KeyCode::F11 || (code == KeyCode::Enter && self.mods.alt_key()) {
+        let action = self.settings.action(code);
+        if action == Some(Action::Fullscreen) || (code == KeyCode::Enter && self.mods.alt_key()) {
             self.fullscreen = !self.fullscreen;
             if let Some(gfx) = &self.gfx {
                 gfx.window.set_fullscreen(self.fullscreen.then_some(Fullscreen::Borderless(None)));
             }
+            self.settings.fullscreen = self.fullscreen;
+            self.settings.save();
             return;
         }
         if code == KeyCode::Escape {
-            if self.game.is_some() {
+            if self.settings_open {
+                self.close_settings();
+            } else if self.game.is_some() {
                 self.esc_menu = !self.esc_menu;
             } else {
                 event_loop.exit();
@@ -180,20 +232,27 @@ impl App {
             }
             return;
         }
-        match code {
-            KeyCode::KeyS => g.stop(),
-            KeyCode::KeyC => g.clear_queue(),
-            KeyCode::KeyQ => g.buy(UnitKind::Light),
-            KeyCode::KeyW => g.buy(UnitKind::Heavy),
-            KeyCode::Home => {
+        // The numpad keeps +/− for speed whatever the bindings.
+        let action = match code {
+            KeyCode::NumpadAdd if action.is_none() => Some(Action::SpeedUp),
+            KeyCode::NumpadSubtract if action.is_none() => Some(Action::SpeedDown),
+            _ => action,
+        };
+        let offline = g.online.is_none();
+        match action {
+            Some(Action::Stop) => g.stop(),
+            Some(Action::ClearQueue) => g.clear_queue(),
+            Some(Action::BuyLight) => g.buy(UnitKind::Light),
+            Some(Action::BuyHeavy) => g.buy(UnitKind::Heavy),
+            Some(Action::Capital) => {
                 if let Some(c) = g.capital_center() {
                     g.camera.center = c;
                 }
             }
             // Network matches run at the relay's pace.
-            KeyCode::Space if g.online.is_none() => g.paused = !g.paused,
-            KeyCode::Equal | KeyCode::NumpadAdd if g.online.is_none() => g.speed = (g.speed + 1).min(SPEEDS.len() - 1),
-            KeyCode::Minus | KeyCode::NumpadSubtract if g.online.is_none() => g.speed = g.speed.saturating_sub(1),
+            Some(Action::Pause) if offline => g.paused = !g.paused,
+            Some(Action::SpeedUp) if offline => g.speed = (g.speed + 1).min(SPEEDS.len() - 1),
+            Some(Action::SpeedDown) if offline => g.speed = g.speed.saturating_sub(1),
             _ => {}
         }
         let _ = (vp, shift);
@@ -272,6 +331,7 @@ impl App {
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        self.frame_start = now;
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
         let vp = self.viewport();
@@ -288,20 +348,20 @@ impl App {
             // Only while the cursor is inside the window: once it leaves, its
             // position is a far-away placeholder, not an edge.
             let inside = (0.0..vp[0]).contains(&p[0]) && (0.0..vp[1]).contains(&p[1]);
-            if self.edge_scroll && self.focused && !self.esc_menu && inside {
-                let speed = 900.0 / g.camera.scale * dt;
-                if p[0] <= EDGE_SCROLL_PX {
-                    g.camera.center[0] -= speed;
-                }
-                if p[0] >= vp[0] - EDGE_SCROLL_PX {
-                    g.camera.center[0] += speed;
-                }
-                if p[1] <= EDGE_SCROLL_PX {
-                    g.camera.center[1] -= speed;
-                }
-                if p[1] >= vp[1] - EDGE_SCROLL_PX {
-                    g.camera.center[1] += speed;
-                }
+            let edge = self.settings.edge_scroll && self.focused && !self.esc_menu && !self.settings_open && inside;
+            let [left, right, up, down] = self.camera_keys;
+            let speed = 900.0 * self.settings.scroll_speed / g.camera.scale * dt;
+            if left || (edge && p[0] <= EDGE_SCROLL_PX) {
+                g.camera.center[0] -= speed;
+            }
+            if right || (edge && p[0] >= vp[0] - EDGE_SCROLL_PX) {
+                g.camera.center[0] += speed;
+            }
+            if up || (edge && p[1] <= EDGE_SCROLL_PX) {
+                g.camera.center[1] -= speed;
+            }
+            if down || (edge && p[1] >= vp[1] - EDGE_SCROLL_PX) {
+                g.camera.center[1] += speed;
             }
             g.camera.clamp_to(g.map_size(), vp);
             g.update(dt);
@@ -314,9 +374,21 @@ impl App {
         let full = ctx.run_ui(raw, |ui| {
             let ctx = ui.ctx().clone();
             action = match &mut self.game {
+                // The menu would show through the settings window.
+                None if self.settings_open => UiAction::None,
                 None => ui::main_menu(ui, &mut self.menu),
-                Some(g) => ui::hud(&ctx, g, &mut self.esc_menu),
+                Some(g) => {
+                    let mut esc = self.esc_menu && !self.settings_open;
+                    let a = ui::hud(&ctx, g, &mut esc);
+                    if !self.settings_open {
+                        self.esc_menu = esc;
+                    }
+                    a
+                }
             };
+            if self.settings_open && ui::settings_window(&ctx, &mut self.settings, &mut self.rebinding) {
+                action = UiAction::CloseSettings;
+            }
         });
         gfx.egui_state.handle_platform_output(&gfx.window, full.platform_output);
         let paint = gfx.egui_ctx.tessellate(full.shapes, full.pixels_per_point);
@@ -402,6 +474,8 @@ impl App {
                 self.renderer = None;
             }
             UiAction::Quit => event_loop.exit(),
+            UiAction::OpenSettings => self.settings_open = true,
+            UiAction::CloseSettings => self.close_settings(),
         }
     }
 }
@@ -452,10 +526,12 @@ impl ApplicationHandler for App {
         if let Some(f) = caps.formats.iter().find(|f| f.is_srgb()) {
             config.format = *f;
         }
-        config.present_mode = wgpu::PresentMode::AutoVsync;
+        config.present_mode =
+            if self.settings.vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
         surface.configure(&gpu.device, &config);
         let egui_ctx = egui::Context::default();
         ui::setup_style(&egui_ctx);
+        egui_ctx.set_zoom_factor(self.settings.ui_scale);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -483,7 +559,11 @@ impl ApplicationHandler for App {
                 gfx.config.height = size.height.max(1);
                 gfx.surface.configure(&gfx.gpu.device, &gfx.config);
             }
-            WindowEvent::Focused(f) => self.focused = f,
+            WindowEvent::Focused(f) => {
+                self.focused = f;
+                // Releases are not delivered to an unfocused window.
+                self.camera_keys = [false; 4];
+            }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             WindowEvent::CursorMoved { position, .. } => self.mouse_moved([position.x as f32, position.y as f32]),
@@ -504,9 +584,26 @@ impl ApplicationHandler for App {
                     // Stop zooming out where the map still fills the screen,
                     // so the point under the cursor stays put at the limit.
                     let min = render::Camera::min_scale_for(g.map_size(), vp);
-                    let target = (g.camera.scale * 1.15f32.powf(steps)).max(min);
+                    let target = (g.camera.scale * 1.15f32.powf(steps * self.settings.zoom_speed)).max(min);
                     g.camera.zoom_at(target / g.camera.scale, self.mouse.pos, vp);
                     g.camera.clamp_to(g.map_size(), vp);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } if self.rebinding.is_some() => {
+                if let (PhysicalKey::Code(code), ElementState::Pressed) = (event.physical_key, event.state) {
+                    let a = self.rebinding.take().expect("checked");
+                    if code != KeyCode::Escape && crate::settings::bindable(code) {
+                        self.settings.bind(a, code);
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if matches!(event.physical_key, PhysicalKey::Code(c) if self.settings.action(c).is_some_and(|a| a >= Action::CameraLeft && a <= Action::CameraDown))
+                    && (!ui_wants_keys || event.state == ElementState::Released) =>
+            {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let k = self.settings.action(code).expect("checked") as usize - Action::CameraLeft as usize;
+                    self.camera_keys[k] = event.state == ElementState::Pressed;
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -522,7 +619,15 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.settings.fps_limit > 0 {
+            let next = self.frame_start + std::time::Duration::from_secs_f64(1.0 / self.settings.fps_limit as f64);
+            if Instant::now() < next {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+                return;
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
         if let Some(gfx) = &self.gfx {
             gfx.window.request_redraw();
         }

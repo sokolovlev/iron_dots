@@ -12,6 +12,8 @@ pub enum UiAction {
     StartMatch(MatchSettings),
     ToMenu,
     Quit,
+    OpenSettings,
+    CloseSettings,
 }
 
 #[derive(Default)]
@@ -52,37 +54,39 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
             ui.label(RichText::new("IRON DOTS").size(48.0).strong());
             ui.label("minimalist real-time strategy");
             ui.add_space(24.0);
-            egui::Grid::new("settings").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                ui.label("Map size");
-                map_picker(ui, "map", &mut m.settings.map, MAP_PRESETS.len());
-                ui.end_row();
-                ui.label("Opponents");
-                ui.add(egui::Slider::new(&mut m.settings.opponents, 1..=7));
-                ui.end_row();
-                ui.label("Difficulty");
-                ui.horizontal(|ui| {
-                    for (d, name) in
-                        [(Difficulty::Easy, "Easy"), (Difficulty::Normal, "Normal"), (Difficulty::Hard, "Hard")]
-                    {
-                        ui.selectable_value(&mut m.settings.difficulty, d, name);
+            crate::ui::centered(ui, 360.0, |ui| {
+                egui::Grid::new("settings").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                    ui.label("Map size");
+                    map_picker(ui, "map", &mut m.settings.map, MAP_PRESETS.len());
+                    ui.end_row();
+                    ui.label("Opponents");
+                    ui.add(egui::Slider::new(&mut m.settings.opponents, 1..=7));
+                    ui.end_row();
+                    ui.label("Difficulty");
+                    ui.horizontal(|ui| {
+                        for (d, name) in
+                            [(Difficulty::Easy, "Easy"), (Difficulty::Normal, "Normal"), (Difficulty::Hard, "Hard")]
+                        {
+                            ui.selectable_value(&mut m.settings.difficulty, d, name);
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Map seed");
+                    ui.add(egui::DragValue::new(&mut m.settings.seed));
+                    ui.end_row();
+                    ui.label("Sandbox");
+                    ui.checkbox(&mut m.settings.sandbox, "huge armies, no upkeep or supply limits");
+                    ui.end_row();
+                    if m.settings.sandbox {
+                        ui.label("Units per side");
+                        ui.add(egui::Slider::new(&mut m.settings.units_per_player, 100..=12_500).logarithmic(true));
+                        ui.end_row();
+                        let total = m.settings.units_per_player as u64 * (m.settings.opponents as u64 + 1);
+                        ui.label("");
+                        ui.weak(format!("{total} units in total"));
+                        ui.end_row();
                     }
                 });
-                ui.end_row();
-                ui.label("Map seed");
-                ui.add(egui::DragValue::new(&mut m.settings.seed));
-                ui.end_row();
-                ui.label("Sandbox");
-                ui.checkbox(&mut m.settings.sandbox, "huge armies, no upkeep or supply limits");
-                ui.end_row();
-                if m.settings.sandbox {
-                    ui.label("Units per side");
-                    ui.add(egui::Slider::new(&mut m.settings.units_per_player, 100..=12_500).logarithmic(true));
-                    ui.end_row();
-                    let total = m.settings.units_per_player as u64 * (m.settings.opponents as u64 + 1);
-                    ui.label("");
-                    ui.weak(format!("{total} units in total"));
-                    ui.end_row();
-                }
             });
             ui.add_space(16.0);
             if ui.button(RichText::new("  Play vs AI  ").size(20.0)).clicked() {
@@ -93,6 +97,9 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                 m.online.open = true;
             }
             ui.add_space(8.0);
+            if ui.button("Settings").clicked() {
+                action = UiAction::OpenSettings;
+            }
             if ui.button("Quit").clicked() {
                 action = UiAction::Quit;
             }
@@ -117,6 +124,19 @@ pub fn map_picker(ui: &mut egui::Ui, id: &str, map: &mut [u32; 2], count: usize)
             ui.selectable_value(map, [w, h], label(w, h));
         }
     });
+}
+
+/// Lays out `f` in a column of `width` centred in the available space.
+pub fn centered<R>(ui: &mut egui::Ui, width: f32, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+        ui.vertical(|ui| {
+            ui.set_max_width(width);
+            f(ui)
+        })
+        .inner
+    })
+    .inner
 }
 
 fn money(v: i64) -> String {
@@ -237,6 +257,9 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                 if ui.button("Resume").clicked() {
                     *menu_open = false;
                 }
+                if ui.button("Settings").clicked() {
+                    action = UiAction::OpenSettings;
+                }
                 let leave = if g.online.is_some() { "Leave match" } else { "Surrender" };
                 if ui.button(leave).clicked() {
                     action = UiAction::ToMenu;
@@ -246,9 +269,8 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                 }
                 ui.separator();
                 ui.weak("LMB select / drag box · RMB move / drag path · Shift queue");
-                ui.weak("S stop · C clear queue · Q/W buy · Ctrl+1–9 groups · Home capital");
-                ui.weak("Space pause · +/− speed · wheel zoom · MMB drag pan");
-                ui.weak("F11 or Alt+Enter: full screen / window");
+                ui.weak("Ctrl+1–9 store group · 1–9 select · wheel zoom · MMB drag pan");
+                ui.weak("Other keys: Settings → Keys");
             },
         );
     }
@@ -292,4 +314,105 @@ fn end_charts(ui: &mut egui::Ui, g: &Game) {
             painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, col)));
         }
     }
+}
+
+/// The settings window (spec 2.10). Returns true when it should close.
+pub fn settings_window(
+    ctx: &egui::Context,
+    s: &mut crate::settings::Settings,
+    rebinding: &mut Option<crate::settings::Action>,
+) -> bool {
+    use crate::settings::{Action, key_name};
+    let mut close = false;
+    egui::Window::new("Settings").anchor(Align2::CENTER_CENTER, [0.0, 0.0]).collapsible(false).resizable(false).show(
+        ctx,
+        |ui| {
+            ui.label(RichText::new("Graphics").strong());
+            egui::Grid::new("gfx").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                ui.label("Full screen");
+                ui.checkbox(&mut s.fullscreen, "borderless, F11 to switch");
+                ui.end_row();
+                ui.label("VSync");
+                ui.checkbox(&mut s.vsync, "");
+                ui.end_row();
+                ui.label("FPS limit");
+                ui.horizontal(|ui| {
+                    let mut on = s.fps_limit > 0;
+                    if ui.checkbox(&mut on, "").changed() {
+                        s.fps_limit = if on { 144 } else { 0 };
+                    }
+                    if on {
+                        ui.add(egui::Slider::new(&mut s.fps_limit, 30..=360));
+                    }
+                });
+                ui.end_row();
+                ui.label("Interface scale");
+                ui.add(egui::Slider::new(&mut s.ui_scale, 0.75..=2.0).step_by(0.05));
+                ui.end_row();
+            });
+            ui.separator();
+            ui.label(RichText::new("Camera").strong());
+            egui::Grid::new("cam").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                ui.label("Scroll at screen edges");
+                ui.checkbox(&mut s.edge_scroll, "");
+                ui.end_row();
+                ui.label("Scroll speed");
+                ui.add(egui::Slider::new(&mut s.scroll_speed, 0.25..=4.0).logarithmic(true));
+                ui.end_row();
+                ui.label("Zoom sensitivity");
+                ui.add(egui::Slider::new(&mut s.zoom_speed, 0.25..=4.0).logarithmic(true));
+                ui.end_row();
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Keys").strong());
+                if ui.small_button("Reset to defaults").clicked() {
+                    s.reset_keys();
+                    *rebinding = None;
+                }
+            });
+            egui::Grid::new("keys").num_columns(4).spacing([16.0, 4.0]).show(ui, |ui| {
+                for (k, a) in Action::ALL.into_iter().enumerate() {
+                    ui.label(a.label());
+                    let text = if *rebinding == Some(a) {
+                        "press a key…".to_string()
+                    } else {
+                        key_name(s.key(a)).to_string()
+                    };
+                    if ui.add(egui::Button::new(text).min_size(egui::vec2(90.0, 0.0))).clicked() {
+                        *rebinding = Some(a);
+                    }
+                    if k % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+            ui.weak("Fixed: mouse, Ctrl+1–9 / 1–9 groups, Esc menu, Alt+Enter full screen, numpad +/− speed.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Sound").strong());
+                ui.weak("(sounds arrive in the next update)");
+            });
+            egui::Grid::new("snd").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                for (name, v) in [
+                    ("Master", &mut s.master_volume),
+                    ("Effects", &mut s.effects_volume),
+                    ("Music", &mut s.music_volume),
+                    ("Alerts", &mut s.alert_volume),
+                ] {
+                    ui.label(name);
+                    ui.add(egui::Slider::new(v, 0.0..=1.0).show_value(false));
+                    ui.end_row();
+                }
+                ui.label("");
+                ui.checkbox(&mut s.mute_unfocused, "Mute when the window is in the background");
+                ui.end_row();
+            });
+            ui.add_space(8.0);
+            if ui.button(RichText::new("  Done  ").size(16.0)).clicked() {
+                close = true;
+            }
+        },
+    );
+    close
 }

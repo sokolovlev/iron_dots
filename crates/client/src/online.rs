@@ -252,29 +252,33 @@ impl OnlineMenu {
     }
 
     fn connect_ui(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("connect").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Your name");
-            ui.text_edit_singleline(&mut self.name);
-            ui.end_row();
-            ui.label("Server");
-            ui.text_edit_singleline(&mut self.address);
-            ui.end_row();
+        crate::ui::centered(ui, 380.0, |ui| {
+            egui::Grid::new("connect").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Your name");
+                ui.text_edit_singleline(&mut self.name);
+                ui.end_row();
+                ui.label("Server");
+                ui.text_edit_singleline(&mut self.address);
+                ui.end_row();
+            });
         });
         ui.add_space(8.0);
         if self.net.is_some() {
             ui.label("Connecting…");
         } else {
-            ui.horizontal(|ui| {
-                if ui.button("Connect").clicked() {
-                    match resolve(self.address.trim()) {
-                        Ok(a) => self.connect(a),
-                        Err(e) => self.error = Some(e),
+            crate::ui::centered(ui, 380.0, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Connect").clicked() {
+                        match resolve(self.address.trim()) {
+                            Ok(a) => self.connect(a),
+                            Err(e) => self.error = Some(e),
+                        }
                     }
-                }
-                if ui.button("Host LAN game").clicked() {
-                    self.host_lan();
-                }
-                ui.add(egui::Slider::new(&mut self.new_lobby.slots, 2..=8).text("slots"));
+                    if ui.button("Host LAN game").clicked() {
+                        self.host_lan();
+                    }
+                    ui.add(egui::Slider::new(&mut self.new_lobby.slots, 2..=8).text("slots"));
+                });
             });
         }
         ui.add_space(12.0);
@@ -322,22 +326,24 @@ impl OnlineMenu {
         }
         ui.add_space(12.0);
         ui.label(RichText::new("New lobby").strong());
-        egui::Grid::new("new").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Name");
-            ui.text_edit_singleline(&mut self.lobby_name);
-            ui.end_row();
-            ui.label("Map size");
-            let mut map = [self.new_lobby.width, self.new_lobby.height];
-            // Up to 2048×1152: the relay's limit.
-            crate::ui::map_picker(ui, "omap", &mut map, 5);
-            [self.new_lobby.width, self.new_lobby.height] = map;
-            ui.end_row();
-            ui.label("Slots");
-            ui.add(egui::Slider::new(&mut self.new_lobby.slots, 2..=8));
-            ui.end_row();
-            ui.label("Map seed");
-            ui.add(egui::DragValue::new(&mut self.new_lobby.seed));
-            ui.end_row();
+        crate::ui::centered(ui, 360.0, |ui| {
+            egui::Grid::new("new").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Name");
+                ui.text_edit_singleline(&mut self.lobby_name);
+                ui.end_row();
+                ui.label("Map size");
+                let mut map = [self.new_lobby.width, self.new_lobby.height];
+                // Up to 2048×1152: the relay's limit.
+                crate::ui::map_picker(ui, "omap", &mut map, 5);
+                [self.new_lobby.width, self.new_lobby.height] = map;
+                ui.end_row();
+                ui.label("Slots");
+                ui.add(egui::Slider::new(&mut self.new_lobby.slots, 2..=8));
+                ui.end_row();
+                ui.label("Map seed");
+                ui.add(egui::DragValue::new(&mut self.new_lobby.seed));
+                ui.end_row();
+            });
         });
         if ui.button("Create lobby").clicked() {
             self.send(ClientMsg::CreateLobby { name: self.lobby_name.clone(), settings: self.new_lobby.clone() });
@@ -352,59 +358,61 @@ impl OnlineMenu {
         ui.weak(format!("map {}×{}, seed {}{lan}", l.settings.width, l.settings.height, l.settings.seed));
         ui.add_space(8.0);
         let mut msgs = Vec::new();
-        egui::Grid::new("slots").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
-            for (k, s) in l.slots.iter().enumerate() {
-                let k = k as u8;
-                ui.label(format!("{}.", k + 1));
-                match &s.kind {
-                    SlotKind::Human { client, name, ready } => {
-                        let tag = if *client == l.host { " (host)" } else { "" };
-                        let col = if *ready || *client == l.host { Color32::LIGHT_GREEN } else { Color32::GRAY };
-                        ui.colored_label(col, format!("{name}{tag}"));
-                    }
-                    other if host => {
-                        let label = |k: &SlotKind| match k {
-                            SlotKind::Open => "Open",
-                            SlotKind::Closed => "Closed",
-                            SlotKind::Bot { difficulty: 0 } => "Bot (easy)",
-                            SlotKind::Bot { difficulty: 1 } => "Bot (normal)",
-                            SlotKind::Bot { .. } => "Bot (hard)",
-                            SlotKind::Human { .. } => "",
-                        };
-                        egui::ComboBox::from_id_salt(("slot", k)).selected_text(label(other)).show_ui(ui, |ui| {
-                            for kind in [
-                                SlotKind::Open,
-                                SlotKind::Closed,
-                                SlotKind::Bot { difficulty: 0 },
-                                SlotKind::Bot { difficulty: 1 },
-                                SlotKind::Bot { difficulty: 2 },
-                            ] {
-                                if ui.selectable_label(*other == kind, label(&kind)).clicked() && *other != kind {
-                                    msgs.push(ClientMsg::SetSlot { slot: k, kind });
+        crate::ui::centered(ui, 320.0, |ui| {
+            egui::Grid::new("slots").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                for (k, s) in l.slots.iter().enumerate() {
+                    let k = k as u8;
+                    ui.label(format!("{}.", k + 1));
+                    match &s.kind {
+                        SlotKind::Human { client, name, ready } => {
+                            let tag = if *client == l.host { " (host)" } else { "" };
+                            let col = if *ready || *client == l.host { Color32::LIGHT_GREEN } else { Color32::GRAY };
+                            ui.colored_label(col, format!("{name}{tag}"));
+                        }
+                        other if host => {
+                            let label = |k: &SlotKind| match k {
+                                SlotKind::Open => "Open",
+                                SlotKind::Closed => "Closed",
+                                SlotKind::Bot { difficulty: 0 } => "Bot (easy)",
+                                SlotKind::Bot { difficulty: 1 } => "Bot (normal)",
+                                SlotKind::Bot { .. } => "Bot (hard)",
+                                SlotKind::Human { .. } => "",
+                            };
+                            egui::ComboBox::from_id_salt(("slot", k)).selected_text(label(other)).show_ui(ui, |ui| {
+                                for kind in [
+                                    SlotKind::Open,
+                                    SlotKind::Closed,
+                                    SlotKind::Bot { difficulty: 0 },
+                                    SlotKind::Bot { difficulty: 1 },
+                                    SlotKind::Bot { difficulty: 2 },
+                                ] {
+                                    if ui.selectable_label(*other == kind, label(&kind)).clicked() && *other != kind {
+                                        msgs.push(ClientMsg::SetSlot { slot: k, kind });
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
+                        SlotKind::Open => {
+                            ui.weak("open");
+                        }
+                        SlotKind::Closed => {
+                            ui.weak("closed");
+                        }
+                        SlotKind::Bot { difficulty } => {
+                            ui.label(["Bot (easy)", "Bot (normal)", "Bot (hard)"][(*difficulty).min(2) as usize]);
+                        }
                     }
-                    SlotKind::Open => {
-                        ui.weak("open");
+                    if host {
+                        let mut team = s.team;
+                        if ui.add(egui::DragValue::new(&mut team).range(1..=8).prefix("team ")).changed() {
+                            msgs.push(ClientMsg::SetTeam { slot: k, team });
+                        }
+                    } else {
+                        ui.label(format!("team {}", s.team));
                     }
-                    SlotKind::Closed => {
-                        ui.weak("closed");
-                    }
-                    SlotKind::Bot { difficulty } => {
-                        ui.label(["Bot (easy)", "Bot (normal)", "Bot (hard)"][(*difficulty).min(2) as usize]);
-                    }
+                    ui.end_row();
                 }
-                if host {
-                    let mut team = s.team;
-                    if ui.add(egui::DragValue::new(&mut team).range(1..=8).prefix("team ")).changed() {
-                        msgs.push(ClientMsg::SetTeam { slot: k, team });
-                    }
-                } else {
-                    ui.label(format!("team {}", s.team));
-                }
-                ui.end_row();
-            }
+            });
         });
         ui.add_space(8.0);
         if host {

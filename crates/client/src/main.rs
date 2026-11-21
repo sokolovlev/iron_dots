@@ -16,6 +16,7 @@ mod game;
 mod gpu;
 mod offscreen;
 mod online;
+mod settings;
 mod ui;
 
 use game::MatchSettings;
@@ -104,7 +105,7 @@ fn main() -> ExitCode {
     };
     let result = match launch.shot {
         Some(path) => offscreen::screenshot(&opts, &path).map(|adapter| println!("wrote {path} using {adapter}")),
-        None => app::run(launch.play.then(|| opts.settings.clone()), !launch.windowed),
+        None => app::run(launch.play.then(|| opts.settings.clone()), launch.windowed),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
