@@ -274,9 +274,12 @@ impl App {
 
         // Edge scrolling.
         if let Some(g) = &mut self.game {
-            if self.edge_scroll && self.focused && !self.esc_menu {
+            let p = self.mouse.pos;
+            // Only while the cursor is inside the window: once it leaves, its
+            // position is a far-away placeholder, not an edge.
+            let inside = (0.0..vp[0]).contains(&p[0]) && (0.0..vp[1]).contains(&p[1]);
+            if self.edge_scroll && self.focused && !self.esc_menu && inside {
                 let speed = 900.0 / g.camera.scale * dt;
-                let p = self.mouse.pos;
                 if p[0] <= EDGE_SCROLL_PX {
                     g.camera.center[0] -= speed;
                 }
