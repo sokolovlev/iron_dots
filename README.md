@@ -106,7 +106,19 @@ the match ends for everyone; a dedicated server avoids that:
 cargo run --release -p relay-server -- --port 27960
 ```
 
-Maps are wide like the screen (close to 16:9): from Small 320×192 to
+**Maps.** Ten built-in maps (4 duels, 3 for 2v2, 2 for 3v3, one 4-player
+free-for-all), all symmetric so no start is better than another, or a random
+generated map of any size. Pick them in the main menu or when creating an
+online lobby; your own maps work online too (the map travels with the lobby).
+
+**Map editor** (main menu → Map editor): terrain brushes, neutral cities and
+start positions with teams, mirror / rotate / four-way symmetry, undo and redo
+(Ctrl+Z / Ctrl+Y), generate from a seed, import a PNG (colours matched to
+terrain; or drop a `.png` or `.wmap` onto the window), save, and Play to try
+the map against bots at once. Maps are saved as `.wmap` next to
+`settings.ron`, in `maps/`.
+
+Generated maps are wide like the screen (close to 16:9): from Small 320×192 to
 Colossal 4096×2304. Sides are multiples of the 64-tile chunk, so exact 16:9
 starts at 1024×576. `--map` takes `WxH` or a single number for a square map.
 

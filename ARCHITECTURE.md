@@ -247,6 +247,23 @@ shortest path (hierarchy cost; tested on an open map). In the benchmarks
 flow fields add about 8–9% to the tick, almost all of it the per-unit
 lookups in the movement pass. Phase 3 itself is ~3%.
 
+## Maps
+
+`.wmap` (`sim_core::mapfile`): `"WMAP"`, a format version, then a zstd frame
+(pure-Rust `ruzstd`) with the bitcode-encoded `MapFile`: name, author,
+terrain in the map's chunk-major order, neutral cities, start positions and
+the suggested team of each start. A 448×256 map is about 16 KB. A match on a
+map carries the encoded file in its scenario (`MapSource::File`), so replays
+and network games need nothing else; the scenario seed is the file's hash.
+Starts without a player become neutral cities.
+
+The built-in pool (`assets/maps`, compiled into the client) is made by
+`headless mapgen`: noise terrain made symmetric (mirror for two sides facing
+each other, 180° rotation, or four-way for free-for-all), starts and neutral
+cities placed in one part and copied to the others. Starting armies are
+placed on the side of the capital facing the map centre, so mirrored starts
+get mirrored armies.
+
 ## Multiplayer (stage 6)
 
 Deterministic lockstep (spec 6.2). Only player commands cross the network;

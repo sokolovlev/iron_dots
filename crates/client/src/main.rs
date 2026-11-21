@@ -13,6 +13,7 @@
 //! ```
 
 mod app;
+mod editor;
 mod game;
 mod gpu;
 mod maps;

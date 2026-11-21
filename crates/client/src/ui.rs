@@ -14,6 +14,8 @@ pub enum UiAction {
     Quit,
     OpenSettings,
     CloseSettings,
+    OpenEditor,
+    CloseEditor,
 }
 
 pub struct Menu {
@@ -153,6 +155,9 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                 m.online.open = true;
             }
             ui.add_space(8.0);
+            if ui.button("Map editor").clicked() {
+                action = UiAction::OpenEditor;
+            }
             if ui.button("Settings").clicked() {
                 action = UiAction::OpenSettings;
             }
@@ -163,7 +168,7 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                 ui.colored_label(Color32::LIGHT_RED, e);
             }
             ui.add_space(24.0);
-            ui.weak("Replays viewer, editor and tutorial arrive in later stages.");
+            ui.weak("Replay viewer and tutorial arrive in later updates.");
         });
     });
     action
@@ -326,7 +331,7 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                 ui.separator();
                 ui.weak("LMB select / drag box · RMB move / drag path · Shift queue");
                 ui.weak("Ctrl+1–9 store group · 1–9 select · wheel zoom · MMB drag pan");
-                ui.weak("Other keys: Settings → Keys");
+                ui.weak("Other keys: see Settings, Keys");
             },
         );
     }

@@ -174,6 +174,25 @@ pub enum Symmetry {
     Quad,
 }
 
+impl Symmetry {
+    /// `p` and its images in the other parts of a `w`×`h` map (`p` first).
+    pub fn images(self, w: u32, h: u32, (x, y): (u32, u32)) -> Vec<(u32, u32)> {
+        let mut v = match self {
+            Symmetry::Mirror => vec![(x, y), (w - 1 - x, y)],
+            Symmetry::Rotate => vec![(x, y), (w - 1 - x, h - 1 - y)],
+            Symmetry::Quad => vec![(x, y), (w - 1 - x, y), (x, h - 1 - y), (w - 1 - x, h - 1 - y)],
+        };
+        // A point on an axis is its own image.
+        v.dedup();
+        v.sort_unstable();
+        v.dedup();
+        if let Some(k) = v.iter().position(|&q| q == (x, y)) {
+            v.swap(0, k);
+        }
+        v
+    }
+}
+
 /// A fair generated map: noise terrain made symmetric, starts and neutral
 /// cities placed in one part and copied to the others. `layout` gives the
 /// starts of the left (or top-left) part as fractions of the map in
@@ -204,11 +223,11 @@ pub fn symmetric(
         }
     }
     // Images of a point in the other parts.
-    let copies = |(x, y): (u32, u32)| -> Vec<(u32, u32)> {
+    let copies = |p: (u32, u32)| -> Vec<(u32, u32)> {
         match sym {
-            Symmetry::Mirror => vec![(x, y), (w - 1 - x, y)],
-            Symmetry::Rotate => vec![(x, y), (w - 1 - x, h - 1 - y)],
-            Symmetry::Quad => vec![(x, y), (w - 1 - x, y), (x, h - 1 - y), (w - 1 - x, h - 1 - y)],
+            Symmetry::Mirror => vec![p, (w - 1 - p.0, p.1)],
+            Symmetry::Rotate => vec![p, (w - 1 - p.0, h - 1 - p.1)],
+            Symmetry::Quad => vec![p, (w - 1 - p.0, p.1), (p.0, h - 1 - p.1), (w - 1 - p.0, h - 1 - p.1)],
         }
     };
     let part_w = w / 2 - 4;
@@ -269,6 +288,9 @@ pub fn symmetric(
     for &c in &part_cities {
         f.cities.extend(copies(c));
     }
-    f.validate()?;
+    // Terrain only (the editor) is not a playable map yet.
+    if !layout.is_empty() {
+        f.validate()?;
+    }
     Ok(f)
 }

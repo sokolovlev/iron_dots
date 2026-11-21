@@ -62,6 +62,8 @@ pub struct App {
     /// `None` without an audio device, or before the window exists.
     audio: Option<crate::sound::Audio>,
     audio_ready: bool,
+    /// The map editor is open (it stays open while a test match runs).
+    editor: Option<crate::editor::Editor>,
     pending_start: Option<MatchSettings>,
     /// Borderless full screen (default) or a normal window; F11 / Alt+Enter.
     fullscreen: bool,
@@ -91,6 +93,7 @@ pub fn run(start: Option<MatchSettings>, windowed: bool) -> Result<(), String> {
         frame_start: Instant::now(),
         audio: None,
         audio_ready: false,
+        editor: None,
         pending_start: None,
         fullscreen,
         settings,
@@ -185,7 +188,7 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
+    fn handle_key(&mut self, code: KeyCode, _event_loop: &ActiveEventLoop) {
         let vp = self.viewport();
         let ctrl = self.mods.control_key() || self.mods.super_key();
         let shift = self.mods.shift_key();
@@ -204,10 +207,23 @@ impl App {
                 self.close_settings();
             } else if self.game.is_some() {
                 self.esc_menu = !self.esc_menu;
-            } else {
-                event_loop.exit();
+            } else if self.editor.is_none() && self.menu.online.open {
+                // Esc backs out of the online screen; the main menu itself
+                // never quits on Esc (that is what the Quit button is for).
+                self.menu.online.open = false;
             }
             return;
+        }
+        if self.game.is_none() {
+            if let Some(e) = &mut self.editor {
+                match code {
+                    KeyCode::KeyZ if ctrl && shift => e.redo(),
+                    KeyCode::KeyZ if ctrl => e.undo(),
+                    KeyCode::KeyY if ctrl => e.redo(),
+                    _ => {}
+                }
+                return;
+            }
         }
         let Some(g) = &mut self.game else { return };
         let digit = match code {
@@ -267,6 +283,25 @@ impl App {
         let vp = self.viewport();
         let pos = self.mouse.pos;
         let shift = self.mods.shift_key();
+        if self.game.is_none() {
+            if let Some(e) = &mut self.editor {
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        self.mouse.left_down = Some(pos);
+                        e.press(pos, vp);
+                    }
+                    (MouseButton::Left, ElementState::Released) => {
+                        self.mouse.left_down = None;
+                        e.release();
+                    }
+                    (MouseButton::Right, ElementState::Pressed) => e.right_click(pos, vp),
+                    (MouseButton::Middle, ElementState::Pressed) => self.mouse.middle_down = Some(pos),
+                    (MouseButton::Middle, ElementState::Released) => self.mouse.middle_down = None,
+                    _ => {}
+                }
+                return;
+            }
+        }
         let Some(g) = &mut self.game else { return };
         let dist = |a: [f32; 2]| ((a[0] - pos[0]).powi(2) + (a[1] - pos[1]).powi(2)).sqrt();
         match (button, state) {
@@ -314,6 +349,16 @@ impl App {
         let vp = self.viewport();
         let prev = self.mouse.pos;
         self.mouse.pos = pos;
+        if self.game.is_none() {
+            if let Some(e) = &mut self.editor {
+                if self.mouse.middle_down.is_some() {
+                    e.camera.center[0] -= (pos[0] - prev[0]) / e.camera.scale;
+                    e.camera.center[1] -= (pos[1] - prev[1]) / e.camera.scale;
+                }
+                e.drag(pos, vp, self.mouse.left_down.is_some());
+                return;
+            }
+        }
         let Some(g) = &mut self.game else { return };
         if self.mouse.middle_down.is_some() {
             g.camera.center[0] -= (pos[0] - prev[0]) / g.camera.scale;
@@ -347,29 +392,41 @@ impl App {
         }
         let Some(gfx) = &mut self.gfx else { return };
 
-        // Edge scrolling.
-        if let Some(g) = &mut self.game {
-            let p = self.mouse.pos;
-            // Only while the cursor is inside the window: once it leaves, its
-            // position is a far-away placeholder, not an edge.
-            let inside = (0.0..vp[0]).contains(&p[0]) && (0.0..vp[1]).contains(&p[1]);
-            let edge = self.settings.edge_scroll && self.focused && !self.esc_menu && !self.settings_open && inside;
-            let [left, right, up, down] = self.camera_keys;
-            let speed = 900.0 * self.settings.scroll_speed / g.camera.scale * dt;
+        // Edge scrolling and camera keys.
+        let p = self.mouse.pos;
+        // Only while the cursor is inside the window (once it leaves, its
+        // position is a far-away placeholder, not an edge) and not over UI.
+        let inside = (0.0..vp[0]).contains(&p[0]) && (0.0..vp[1]).contains(&p[1]);
+        let edge = self.settings.edge_scroll
+            && self.focused
+            && !self.esc_menu
+            && !self.settings_open
+            && inside
+            && !gfx.egui_ctx.is_pointer_over_egui();
+        let scroll = |cam: &mut render::Camera, size: [f32; 2], keys: [bool; 4], speed: f32| {
+            let [left, right, up, down] = keys;
+            let speed = 900.0 * speed / cam.scale * dt;
             if left || (edge && p[0] <= EDGE_SCROLL_PX) {
-                g.camera.center[0] -= speed;
+                cam.center[0] -= speed;
             }
             if right || (edge && p[0] >= vp[0] - EDGE_SCROLL_PX) {
-                g.camera.center[0] += speed;
+                cam.center[0] += speed;
             }
             if up || (edge && p[1] <= EDGE_SCROLL_PX) {
-                g.camera.center[1] -= speed;
+                cam.center[1] -= speed;
             }
             if down || (edge && p[1] >= vp[1] - EDGE_SCROLL_PX) {
-                g.camera.center[1] += speed;
+                cam.center[1] += speed;
             }
-            g.camera.clamp_to(g.map_size(), vp);
+            cam.clamp_to(size, vp);
+        };
+        if let Some(g) = &mut self.game {
+            let size = g.map_size();
+            scroll(&mut g.camera, size, self.camera_keys, self.settings.scroll_speed);
             g.update(dt);
+        } else if let Some(e) = &mut self.editor {
+            let size = e.map_size();
+            scroll(&mut e.camera, size, self.camera_keys, self.settings.scroll_speed);
         }
         if let Some(a) = &mut self.audio {
             a.update(dt);
@@ -398,6 +455,18 @@ impl App {
             action = match &mut self.game {
                 // The menu would show through the settings window.
                 None if self.settings_open => UiAction::None,
+                None if self.editor.is_some() => {
+                    let e = self.editor.as_mut().expect("checked");
+                    match e.ui(ui, vp, &self.menu.maps) {
+                        crate::editor::EditorAction::None => UiAction::None,
+                        crate::editor::EditorAction::Exit => UiAction::CloseEditor,
+                        crate::editor::EditorAction::Play(m) => UiAction::StartMatch(MatchSettings {
+                            map_file: Some(m),
+                            difficulty: self.menu.settings.difficulty,
+                            ..MatchSettings::default()
+                        }),
+                    }
+                }
                 None => ui::main_menu(ui, &mut self.menu),
                 Some(g) => {
                     let mut esc = self.esc_menu && !self.settings_open;
@@ -453,6 +522,21 @@ impl App {
             r.set_markers(device, queue, &self.markers);
             r.set_overlay(device, queue, &self.overlay.vertices);
             r.set_camera(queue, &g.camera, vp, g.time);
+        } else if let Some(e) = &mut self.editor {
+            if e.resized || self.renderer.is_none() {
+                e.resized = false;
+                e.take_dirty();
+                self.renderer = Some(Renderer::new(device, queue, gfx.config.format, &e.map));
+            }
+            let r = self.renderer.as_mut().expect("just made");
+            for (cx, cy) in e.take_dirty() {
+                r.upload_chunk(queue, &e.map, cx, cy);
+            }
+            e.markers(&mut self.markers);
+            e.overlay(&mut self.overlay);
+            r.set_markers(device, queue, &self.markers);
+            r.set_overlay(device, queue, &self.overlay.vertices);
+            r.set_camera(queue, &e.camera, vp, 0.0);
         }
         {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -472,7 +556,7 @@ impl App {
                 multiview_mask: None,
             });
             let mut pass = pass.forget_lifetime();
-            if let (Some(_), Some(r)) = (&self.game, &self.renderer) {
+            if let (true, Some(r)) = (self.game.is_some() || self.editor.is_some(), &self.renderer) {
                 r.draw(&mut pass);
             }
             gfx.egui_renderer.render(&mut pass, &paint, &screen);
@@ -488,12 +572,22 @@ impl App {
             UiAction::None => {}
             UiAction::StartMatch(s) => {
                 self.save_replay();
+                if let Some(e) = &mut self.editor {
+                    // Back in the editor after the match: redraw its map.
+                    e.resized = true;
+                }
                 self.start_match(s)
             }
             UiAction::ToMenu => {
                 self.save_replay();
                 self.game = None;
                 self.renderer = None;
+            }
+            UiAction::OpenEditor => self.editor = Some(crate::editor::Editor::new()),
+            UiAction::CloseEditor => {
+                self.editor = None;
+                self.renderer = None;
+                self.menu.reload_maps();
             }
             UiAction::Quit => event_loop.exit(),
             UiAction::OpenSettings => self.settings_open = true,
@@ -597,6 +691,11 @@ impl ApplicationHandler for App {
                 self.camera_keys = [false; 4];
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::DroppedFile(path) => {
+                if let (None, Some(e)) = (&self.game, &mut self.editor) {
+                    e.drop_file(&path);
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             WindowEvent::CursorMoved { position, .. } => self.mouse_moved([position.x as f32, position.y as f32]),
             WindowEvent::CursorLeft { .. } => self.mouse.pos = [-1000.0, -1000.0],
@@ -612,13 +711,18 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
                 };
-                if let Some(g) = &mut self.game {
+                let cam = match (&mut self.game, &mut self.editor) {
+                    (Some(g), _) => Some((g.map_size(), &mut g.camera)),
+                    (None, Some(e)) => Some((e.map_size(), &mut e.camera)),
+                    _ => None,
+                };
+                if let Some((size, cam)) = cam {
                     // Stop zooming out where the map still fills the screen,
                     // so the point under the cursor stays put at the limit.
-                    let min = render::Camera::min_scale_for(g.map_size(), vp);
-                    let target = (g.camera.scale * 1.15f32.powf(steps * self.settings.zoom_speed)).max(min);
-                    g.camera.zoom_at(target / g.camera.scale, self.mouse.pos, vp);
-                    g.camera.clamp_to(g.map_size(), vp);
+                    let min = render::Camera::min_scale_for(size, vp);
+                    let target = (cam.scale * 1.15f32.powf(steps * self.settings.zoom_speed)).max(min);
+                    cam.zoom_at(target / cam.scale, self.mouse.pos, vp);
+                    cam.clamp_to(size, vp);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if self.rebinding.is_some() => {

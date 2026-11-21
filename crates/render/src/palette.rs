@@ -29,3 +29,18 @@ pub fn relative(me_team: u8, team_of: impl Fn(u8) -> u8, me: u8) -> [[f32; 4]; 9
     }
     c
 }
+
+/// Terrain colours (sRGB) by `Terrain` discriminant, as drawn by the map
+/// shader; used by the editor's tool buttons and PNG import.
+pub const TERRAIN: [[f32; 3]; 10] = [
+    [0.80, 0.82, 0.68], // plain
+    [0.47, 0.60, 0.42], // forest
+    [0.71, 0.67, 0.52], // hills
+    [0.47, 0.45, 0.44], // mountain
+    [0.45, 0.63, 0.78], // water
+    [0.89, 0.83, 0.63], // sand
+    [0.94, 0.95, 0.97], // snow
+    [0.60, 0.52, 0.42], // mud
+    [0.80, 0.82, 0.68], // city
+    [0.62, 0.52, 0.40], // bridge
+];
