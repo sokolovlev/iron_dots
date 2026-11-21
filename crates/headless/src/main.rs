@@ -11,6 +11,10 @@
 //! iron-dots-headless aieval --difficulty A,B [--matches N]
 //!                                               bot A vs bot B, sides swapped every
 //!                                               match: win rates (spec 8.1, AI levels)
+//! iron-dots-headless mapgen --map WxH --seed N --out FILE.wmap SYMMETRY LAYOUT [CITIES] [NAME]
+//!                                               fair generated map: SYMMETRY mirror|rotate|quad,
+//!                                               LAYOUT starts of one part as x,y in ‰ ("150,500;...")
+//!       --mapfile FILE (match, aieval): play on a .wmap map with its suggested teams
 //! iron-dots-headless netsim [--matches N]       3v3 matches over QUIC through a proxy with
 //!                                               10% loss and 100 ms jitter, one rejoin per
 //!                                               match; fails on any desync (spec 6.2)
@@ -49,6 +53,7 @@ struct Opts {
     tick_rate: u32,
     clean: bool,
     tune: String,
+    mapfile: Option<String>,
     positional: Vec<String>,
 }
 
@@ -70,6 +75,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         tick_rate: 30,
         clean: false,
         tune: String::new(),
+        mapfile: None,
         positional: Vec::new(),
     };
     let mut it = args.iter();
@@ -96,6 +102,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--tick-rate" => o.tick_rate = num(val("--tick-rate")?)?.clamp(1, 240) as u32,
             "--clean" => o.clean = true,
             "--tune" => o.tune = val("--tune")?,
+            "--mapfile" => o.mapfile = Some(val("--mapfile")?),
             "--threads" => o.threads = num(val("--threads")?)?.max(1) as usize,
             "--difficulty" => {
                 o.difficulty = val("--difficulty")?
@@ -177,6 +184,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "match" => play_match(&o, &b)?,
         "netsim" => netsim(&o)?,
         "aieval" => aieval(&o, &b)?,
+        "mapgen" => mapgen(&o)?,
         _ => return Err(usage()),
     }
     Ok(())
@@ -341,8 +349,22 @@ fn scaling(o: &Opts, b: &Balance) -> Result<(), String> {
     Ok(())
 }
 
+/// The match scenario: a `.wmap` file with its suggested teams, or a
+/// generated standard match.
+fn match_spec(o: &Opts, b: &Balance, players: u8, seed: u64) -> Result<ScenarioSpec, String> {
+    match &o.mapfile {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            let f = sim_core::mapfile::MapFile::decode(&bytes)?;
+            let slots: Vec<Option<u8>> = f.teams.iter().take(players as usize).map(|&t| Some(t)).collect();
+            ScenarioSpec::from_map_file(&bytes, &slots, b)
+        }
+        None => ScenarioSpec::standard_match(o.map, o.map_h, players, seed, b),
+    }
+}
+
 fn play_match(o: &Opts, b: &Balance) -> Result<(), String> {
-    let spec = ScenarioSpec::standard_match(o.map, o.map_h, o.players, o.seed, b)?;
+    let spec = match_spec(o, b, o.players, o.seed)?;
     let mut bots: Vec<Box<dyn Controller>> = (1..=o.players)
         .map(|p| {
             let d = o.difficulty.get(p as usize - 1).or(o.difficulty.last()).copied().unwrap_or(ai::Difficulty::Normal);
@@ -427,7 +449,7 @@ fn aieval(o: &Opts, b: &Balance) -> Result<(), String> {
                     // Each map is played twice, once from each side.
                     let seed = o.seed + (k / 2) as u64;
                     let swap = k % 2 == 1;
-                    let r = ScenarioSpec::standard_match(o.map, o.map_h, 2, seed, b)
+                    let r = match_spec(o, b, 2, seed)
                         .and_then(|spec| duel(&spec, b, o.ticks, if swap { [pb, pa] } else { [pa, pb] }));
                     let a_won = r.as_ref().ok().and_then(|(w, _)| *w).map(|w| (w == 1) != swap);
                     let secs = r.as_ref().map(|r| r.1).unwrap_or(0);
@@ -453,6 +475,44 @@ fn aieval(o: &Opts, b: &Balance) -> Result<(), String> {
         avg / 60,
         avg % 60,
         t.elapsed()
+    );
+    Ok(())
+}
+
+/// Writes a fair generated `.wmap` map (see `sim_core::mapfile::symmetric`).
+fn mapgen(o: &Opts) -> Result<(), String> {
+    use sim_core::mapfile::{Symmetry, symmetric};
+    let out = o.out.clone().ok_or("mapgen needs --out FILE.wmap")?;
+    let [sym, layout, rest @ ..] = &o.positional[..] else {
+        return Err("mapgen needs SYMMETRY and LAYOUT".into());
+    };
+    let sym = match sym.as_str() {
+        "mirror" => Symmetry::Mirror,
+        "rotate" => Symmetry::Rotate,
+        "quad" => Symmetry::Quad,
+        s => return Err(format!("unknown symmetry {s}")),
+    };
+    let layout = layout
+        .split(';')
+        .map(|p| {
+            let (x, y) = p.split_once(',').ok_or("layout points are x,y")?;
+            Ok((x.trim().parse().map_err(|_| "bad x")?, y.trim().parse().map_err(|_| "bad y")?))
+        })
+        .collect::<Result<Vec<(u32, u32)>, &str>>()?;
+    let cities = rest.first().map_or(Ok(5), |c| c.parse()).map_err(|_| "bad city count")?;
+    let mut f = symmetric(o.map, o.map_h, o.seed, sym, &layout, cities)?;
+    f.name = rest.get(1).cloned().unwrap_or_else(|| "Untitled".into());
+    f.author = "Iron Dots".into();
+    let bytes = f.encode();
+    std::fs::write(&out, &bytes).map_err(|e| format!("{out}: {e}"))?;
+    println!(
+        "wrote {out}: {}x{}, {} starts (teams {:?}), {} neutral cities, {} bytes",
+        f.width,
+        f.height,
+        f.starts.len(),
+        f.teams,
+        f.cities.len(),
+        bytes.len()
     );
     Ok(())
 }
@@ -525,7 +585,7 @@ fn netsim(o: &Opts) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: iron-dots-headless <record|verify|hash|bench|match|scaling|netsim|aieval> [--map N] [--units N] [--players N] \
+    "usage: iron-dots-headless <record|verify|hash|bench|match|scaling|netsim|aieval|mapgen> [--map N] [--units N] [--players N] \
      [--seed N] [--ticks N] [--balance FILE] [--out FILE] [FILE]"
         .into()
 }

@@ -30,6 +30,9 @@ pub struct MatchSettings {
     /// limits; `units_per_player` per faction.
     pub sandbox: bool,
     pub units_per_player: u32,
+    /// Play on this map instead of a generated one; every start gets a
+    /// player (you in the first), with the map's suggested teams.
+    pub map_file: Option<std::sync::Arc<crate::maps::MapEntry>>,
 }
 
 impl Default for MatchSettings {
@@ -41,6 +44,7 @@ impl Default for MatchSettings {
             seed: 1,
             sandbox: false,
             units_per_player: 2_000,
+            map_file: None,
         }
     }
 }
@@ -134,6 +138,13 @@ const MAX_RETRIES: u32 = 20;
 impl Game {
     pub fn new(settings: MatchSettings) -> Result<Game, String> {
         let balance = Balance::default_balance();
+        if let Some(m) = &settings.map_file {
+            let slots: Vec<Option<u8>> = m.teams.iter().map(|&t| Some(t)).collect();
+            let spec = ScenarioSpec::from_map_file(&m.bytes, &slots, &balance)?;
+            let players = slots.len() as u8;
+            let bots = (2..=players).map(|p| Bot::new(p, settings.difficulty)).collect();
+            return Game::build(settings, spec, balance, 1, bots);
+        }
         let players = settings.opponents + 1;
         let spec = if settings.sandbox {
             ScenarioSpec::battle(settings.map[0], settings.map[1], settings.units_per_player, players, settings.seed)?
@@ -946,7 +957,7 @@ mod tests {
             .collect();
         clients[0].send(ClientMsg::CreateLobby {
             name: "t".into(),
-            settings: LobbySettings { width: 256, height: 128, seed: 2, slots: 3 },
+            settings: LobbySettings { width: 256, height: 128, seed: 2, slots: 3, map: None },
         });
         let ServerMsg::Lobby(l) = wait(&clients[0], &|m| matches!(m, ServerMsg::Lobby(_))) else { unreachable!() };
         clients[1].send(ClientMsg::JoinLobby { lobby: l.id });

@@ -349,6 +349,22 @@ impl Relay {
             out.push(Out::Send(client, ServerMsg::Error("server is full".into())));
             return;
         }
+        let mut s = s;
+        let mut teams: Vec<u8> = (1..=s.slots).collect();
+        if let Some(m) = &s.map {
+            match sim_core::mapfile::MapFile::decode(&m.bytes).and_then(|f| f.validate().map(|_| f)) {
+                Ok(f) => {
+                    // One slot per start; teams as the map suggests.
+                    s.slots = f.starts.len() as u8;
+                    (s.width, s.height) = (f.width, f.height);
+                    teams = f.teams;
+                }
+                Err(e) => {
+                    out.push(Out::Send(client, ServerMsg::Error(format!("bad map: {e}"))));
+                    return;
+                }
+            }
+        }
         if !(2..=8).contains(&s.slots)
             || ![s.width, s.height].iter().all(|v| (64..=self.config.max_map).contains(v) && v % 64 == 0)
         {
@@ -358,7 +374,7 @@ impl Relay {
         let id = self.id();
         let me = self.clients[&client].name.clone().unwrap_or_default();
         let name: String = name.chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
-        let mut slots: Vec<Slot> = (0..s.slots).map(|k| Slot { kind: SlotKind::Open, team: k + 1 }).collect();
+        let mut slots: Vec<Slot> = teams.iter().map(|&team| Slot { kind: SlotKind::Open, team }).collect();
         slots[0].kind = SlotKind::Human { client, name: me, ready: false };
         let state = LobbyState { id, name, host: client, settings: s, slots };
         self.lobbies.insert(id, Lobby { state });
@@ -472,11 +488,22 @@ impl Relay {
             return fail(out, "need at least two teams");
         }
         let s = &l.settings;
-        let mut scenario =
-            match ScenarioSpec::standard_match(s.width, s.height, taken.len() as u8, s.seed, &self.balance) {
-                Ok(sc) => sc,
-                Err(e) => return fail(out, &e),
-            };
+        let scenario = match &s.map {
+            // Slot k plays at start k; empty starts become neutral cities.
+            Some(m) => {
+                let slots: Vec<Option<u8>> = l
+                    .slots
+                    .iter()
+                    .map(|sl| matches!(sl.kind, SlotKind::Human { .. } | SlotKind::Bot { .. }).then_some(sl.team))
+                    .collect();
+                ScenarioSpec::from_map_file(&m.bytes, &slots, &self.balance)
+            }
+            None => ScenarioSpec::standard_match(s.width, s.height, taken.len() as u8, s.seed, &self.balance),
+        };
+        let mut scenario = match scenario {
+            Ok(sc) => sc,
+            Err(e) => return fail(out, &e),
+        };
         let mut players = Vec::new();
         let mut bots = Vec::new();
         for (k, slot) in taken.iter().enumerate() {
@@ -621,6 +648,7 @@ fn info(l: &LobbyState) -> LobbyInfo {
         open: l.slots.iter().filter(|s| s.kind == SlotKind::Open).count() as u8,
         width: l.settings.width,
         height: l.settings.height,
+        map: l.settings.map.as_ref().map(|m| m.name.clone()),
     }
 }
 

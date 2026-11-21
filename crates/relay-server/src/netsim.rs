@@ -23,6 +23,8 @@ pub type BotFactory = fn(u8, u8) -> Box<dyn Controller + Send>;
 pub struct Options {
     pub width: u32,
     pub height: u32,
+    /// Play on this `.wmap` instead of a generated map.
+    pub map_file: Option<Vec<u8>>,
     pub seed: u64,
     /// Team of each human client (6 entries for 3v3).
     pub teams: Vec<u8>,
@@ -40,6 +42,7 @@ impl Options {
         Options {
             width: 448,
             height: 256,
+            map_file: None,
             seed,
             teams: vec![1, 1, 1, 2, 2, 2],
             bots: Vec::new(),
@@ -208,7 +211,13 @@ pub fn run(opts: &Options, make_bot: BotFactory) -> Result<Outcome, String> {
     let host = &clients[0];
     host.send(ClientMsg::CreateLobby {
         name: "netsim".into(),
-        settings: LobbySettings { width: opts.width, height: opts.height, seed: opts.seed, slots },
+        settings: LobbySettings {
+            width: opts.width,
+            height: opts.height,
+            seed: opts.seed,
+            slots,
+            map: opts.map_file.clone().map(|bytes| net::proto::LobbyMap { name: "netsim".into(), bytes }),
+        },
     });
     let ServerMsg::Lobby(lobby) = wait(host, Duration::from_secs(20), |m| matches!(m, ServerMsg::Lobby(_)))? else {
         unreachable!()

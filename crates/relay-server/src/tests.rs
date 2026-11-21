@@ -21,7 +21,7 @@ fn to(out: &[Out], client: u32) -> Vec<ServerMsg> {
 }
 
 fn settings() -> LobbySettings {
-    LobbySettings { width: 256, height: 128, seed: 3, slots: 4 }
+    LobbySettings { width: 256, height: 128, seed: 3, slots: 4, map: None }
 }
 
 /// Two humans and a bot, started; returns (relay, host, guest, game, tokens).
@@ -180,4 +180,40 @@ fn rejoin_replays_history_and_checks_hashes() {
     // Its replayed hash is checked against the agreed one.
     r.message(b2, C::Hash { tick: 30, hash: 10 }, &mut out);
     assert!(to(&out, a).iter().any(|m| matches!(m, ServerMsg::Desync { tick: 30, .. })));
+}
+
+#[test]
+fn map_lobby_uses_the_map_starts_and_teams() {
+    let mut f = sim_core::mapfile::MapFile::blank(256, 128).unwrap();
+    f.starts = vec![(30, 30), (225, 30), (30, 97), (225, 97)];
+    f.teams = vec![1, 2, 1, 2];
+    f.cities = vec![(128, 64)];
+    let bytes = f.encode();
+    let mut r = Relay::new(Config::default(), 1);
+    let a = hello(&mut r, "ann");
+    let b = hello(&mut r, "bob");
+    let mut out = Vec::new();
+    let settings = LobbySettings {
+        width: 0,
+        height: 0,
+        seed: 0,
+        slots: 2,
+        map: Some(net::proto::LobbyMap { name: "Test".into(), bytes: bytes.clone() }),
+    };
+    r.message(a, C::CreateLobby { name: "m".into(), settings }, &mut out);
+    let Some(ServerMsg::Lobby(l)) = to(&out, a).pop() else { panic!("{out:?}") };
+    assert_eq!(l.slots.len(), 4, "one slot per start");
+    assert_eq!(l.slots.iter().map(|s| s.team).collect::<Vec<_>>(), vec![1, 2, 1, 2]);
+    // Bob takes slot 1 (team 2), a bot slot 2 (team 1); slot 3 stays empty.
+    r.message(b, C::JoinLobby { lobby: l.id }, &mut out);
+    r.message(b, C::SetReady(true), &mut out);
+    r.message(a, C::SetSlot { slot: 2, kind: SlotKind::Bot { difficulty: 1 } }, &mut out);
+    out.clear();
+    r.message(a, C::Start, &mut out);
+    let Some(ServerMsg::GameStart { scenario, bots, .. }) = to(&out, b).pop() else { panic!("{out:?}") };
+    assert_eq!(scenario.players.iter().map(|p| p.team).collect::<Vec<_>>(), vec![1, 2, 1]);
+    assert_eq!(bots, vec![(3, 1)]);
+    // The empty start (225, 97) is a neutral city.
+    assert!(scenario.cities.iter().any(|c| (c.x, c.y) == (225, 97) && c.owner == 0));
+    scenario.build(&Balance::default_balance()).unwrap();
 }

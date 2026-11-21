@@ -15,6 +15,7 @@ pub mod flow;
 pub mod fx;
 pub mod grid;
 pub mod map;
+pub mod mapfile;
 pub mod order;
 pub mod pathfind;
 pub mod replay;

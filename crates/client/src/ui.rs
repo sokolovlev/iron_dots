@@ -16,11 +16,56 @@ pub enum UiAction {
     CloseSettings,
 }
 
-#[derive(Default)]
 pub struct Menu {
     pub settings: MatchSettings,
     pub error: Option<String>,
     pub online: crate::online::OnlineMenu,
+    /// Built-in maps, then the player's own.
+    pub maps: Vec<std::sync::Arc<crate::maps::MapEntry>>,
+}
+
+impl Default for Menu {
+    fn default() -> Self {
+        let mut m =
+            Menu { settings: MatchSettings::default(), error: None, online: Default::default(), maps: Vec::new() };
+        m.reload_maps();
+        m
+    }
+}
+
+impl Menu {
+    pub fn reload_maps(&mut self) {
+        self.maps = crate::maps::builtin();
+        self.maps.extend(crate::maps::user_maps());
+        self.online.maps = self.maps.clone();
+    }
+}
+
+/// Map choice: a random generated map, or one from `maps`.
+pub fn map_choice(
+    ui: &mut egui::Ui,
+    id: &str,
+    maps: &[std::sync::Arc<crate::maps::MapEntry>],
+    chosen: &mut Option<std::sync::Arc<crate::maps::MapEntry>>,
+) {
+    let text = chosen.as_ref().map_or("Random (generated)".to_string(), |m| m.label());
+    egui::ComboBox::from_id_salt(id).width(300.0).selected_text(text).show_ui(ui, |ui| {
+        if ui.selectable_label(chosen.is_none(), "Random (generated)").clicked() {
+            *chosen = None;
+        }
+        let mut own = false;
+        for m in maps {
+            if m.path.is_some() && !own {
+                own = true;
+                ui.separator();
+                ui.weak("Your maps");
+            }
+            let on = chosen.as_ref().is_some_and(|c| c.bytes == m.bytes);
+            if ui.selectable_label(on, m.label()).clicked() {
+                *chosen = Some(m.clone());
+            }
+        }
+    });
 }
 
 /// Dark, high-contrast style used by every screen.
@@ -54,14 +99,23 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
             ui.label(RichText::new("IRON DOTS").size(48.0).strong());
             ui.label("minimalist real-time strategy");
             ui.add_space(24.0);
-            crate::ui::centered(ui, 360.0, |ui| {
+            crate::ui::centered(ui, 420.0, |ui| {
                 egui::Grid::new("settings").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                    ui.label("Map size");
-                    map_picker(ui, "map", &mut m.settings.map, MAP_PRESETS.len());
+                    ui.label("Map");
+                    map_choice(ui, "mapfile", &m.maps, &mut m.settings.map_file);
                     ui.end_row();
-                    ui.label("Opponents");
-                    ui.add(egui::Slider::new(&mut m.settings.opponents, 1..=7));
-                    ui.end_row();
+                    if let Some(f) = &m.settings.map_file {
+                        ui.label("Players");
+                        ui.weak(format!("{}: you and {} bots, teams as on the map", f.mode(), f.players() - 1));
+                        ui.end_row();
+                    } else {
+                        ui.label("Map size");
+                        map_picker(ui, "map", &mut m.settings.map, MAP_PRESETS.len());
+                        ui.end_row();
+                        ui.label("Opponents");
+                        ui.add(egui::Slider::new(&mut m.settings.opponents, 1..=7));
+                        ui.end_row();
+                    }
                     ui.label("Difficulty");
                     ui.horizontal(|ui| {
                         for (d, name) in
@@ -71,13 +125,15 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                         }
                     });
                     ui.end_row();
-                    ui.label("Map seed");
-                    ui.add(egui::DragValue::new(&mut m.settings.seed));
-                    ui.end_row();
-                    ui.label("Sandbox");
-                    ui.checkbox(&mut m.settings.sandbox, "huge armies, no upkeep or supply limits");
-                    ui.end_row();
-                    if m.settings.sandbox {
+                    if m.settings.map_file.is_none() {
+                        ui.label("Map seed");
+                        ui.add(egui::DragValue::new(&mut m.settings.seed));
+                        ui.end_row();
+                        ui.label("Sandbox");
+                        ui.checkbox(&mut m.settings.sandbox, "huge armies, no upkeep or supply limits");
+                        ui.end_row();
+                    }
+                    if m.settings.sandbox && m.settings.map_file.is_none() {
                         ui.label("Units per side");
                         ui.add(egui::Slider::new(&mut m.settings.units_per_player, 100..=12_500).logarithmic(true));
                         ui.end_row();

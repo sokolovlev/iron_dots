@@ -12,6 +12,7 @@ serde.workspace = true
 ron.workspace = true
 bitcode.workspace = true
 xxhash-rust.workspace = true
+ruzstd.workspace = true
 rayon.workspace = true
 simd-kernels.workspace = true
 pathing.workspace = true

@@ -46,6 +46,10 @@ pub struct OnlineMenu {
     scanner: Option<Result<Scanner, String>>,
     lan: Vec<(LanGame, f32)>,
     new_lobby: LobbySettings,
+    /// Map for a new lobby; `None` = generated.
+    new_map: Option<std::sync::Arc<crate::maps::MapEntry>>,
+    /// Maps to choose from (set by the main menu).
+    pub maps: Vec<std::sync::Arc<crate::maps::MapEntry>>,
     lobby_name: String,
     time: f32,
     last_list: f32,
@@ -66,7 +70,9 @@ impl Default for OnlineMenu {
             hosting: None,
             scanner: None,
             lan: Vec::new(),
-            new_lobby: LobbySettings { width: 320, height: 192, seed: 1, slots: 2 },
+            new_lobby: LobbySettings { width: 320, height: 192, seed: 1, slots: 2, map: None },
+            new_map: None,
+            maps: Vec::new(),
             lobby_name: "Iron Dots".into(),
             time: 0.0,
             last_list: -10.0,
@@ -183,7 +189,7 @@ impl OnlineMenu {
                         if self.hosting.is_some() && self.lobby.is_none() {
                             self.send(ClientMsg::CreateLobby {
                                 name: self.lobby_name.clone(),
-                                settings: self.new_lobby.clone(),
+                                settings: self.lobby_settings(),
                             });
                         }
                     }
@@ -277,9 +283,11 @@ impl OnlineMenu {
                     if ui.button("Host LAN game").clicked() {
                         self.host_lan();
                     }
-                    ui.add(egui::Slider::new(&mut self.new_lobby.slots, 2..=8).text("slots"));
                 });
             });
+            ui.add_space(8.0);
+            ui.weak("A hosted LAN game uses these settings:");
+            self.new_game_form(ui);
         }
         ui.add_space(12.0);
         ui.label(RichText::new("Games on your network").strong());
@@ -315,7 +323,11 @@ impl OnlineMenu {
         let mut join = None;
         for l in &self.lobbies {
             ui.horizontal(|ui| {
-                ui.label(format!("{}  ·  {} players, {} open  ·  {}×{}", l.name, l.humans, l.open, l.width, l.height));
+                let map = l.map.clone().unwrap_or_else(|| "random map".into());
+                ui.label(format!(
+                    "{}  ·  {} players, {} open  ·  {map} {}×{}",
+                    l.name, l.humans, l.open, l.width, l.height
+                ));
                 if l.open > 0 && ui.button("Join").clicked() {
                     join = Some(l.id);
                 }
@@ -326,28 +338,48 @@ impl OnlineMenu {
         }
         ui.add_space(12.0);
         ui.label(RichText::new("New lobby").strong());
-        crate::ui::centered(ui, 360.0, |ui| {
+        self.new_game_form(ui);
+        if ui.button("Create lobby").clicked() {
+            self.send(ClientMsg::CreateLobby { name: self.lobby_name.clone(), settings: self.lobby_settings() });
+        }
+    }
+
+    fn lobby_settings(&self) -> LobbySettings {
+        let mut s = self.new_lobby.clone();
+        s.map = self.new_map.as_ref().map(|m| net::proto::LobbyMap { name: m.name.clone(), bytes: m.bytes.clone() });
+        s
+    }
+
+    fn new_game_form(&mut self, ui: &mut egui::Ui) {
+        crate::ui::centered(ui, 440.0, |ui| {
             egui::Grid::new("new").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut self.lobby_name);
                 ui.end_row();
-                ui.label("Map size");
-                let mut map = [self.new_lobby.width, self.new_lobby.height];
-                // Up to 2048×1152: the relay's limit.
-                crate::ui::map_picker(ui, "omap", &mut map, 5);
-                [self.new_lobby.width, self.new_lobby.height] = map;
+                ui.label("Map");
+                // Online maps stop at 2048×1152, the relay's limit.
+                let maps: Vec<_> = self.maps.iter().filter(|m| m.width <= 2048).cloned().collect();
+                crate::ui::map_choice(ui, "omapfile", &maps, &mut self.new_map);
                 ui.end_row();
-                ui.label("Slots");
-                ui.add(egui::Slider::new(&mut self.new_lobby.slots, 2..=8));
-                ui.end_row();
-                ui.label("Map seed");
-                ui.add(egui::DragValue::new(&mut self.new_lobby.seed));
-                ui.end_row();
+                if let Some(m) = &self.new_map {
+                    ui.label("Slots");
+                    ui.weak(format!("{} ({} starts)", m.mode(), m.players()));
+                    ui.end_row();
+                } else {
+                    ui.label("Map size");
+                    let mut map = [self.new_lobby.width, self.new_lobby.height];
+                    crate::ui::map_picker(ui, "omap", &mut map, 5);
+                    [self.new_lobby.width, self.new_lobby.height] = map;
+                    ui.end_row();
+                    ui.label("Slots");
+                    ui.add(egui::Slider::new(&mut self.new_lobby.slots, 2..=8));
+                    ui.end_row();
+                    ui.label("Map seed");
+                    ui.add(egui::DragValue::new(&mut self.new_lobby.seed));
+                    ui.end_row();
+                }
             });
         });
-        if ui.button("Create lobby").clicked() {
-            self.send(ClientMsg::CreateLobby { name: self.lobby_name.clone(), settings: self.new_lobby.clone() });
-        }
     }
 
     fn lobby_ui(&mut self, ui: &mut egui::Ui, l: &LobbyState) {
@@ -355,7 +387,11 @@ impl OnlineMenu {
         let host = l.host == me;
         ui.label(RichText::new(&l.name).size(20.0).strong());
         let lan = self.hosting.as_ref().map(|h| format!("  ·  LAN, port {}", h.relay.addr.port())).unwrap_or_default();
-        ui.weak(format!("map {}×{}, seed {}{lan}", l.settings.width, l.settings.height, l.settings.seed));
+        let map = match &l.settings.map {
+            Some(m) => format!("map {} {}×{}", m.name, l.settings.width, l.settings.height),
+            None => format!("random map {}×{}, seed {}", l.settings.width, l.settings.height, l.settings.seed),
+        };
+        ui.weak(format!("{map}{lan}"));
         ui.add_space(8.0);
         let mut msgs = Vec::new();
         crate::ui::centered(ui, 320.0, |ui| {

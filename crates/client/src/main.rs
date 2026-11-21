@@ -8,12 +8,14 @@
 //! iron-dots --screenshot FILE [opts] [--ticks N] [--size WxH] [--zoom PX] [--no-hud]
 //!                                   render a bot-vs-bot frame to PNG, no window
 //! opts: --map N|WxH  --opponents N  --difficulty easy|normal|hard  --seed N
+//!       --mapfile FILE.wmap     (play on a map file, all its starts filled)
 //!       --sandbox [--units N]   (spec 2.7: N units per side, no upkeep/supply)
 //! ```
 
 mod app;
 mod game;
 mod gpu;
+mod maps;
 mod offscreen;
 mod online;
 mod settings;
@@ -56,6 +58,11 @@ fn parse() -> Result<(Launch, offscreen::ShotOptions), String> {
                 o.settings.map = [num(w.to_string())? as u32, num(h.to_string())? as u32];
             }
             "--sandbox" => o.settings.sandbox = true,
+            "--mapfile" => {
+                let path = std::path::PathBuf::from(val()?);
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                o.settings.map_file = Some(std::sync::Arc::new(maps::MapEntry::from_bytes(bytes, Some(path))?));
+            }
             "--units" => o.settings.units_per_player = num(val()?)?.clamp(1, 12_500) as u32,
             "--opponents" => o.settings.opponents = num(val()?)?.clamp(1, 7) as u8,
             "--seed" => o.settings.seed = num(val()?)?,

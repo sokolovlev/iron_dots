@@ -157,6 +157,52 @@ impl ScenarioSpec {
         })
     }
 
+    /// A match on a `.wmap` map. `slots[k]` is the team of the player at
+    /// start `k`, or `None` if nobody plays there (that capital becomes a
+    /// neutral city). Players are numbered in slot order.
+    pub fn from_map_file(bytes: &[u8], slots: &[Option<u8>], balance: &Balance) -> Result<ScenarioSpec, String> {
+        let file = crate::mapfile::MapFile::decode(bytes)?;
+        file.validate()?;
+        if slots.len() > file.starts.len() {
+            return Err(format!("the map has {} start positions", file.starts.len()));
+        }
+        let map = file.to_map()?;
+        let mut cities = Vec::new();
+        let mut spawns = Vec::new();
+        let mut players = Vec::new();
+        for (k, &(x, y)) in file.starts.iter().enumerate() {
+            match slots.get(k).copied().flatten() {
+                Some(team) => {
+                    let owner = players.len() as u8 + 1;
+                    players.push(PlayerSetup { team });
+                    cities.push(CitySpawn { x, y, owner, capital: true, claim: 6 });
+                    let n = balance.match_rules.start_light_units;
+                    // Army on the side facing the map centre, so mirrored
+                    // starts get mirrored armies.
+                    let dx = if x < file.width / 2 { 2 } else { -2 };
+                    for at in army_positions(&map, x as i32 + dx, y as i32, n) {
+                        spawns.push(Spawn { owner, kind: UnitKind::Light, at });
+                    }
+                }
+                None => cities.push(CitySpawn { x, y, owner: 0, capital: false, claim: 0 }),
+            }
+        }
+        if players.len() < 2 {
+            return Err("a match needs at least two players".into());
+        }
+        for &(x, y) in &file.cities {
+            cities.push(CitySpawn { x, y, owner: 0, capital: false, claim: 0 });
+        }
+        Ok(ScenarioSpec {
+            map: MapSource::File(bytes.to_vec()),
+            seed: crate::mapfile::MapFile::hash(bytes),
+            players,
+            cities,
+            spawns,
+            sandbox: false,
+        })
+    }
+
     /// Sandbox battle for benchmarks: generated map with `players` armies
     /// (each `units_per_player` strong, every 4th unit heavy) around the
     /// centre, each with a capital. Free-for-all teams.

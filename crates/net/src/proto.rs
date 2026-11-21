@@ -6,7 +6,7 @@ use sim_core::command::{Command, CommandKind};
 use sim_core::scenario::ScenarioSpec;
 
 /// Bump on any change to the messages below (spec 6.5, protocol_version).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Commands of one tick, as decided by the relay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,8 +44,19 @@ pub struct LobbySettings {
     pub width: u32,
     pub height: u32,
     pub seed: u64,
-    /// Number of slots (2..=8); one player per slot.
+    /// Number of slots (2..=8); one player per slot. With a map file,
+    /// one slot per start position.
     pub slots: u8,
+    /// A `.wmap` map (built-in or the host's own); `None` = generated from
+    /// `width`, `height` and `seed`.
+    pub map: Option<LobbyMap>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyMap {
+    pub name: String,
+    /// The encoded map file, sent to everyone with the lobby.
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +77,8 @@ pub struct LobbyInfo {
     pub open: u8,
     pub width: u32,
     pub height: u32,
+    /// Map name, if the lobby plays on a map file.
+    pub map: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

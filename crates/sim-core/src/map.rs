@@ -100,6 +100,9 @@ pub enum MapSource {
     Generated { width: u32, height: u32, seed: u64 },
     /// Explicit tiles (editor maps, tests).
     Tiles(Map),
+    /// An encoded `.wmap` file (built-in or editor maps); compact enough
+    /// to travel in lobby messages and replays.
+    File(Vec<u8>),
 }
 
 impl MapSource {
@@ -107,6 +110,7 @@ impl MapSource {
         match self {
             MapSource::Generated { width, height, seed } => Map::generate(*width, *height, *seed),
             MapSource::Tiles(m) => Ok(m.clone()),
+            MapSource::File(bytes) => crate::mapfile::MapFile::decode(bytes)?.to_map(),
         }
     }
 }
