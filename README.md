@@ -92,6 +92,7 @@ cargo run --release -p client -- --play --sandbox --map 4096 --opponents 7 --uni
 | Camera | wheel zoom to cursor, MMB drag, screen edges, Home = capital |
 | Pause / speed | Space / + and − (×0.5 … ×4) |
 | Menu | Esc |
+| Full screen / window | F11 or Alt+Enter (starts full screen; `--windowed` to start in a window) |
 
 **Online.** Main menu → Online. Either type a server address and Connect, or
 press *Host LAN game*: your game becomes the server and appears under "Games

@@ -11,7 +11,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 /// Mouse movement (pixels) below which a press counts as a click.
 const CLICK_SLOP: f32 = 6.0;
@@ -52,9 +52,11 @@ pub struct App {
     focused: bool,
     pub edge_scroll: bool,
     pending_start: Option<MatchSettings>,
+    /// Borderless full screen (default) or a normal window; F11 / Alt+Enter.
+    fullscreen: bool,
 }
 
-pub fn run(start: Option<MatchSettings>) -> Result<(), String> {
+pub fn run(start: Option<MatchSettings>, fullscreen: bool) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
@@ -72,6 +74,7 @@ pub fn run(start: Option<MatchSettings>) -> Result<(), String> {
         focused: true,
         edge_scroll: true,
         pending_start: None,
+        fullscreen,
     };
     if let Some(s) = start {
         app.menu.settings = s.clone();
@@ -134,6 +137,13 @@ impl App {
         let vp = self.viewport();
         let ctrl = self.mods.control_key() || self.mods.super_key();
         let shift = self.mods.shift_key();
+        if code == KeyCode::F11 || (code == KeyCode::Enter && self.mods.alt_key()) {
+            self.fullscreen = !self.fullscreen;
+            if let Some(gfx) = &self.gfx {
+                gfx.window.set_fullscreen(self.fullscreen.then_some(Fullscreen::Borderless(None)));
+            }
+            return;
+        }
         if code == KeyCode::Escape {
             if self.game.is_some() {
                 self.esc_menu = !self.esc_menu;
@@ -403,7 +413,9 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("Iron Dots")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0))
+            // Borderless on the current monitor: no title bar, no taskbar.
+            .with_fullscreen(self.fullscreen.then_some(Fullscreen::Borderless(None)));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

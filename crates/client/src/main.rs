@@ -3,6 +3,8 @@
 //! ```text
 //! iron-dots                         open the main menu
 //! iron-dots --play [opts]           start a match vs AI right away
+//! iron-dots --windowed              start in a window instead of full screen
+//!                                   (F11 or Alt+Enter switch at any time)
 //! iron-dots --screenshot FILE [opts] [--ticks N] [--size WxH] [--zoom PX] [--no-hud]
 //!                                   render a bot-vs-bot frame to PNG, no window
 //! opts: --map N  --opponents N  --difficulty easy|normal|hard  --seed N
@@ -19,9 +21,16 @@ mod ui;
 use game::MatchSettings;
 use std::process::ExitCode;
 
-fn parse() -> Result<(Option<String>, bool, offscreen::ShotOptions), String> {
+struct Launch {
+    shot: Option<String>,
+    play: bool,
+    windowed: bool,
+}
+
+fn parse() -> Result<(Launch, offscreen::ShotOptions), String> {
     let mut shot = None;
     let mut play = false;
+    let mut windowed = false;
     let mut o = offscreen::ShotOptions {
         settings: MatchSettings::default(),
         ticks: 1800,
@@ -37,6 +46,7 @@ fn parse() -> Result<(Option<String>, bool, offscreen::ShotOptions), String> {
         match a.as_str() {
             "--screenshot" => shot = Some(val()?),
             "--play" => play = true,
+            "--windowed" => windowed = true,
             "--map" => o.settings.map_size = num(val()?)? as u32,
             "--sandbox" => o.settings.sandbox = true,
             "--units" => o.settings.units_per_player = num(val()?)?.clamp(1, 12_500) as u32,
@@ -63,7 +73,7 @@ fn parse() -> Result<(Option<String>, bool, offscreen::ShotOptions), String> {
             _ => return Err(format!("unknown option {a}")),
         }
     }
-    Ok((shot, play, o))
+    Ok((Launch { shot, play, windowed }, o))
 }
 
 /// With `--features tracy`, sends tick-phase spans to the Tracy profiler.
@@ -80,16 +90,16 @@ fn init_profiling() {
 
 fn main() -> ExitCode {
     init_profiling();
-    let (shot, play, opts) = match parse() {
+    let (launch, opts) = match parse() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let result = match shot {
+    let result = match launch.shot {
         Some(path) => offscreen::screenshot(&opts, &path).map(|adapter| println!("wrote {path} using {adapter}")),
-        None => app::run(play.then(|| opts.settings.clone())),
+        None => app::run(launch.play.then(|| opts.settings.clone()), !launch.windowed),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

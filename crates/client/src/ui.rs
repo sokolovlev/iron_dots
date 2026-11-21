@@ -241,6 +241,7 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                 ui.weak("LMB select / drag box · RMB move / drag path · Shift queue");
                 ui.weak("S stop · C clear queue · Q/W buy · Ctrl+1–9 groups · Home capital");
                 ui.weak("Space pause · +/− speed · wheel zoom · MMB drag pan");
+                ui.weak("F11 or Alt+Enter: full screen / window");
             },
         );
     }
