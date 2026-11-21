@@ -313,15 +313,37 @@ CI, and a 900-tick match runs in `cargo test`.
 
 `crates/ai` reads the world and returns ordinary commands, so the same bots
 run on every client in a lockstep game. It follows the same determinism rules
-(integers, ordered containers; a `clippy.toml` enforces it). Strategy is
-simple: buy when money and supply allow, pick the nearest neutral or enemy
-city (weighted by how well it is defended), defend threatened cities, and pull
-back units with broken morale. Difficulty changes reaction time, defense
-awareness, tactics and cash reserve.
+(integers, ordered containers; a `clippy.toml` enforces it).
 
-Measured in self-play on 256² maps, 20 matches per pairing with sides swapped:
-Normal beats Easy 13/20, while Hard beats Normal 9/20 and Easy 10/20. Making
-each level reliably stronger (spec v1.0 target: ≥ 70%) is stage 7 work.
+Each think: buy as money and supply allow; pull back units with broken
+morale; send idle units to own cities that are outnumbered; then pick
+targets. Levels differ only in decision frequency and depth (spec 6.3), set
+by `ai::Profile`:
+
+| | Easy | Normal | Hard |
+|---|---|---|---|
+| Decisions every | 3 s | 1 s | ⅓ s |
+| Targets | each unit its own nearest city | groups that outweigh the defenders by 20% | by 60% |
+| Defence, retreat | no | yes | yes |
+| Leftover units | wait | wait | gather at the city nearest the next target |
+| Contact while moving | keeps attacking | keeps attacking | stops and defends |
+
+The last row matters most. A unit with an order is the attacker in a fight
+(25% more damage taken, morale lost four times faster, no terrain bonus), so
+stopping on contact turns an encounter into a defence and lets the enemy
+attack into it.
+
+Measured with `headless aieval` (100 matches per pairing, both sides of
+each map, unseen seeds):
+
+| Pairing | Small 320×192 | Medium 448×256 |
+|---|---|---|
+| Normal vs Easy | 93% | 99% |
+| Hard vs Normal | 74% | 85% |
+
+A fixed 10-match sample of the same runs in `cargo test` as a regression
+guard. Heavy units still make bots weaker (Hard with every 4th purchase heavy
+wins 10%), so bots buy light units only.
 
 ## Rendering
 

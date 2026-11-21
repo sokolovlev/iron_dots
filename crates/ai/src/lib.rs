@@ -33,44 +33,90 @@ pub enum Difficulty {
 impl Difficulty {
     pub const ALL: [Difficulty; 3] = [Difficulty::Easy, Difficulty::Normal, Difficulty::Hard];
 
+    /// The parameters behind this level.
+    pub fn profile(self) -> Profile {
+        match self {
+            Difficulty::Easy => Profile {
+                period: 90,
+                defense_weight: 0,
+                reserve: 300_000,
+                tactical: false,
+                margin: 0,
+                rally: false,
+                heavy_every: 0,
+                hold: false,
+            },
+            Difficulty::Normal => Profile {
+                period: 30,
+                defense_weight: 50,
+                reserve: 0,
+                tactical: true,
+                margin: 120,
+                rally: false,
+                heavy_every: 0,
+                hold: false,
+            },
+            Difficulty::Hard => Profile {
+                period: 10,
+                defense_weight: 100,
+                reserve: 0,
+                tactical: true,
+                margin: 160,
+                rally: true,
+                heavy_every: 0,
+                hold: true,
+            },
+        }
+    }
+}
+
+/// What a difficulty level changes (spec 6.3: decision frequency and depth
+/// of analysis, never cheating). Public so self-play can tune it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Profile {
     /// Ticks between decisions.
-    fn period(self) -> u32 {
-        match self {
-            Difficulty::Easy => 90,
-            Difficulty::Normal => 30,
-            Difficulty::Hard => 10,
-        }
-    }
-
-    /// How much a defended city is avoided when choosing targets, percent
+    pub period: u32,
+    /// How much a defended city is avoided when choosing targets: percent
     /// extra distance per full-health light defender (0 = blind).
-    fn defense_weight(self) -> i64 {
-        match self {
-            Difficulty::Easy => 0,
-            Difficulty::Normal => 50,
-            Difficulty::Hard => 100,
+    pub defense_weight: i64,
+    /// Money kept in the treasury (thousandths) before buying.
+    pub reserve: i64,
+    /// Pull back broken units and defend threatened cities.
+    pub tactical: bool,
+    /// Concentration of force: attack a city only with a group at least
+    /// this many percent as strong as its defenders; 0 = every unit goes
+    /// to its own nearest target (a trickle).
+    pub margin: i64,
+    /// Units not enough for any attack gather at the own city closest to
+    /// the next target instead of waiting where they stand.
+    pub rally: bool,
+    /// Every n-th purchase is a heavy unit (0 = never).
+    pub heavy_every: u32,
+    /// Units that run into enemies while moving stop and fight where they
+    /// stand: a unit without an order defends (less damage taken, slower
+    /// morale loss, terrain bonus) and lets the enemy attack into it.
+    pub hold: bool,
+}
+
+impl Profile {
+    /// Applies `key=value,...` overrides (self-play experiments).
+    pub fn tune(&mut self, spec: &str) -> Result<(), String> {
+        for kv in spec.split(',').filter(|s| !s.is_empty()) {
+            let (k, v) = kv.split_once('=').ok_or_else(|| format!("{kv}: expected key=value"))?;
+            let n: i64 = v.parse().map_err(|_| format!("{kv}: not a number"))?;
+            match k {
+                "period" => self.period = n.clamp(1, 600) as u32,
+                "defense_weight" => self.defense_weight = n,
+                "reserve" => self.reserve = n,
+                "tactical" => self.tactical = n != 0,
+                "margin" => self.margin = n,
+                "rally" => self.rally = n != 0,
+                "heavy_every" => self.heavy_every = n.max(0) as u32,
+                "hold" => self.hold = n != 0,
+                _ => return Err(format!("unknown AI parameter {k}")),
+            }
         }
-    }
-
-    /// Every n-th purchase is a heavy unit (0 = never). The stage 2 bot
-    /// does not yet steer heavies onto open ground, and in self-play they
-    /// made it weaker, so it buys light units only for now.
-    fn heavy_every(self) -> u32 {
-        0
-    }
-
-    /// Money kept in the treasury (thousandths) before buying: the easy bot
-    /// sits on cash and grows slower.
-    fn reserve(self) -> i64 {
-        match self {
-            Difficulty::Easy => 300_000,
-            _ => 0,
-        }
-    }
-
-    /// Whether the bot pulls back broken units and defends threatened cities.
-    fn tactical(self) -> bool {
-        self != Difficulty::Easy
+        Ok(())
     }
 }
 
@@ -80,6 +126,7 @@ const CITY_ZONE: i32 = 8;
 pub struct Bot {
     player: u8,
     difficulty: Difficulty,
+    p: Profile,
     seq: u32,
     /// Units already sent somewhere: handle → target city.
     assigned: BTreeMap<UnitHandle, u16>,
@@ -88,7 +135,11 @@ pub struct Bot {
 
 impl Bot {
     pub fn new(player: u8, difficulty: Difficulty) -> Bot {
-        Bot { player, difficulty, seq: 0, assigned: BTreeMap::new(), bought: 0 }
+        Bot::with_profile(player, difficulty, difficulty.profile())
+    }
+
+    pub fn with_profile(player: u8, difficulty: Difficulty, p: Profile) -> Bot {
+        Bot { player, difficulty, p, seq: 0, assigned: BTreeMap::new(), bought: 0 }
     }
 
     pub fn difficulty(&self) -> Difficulty {
@@ -113,10 +164,139 @@ impl Bot {
     }
 }
 
+/// Strength of one full-health light unit (see [`Bot::strength`]).
+const LIGHT: i64 = 20_000;
+
+impl Bot {
+    /// Value-weighted distance from `(x, y)` to city `ci`: neutral cities
+    /// count as closer, enemy capitals a bit closer than other enemy cities,
+    /// defended ones further away (by difficulty).
+    fn target_cost(&self, world: &World, ci: usize, x: i32, y: i32, enemy_near: &[i64]) -> i64 {
+        let c = &world.cities()[ci];
+        let d = dist2(x, y, c.center().x.0, c.center().y.0) >> 16;
+        let mut weight = if c.owner == 0 {
+            100
+        } else if c.capital_of != 0 {
+            170
+        } else {
+            250
+        };
+        weight += weight * self.p.defense_weight * enemy_near[ci] / (100 * LIGHT);
+        d * weight
+    }
+
+    fn is_target(world: &World, ci: usize, my_team: u8) -> bool {
+        let c = &world.cities()[ci];
+        c.owner == 0 || world.team_of(c.owner) != my_team
+    }
+
+    /// Easy: each idle unit heads for its own best target.
+    fn trickle(&self, world: &World, free: &[usize], enemy_near: &[i64], targets: &mut BTreeMap<u16, Vec<usize>>) {
+        let u = world.units();
+        let my_team = world.team_of(self.player);
+        for &i in free {
+            let (x, y) = (u.pos_x[i], u.pos_y[i]);
+            let best = (0..world.cities().len())
+                .filter(|&ci| Self::is_target(world, ci, my_team))
+                .min_by_key(|&ci| (self.target_cost(world, ci, x, y, enemy_near), ci));
+            if let Some(ci) = best {
+                targets.entry(ci as u16).or_default().push(i);
+            }
+        }
+    }
+
+    /// Normal and hard: targets in order of cost; each gets the nearest
+    /// free units until the group outweighs its defenders by `margin`
+    /// percent (counting units already on their way). A target that cannot
+    /// be matched is skipped, or, with rallying, becomes the gathering point.
+    fn concentrate(
+        &mut self,
+        world: &World,
+        free: &[usize],
+        enemy_near: &[i64],
+        margin: i64,
+        targets: &mut BTreeMap<u16, Vec<usize>>,
+        out: &mut Vec<Command>,
+    ) {
+        if free.is_empty() {
+            return;
+        }
+        let u = world.units();
+        let cities = world.cities();
+        let me = self.player;
+        let my_team = world.team_of(me);
+        let mut en_route = vec![0i64; cities.len()];
+        for (h, &c) in &self.assigned {
+            if let Some(i) = u.index_of(*h) {
+                en_route[c as usize] += Self::strength(world, i);
+            }
+        }
+        // Order targets by their cost from the nearest free unit.
+        let mut order: Vec<(i64, usize)> = (0..cities.len())
+            .filter(|&ci| Self::is_target(world, ci, my_team))
+            .map(|ci| {
+                let cost = free
+                    .iter()
+                    .map(|&i| self.target_cost(world, ci, u.pos_x[i], u.pos_y[i], enemy_near))
+                    .min()
+                    .unwrap_or(i64::MAX);
+                (cost, ci)
+            })
+            .collect();
+        order.sort_unstable();
+        let mut left: Vec<usize> = free.to_vec();
+        let mut rally_at: Option<usize> = None;
+        for &(_, ci) in &order {
+            if left.is_empty() {
+                break;
+            }
+            let base = if cities[ci].owner == 0 { LIGHT } else { 2 * LIGHT };
+            let need = (enemy_near[ci] * margin / 100).max(base) - en_route[ci];
+            if need <= 0 {
+                continue;
+            }
+            let p = cities[ci].center();
+            left.sort_by_key(|&i| (dist2(u.pos_x[i], u.pos_y[i], p.x.0, p.y.0), i));
+            let mut sum = 0;
+            let mut n = 0;
+            while n < left.len() && sum < need {
+                sum += Self::strength(world, left[n]);
+                n += 1;
+            }
+            if sum >= need {
+                targets.entry(ci as u16).or_default().extend(left.drain(..n));
+            } else if self.p.rally && rally_at.is_none() {
+                rally_at = Some(ci);
+            }
+        }
+        // Leftovers gather at our city closest to the target they could
+        // not yet take, so the next wave starts together.
+        let Some(goal) = rally_at else { return };
+        let g = cities[goal].center();
+        let Some(stage) = (0..cities.len())
+            .filter(|&ci| cities[ci].owner == me)
+            .min_by_key(|&ci| (dist2(cities[ci].center().x.0, cities[ci].center().y.0, g.x.0, g.y.0), ci))
+        else {
+            return;
+        };
+        let s = cities[stage].center();
+        let zone2 = (CITY_ZONE as i64 * ONE as i64).pow(2);
+        let far: Vec<UnitHandle> = left
+            .iter()
+            .filter(|&&i| dist2(u.pos_x[i], u.pos_y[i], s.x.0, s.y.0) > zone2)
+            .map(|&i| u.handle(i))
+            .collect();
+        if !far.is_empty() {
+            let tick = world.tick();
+            out.push(self.cmd(tick, CommandKind::Move { units: far, path: vec![s], queue: false }));
+        }
+    }
+}
+
 impl Controller for Bot {
     fn think(&mut self, world: &World) -> Vec<Command> {
         let tick = world.tick();
-        let period = self.difficulty.period();
+        let period = self.p.period;
         if world.winner().is_some() || (tick + self.player as u32 * 3) % period != 0 {
             return Vec::new();
         }
@@ -146,7 +326,7 @@ impl Controller for Bot {
 
         // ------------------------------------------------------- economy
         let money = world.player(me).money;
-        let mut budget = money - self.difficulty.reserve();
+        let mut budget = money - self.p.reserve;
         for (ci, c) in cities.iter().enumerate() {
             if c.owner != me {
                 continue;
@@ -154,7 +334,7 @@ impl Controller for Bot {
             let Some((used, limit)) = world.city_supply(ci) else { continue };
             let mut free = limit.saturating_sub(used);
             loop {
-                let every = self.difficulty.heavy_every();
+                let every = self.p.heavy_every;
                 let want_heavy = every != 0 && self.bought % every == every - 1;
                 let kind = if want_heavy { UnitKind::Heavy } else { UnitKind::Light };
                 let cost = world.rules().cost[kind as usize];
@@ -198,7 +378,7 @@ impl Controller for Bot {
 
         // ------------------------------------------------------- tactics
         let mut retreating: Vec<UnitHandle> = Vec::new();
-        if self.difficulty.tactical() {
+        if self.p.tactical {
             let mut by_city: BTreeMap<usize, Vec<UnitHandle>> = BTreeMap::new();
             for i in 0..u.len() {
                 if u.owner[i] != me || u.flags[i] & flags::IN_COMBAT == 0 {
@@ -220,6 +400,23 @@ impl Controller for Bot {
             }
         }
 
+        // Hold the line: moving units in contact stop and defend.
+        if self.p.hold {
+            let holding: Vec<UnitHandle> = (0..u.len())
+                .filter(|&i| {
+                    u.owner[i] == me && u.flags[i] & flags::ATTACKING != 0 && !retreating.contains(&u.handle(i))
+                })
+                .map(|i| u.handle(i))
+                .collect();
+            if !holding.is_empty() {
+                for h in &holding {
+                    self.assigned.remove(h);
+                }
+                retreating.extend(holding.iter().copied());
+                out.push(self.cmd(tick, CommandKind::Stop { units: holding }));
+            }
+        }
+
         // ------------------------------------------------------- strategy
         // Idle units: no order, not retreating, not assigned.
         let idle: Vec<usize> = (0..u.len())
@@ -228,6 +425,8 @@ impl Controller for Bot {
                     && u.order[i] == NO_ORDER
                     && !self.assigned.contains_key(&u.handle(i))
                     && !retreating.contains(&u.handle(i))
+                    // Holding units finish their fight first.
+                    && !(self.p.hold && u.flags[i] & flags::IN_COMBAT != 0)
             })
             .collect();
         if idle.is_empty() {
@@ -237,7 +436,7 @@ impl Controller for Bot {
         // Defend first: threatened own cities pull idle units.
         let mut targets: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
         let mut taken = vec![false; idle.len()];
-        if self.difficulty.tactical() {
+        if self.p.tactical {
             for (ci, c) in cities.iter().enumerate() {
                 if c.owner != me || enemy_near[ci] <= own_near[ci] {
                     continue;
@@ -257,33 +456,10 @@ impl Controller for Bot {
             }
         }
 
-        // Then expand/attack: each idle unit picks a city to take. Neutral
-        // cities count as closer, capitals of enemies as a bit closer too.
-        for (k, &i) in idle.iter().enumerate() {
-            if taken[k] {
-                continue;
-            }
-            let (x, y) = (u.pos_x[i], u.pos_y[i]);
-            let best = cities
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.owner == 0 || world.team_of(c.owner) != my_team)
-                .min_by_key(|(ci, c)| {
-                    let d = dist2(x, y, c.center().x.0, c.center().y.0) >> 16;
-                    let mut weight = if c.owner == 0 {
-                        100
-                    } else if c.capital_of != 0 {
-                        170
-                    } else {
-                        250
-                    };
-                    // Strength 20 000 = one full-health light unit.
-                    weight += weight * self.difficulty.defense_weight() * enemy_near[*ci] / (100 * 20_000);
-                    (d * weight, *ci)
-                });
-            if let Some((ci, _)) = best {
-                targets.entry(ci as u16).or_default().push(i);
-            }
+        let free: Vec<usize> = (0..idle.len()).filter(|&k| !taken[k]).map(|k| idle[k]).collect();
+        match self.p.margin {
+            0 => self.trickle(world, &free, &enemy_near, &mut targets),
+            margin => self.concentrate(world, &free, &enemy_near, margin, &mut targets, &mut out),
         }
 
         for (ci, group) in targets {

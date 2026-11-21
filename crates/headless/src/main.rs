@@ -8,6 +8,9 @@
 //! iron-dots-headless match  [opts] [--out FILE] bots play a standard match to the end
 //! iron-dots-headless scaling [--threads MAX]    thread-scaling table (Markdown) for the
 //!                                               spec 3 targets, up to all hardware threads
+//! iron-dots-headless aieval --difficulty A,B [--matches N]
+//!                                               bot A vs bot B, sides swapped every
+//!                                               match: win rates (spec 8.1, AI levels)
 //! iron-dots-headless netsim [--matches N]       3v3 matches over QUIC through a proxy with
 //!                                               10% loss and 100 ms jitter, one rejoin per
 //!                                               match; fails on any desync (spec 6.2)
@@ -45,6 +48,7 @@ struct Opts {
     parallel: u32,
     tick_rate: u32,
     clean: bool,
+    tune: String,
     positional: Vec<String>,
 }
 
@@ -65,6 +69,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         parallel: 4,
         tick_rate: 30,
         clean: false,
+        tune: String::new(),
         positional: Vec::new(),
     };
     let mut it = args.iter();
@@ -90,6 +95,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--parallel" => o.parallel = num(val("--parallel")?)?.max(1) as u32,
             "--tick-rate" => o.tick_rate = num(val("--tick-rate")?)?.clamp(1, 240) as u32,
             "--clean" => o.clean = true,
+            "--tune" => o.tune = val("--tune")?,
             "--threads" => o.threads = num(val("--threads")?)?.max(1) as usize,
             "--difficulty" => {
                 o.difficulty = val("--difficulty")?
@@ -170,6 +176,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "scaling" => scaling(&o, &b)?,
         "match" => play_match(&o, &b)?,
         "netsim" => netsim(&o)?,
+        "aieval" => aieval(&o, &b)?,
         _ => return Err(usage()),
     }
     Ok(())
@@ -375,6 +382,81 @@ fn net_bot(player: u8, difficulty: u8) -> Box<dyn Controller + Send> {
     Box::new(ai::Bot::new(player, d))
 }
 
+/// One bot-vs-bot match on one thread: winning player (1 or 2) or `None`,
+/// and the game time in seconds.
+fn duel(spec: &ScenarioSpec, b: &Balance, ticks: u32, p: [ai::Profile; 2]) -> Result<(Option<u8>, u32), String> {
+    let mut w = spec.build(b)?;
+    w.set_threads(1)?;
+    let mut bots = [
+        ai::Bot::with_profile(1, ai::Difficulty::Normal, p[0]),
+        ai::Bot::with_profile(2, ai::Difficulty::Normal, p[1]),
+    ];
+    let mut cmds = Vec::new();
+    while w.tick() < ticks && w.winner().is_none() {
+        cmds.clear();
+        for bot in &mut bots {
+            cmds.extend(bot.think(&w));
+        }
+        w.step(&cmds);
+    }
+    // Teams equal player ids in a standard match.
+    Ok((w.winner(), w.tick() / b.tick_rate))
+}
+
+/// Bot A against bot B, `--matches` games on different maps with sides
+/// swapped every game. Prints A's win rate; draws count as not won.
+fn aieval(o: &Opts, b: &Balance) -> Result<(), String> {
+    let [a, bd] = match o.difficulty[..] {
+        [a, b] => [a, b],
+        _ => return Err("aieval needs --difficulty A,B".into()),
+    };
+    let mut pa = a.profile();
+    pa.tune(&o.tune)?;
+    let pb = bd.profile();
+    let next = std::sync::atomic::AtomicU32::new(0);
+    let results = std::sync::Mutex::new(Vec::new());
+    let t = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..o.parallel.max(1) {
+            scope.spawn(|| {
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= o.matches {
+                        return;
+                    }
+                    // Each map is played twice, once from each side.
+                    let seed = o.seed + (k / 2) as u64;
+                    let swap = k % 2 == 1;
+                    let r = ScenarioSpec::standard_match(o.map, o.map_h, 2, seed, b)
+                        .and_then(|spec| duel(&spec, b, o.ticks, if swap { [pb, pa] } else { [pa, pb] }));
+                    let a_won = r.as_ref().ok().and_then(|(w, _)| *w).map(|w| (w == 1) != swap);
+                    let secs = r.as_ref().map(|r| r.1).unwrap_or(0);
+                    results.lock().expect("lock").push((k, a_won, secs));
+                }
+            });
+        }
+    });
+    let mut r = results.into_inner().expect("lock");
+    r.sort_by_key(|x| x.0);
+    let wins = r.iter().filter(|x| x.1 == Some(true)).count();
+    let losses = r.iter().filter(|x| x.1 == Some(false)).count();
+    let draws = r.len() - wins - losses;
+    let avg = r.iter().filter(|x| x.1.is_some()).map(|x| x.2).sum::<u32>() / (wins + losses).max(1) as u32;
+    println!(
+        "{a:?}{} vs {bd:?} on {}x{}: {wins} won, {losses} lost, {draws} undecided after {} min of {} ({}%), average decided match {}:{:02}, {:.0?}",
+        if o.tune.is_empty() { String::new() } else { format!(" [{}]", o.tune) },
+        o.map,
+        o.map_h,
+        o.ticks / b.tick_rate / 60,
+        r.len(),
+        wins * 100 / r.len().max(1),
+        avg / 60,
+        avg % 60,
+        t.elapsed()
+    );
+    Ok(())
+}
+
 /// Networked 3v3 matches (spec 8, stage 6 exit criterion).
 fn netsim(o: &Opts) -> Result<(), String> {
     use relay_server::netsim::{self, Options};
@@ -443,7 +525,7 @@ fn netsim(o: &Opts) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: iron-dots-headless <record|verify|hash|bench|match|scaling|netsim> [--map N] [--units N] [--players N] \
+    "usage: iron-dots-headless <record|verify|hash|bench|match|scaling|netsim|aieval> [--map N] [--units N] [--players N] \
      [--seed N] [--ticks N] [--balance FILE] [--out FILE] [FILE]"
         .into()
 }

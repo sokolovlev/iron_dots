@@ -146,6 +146,10 @@ cargo run --release -p client -- --screenshot frame.png --map 256 --ticks 4500
 cargo run --release -p headless -- netsim --matches 20
 ```
 
+```bash
+cargo run --release -p headless -- aieval --difficulty hard,normal --matches 100 --map 320x192 --ticks 45000
+```
+
 The screenshot command renders a bot-vs-bot frame without a window (CI uses
 Mesa's software Vulkan driver). `netsim` plays networked 3v3 matches through
 a proxy that drops 10% of packets and adds up to 100 ms of jitter, and fails
