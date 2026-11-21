@@ -59,6 +59,9 @@ pub struct App {
     camera_keys: [bool; 4],
     /// Start of the current frame, for the FPS cap.
     frame_start: Instant,
+    /// `None` without an audio device, or before the window exists.
+    audio: Option<crate::sound::Audio>,
+    audio_ready: bool,
     pending_start: Option<MatchSettings>,
     /// Borderless full screen (default) or a normal window; F11 / Alt+Enter.
     fullscreen: bool,
@@ -86,6 +89,8 @@ pub fn run(start: Option<MatchSettings>, windowed: bool) -> Result<(), String> {
         rebinding: None,
         camera_keys: [false; 4],
         frame_start: Instant::now(),
+        audio: None,
+        audio_ready: false,
         pending_start: None,
         fullscreen,
         settings,
@@ -366,6 +371,23 @@ impl App {
             g.camera.clamp_to(g.map_size(), vp);
             g.update(dt);
         }
+        if let Some(a) = &mut self.audio {
+            a.update(dt);
+            if self.settings_open {
+                // Let the player hear slider changes right away.
+                a.apply(&self.settings, self.focused);
+            }
+            match &mut self.game {
+                Some(g) => {
+                    a.set_in_match(true);
+                    for s in g.sounds.drain(..) {
+                        a.play(s);
+                    }
+                    a.set_combat(g.visible_combat.get(), g.camera.scale);
+                }
+                None => a.set_in_match(false),
+            }
+        }
 
         // UI.
         let raw = gfx.egui_state.take_egui_input(&gfx.window);
@@ -529,6 +551,13 @@ impl ApplicationHandler for App {
         config.present_mode =
             if self.settings.vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
         surface.configure(&gpu.device, &config);
+        if !self.audio_ready {
+            self.audio_ready = true;
+            self.audio = crate::sound::Audio::new();
+            if let Some(a) = &mut self.audio {
+                a.apply(&self.settings, true);
+            }
+        }
         let egui_ctx = egui::Context::default();
         ui::setup_style(&egui_ctx);
         egui_ctx.set_zoom_factor(self.settings.ui_scale);
@@ -561,6 +590,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                if let Some(a) = &mut self.audio {
+                    a.apply(&self.settings, f);
+                }
                 // Releases are not delivered to an unfocused window.
                 self.camera_keys = [false; 4];
             }

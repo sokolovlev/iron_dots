@@ -17,6 +17,7 @@ mod gpu;
 mod offscreen;
 mod online;
 mod settings;
+mod sound;
 mod ui;
 
 use game::MatchSettings;

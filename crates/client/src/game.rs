@@ -3,6 +3,7 @@
 //! here, so the same code drives the window and offscreen screenshots.
 
 use crate::online::{Hosting, Started};
+use crate::sound::Sfx;
 use ai::{Bot, Difficulty};
 use net::lockstep::Lockstep;
 use net::proto::{ClientMsg, ServerMsg};
@@ -14,6 +15,7 @@ use sim_core::replay::Replay;
 use sim_core::scenario::{Controller, ScenarioSpec};
 use sim_core::unit::{NO_ORDER, flags};
 use sim_core::{Balance, UnitHandle, UnitKind, World};
+use std::cell::Cell;
 use std::net::SocketAddr;
 
 /// Settings chosen in the menu.
@@ -82,6 +84,10 @@ pub struct Game {
     pub history: Vec<[(u32, u32, i64); 9]>,
     /// Set in a network match.
     pub online: Option<Online>,
+    /// Sounds to play this frame (drained by the app).
+    pub sounds: Vec<Sfx>,
+    /// Units fighting on screen, counted while building markers.
+    pub visible_combat: Cell<u32>,
 }
 
 /// State of a network match (lockstep through a relay, spec 6.2).
@@ -208,6 +214,8 @@ impl Game {
             message: None,
             history: Vec::new(),
             online: None,
+            sounds: Vec::new(),
+            visible_combat: Cell::new(0),
         })
     }
 
@@ -277,6 +285,8 @@ impl Game {
 
     /// One tick with the given commands plus the bots'.
     fn apply(&mut self, mut cmds: Vec<Command>) {
+        let owners: Vec<u8> = self.world.cities().iter().map(|c| c.owner).collect();
+        let decided = self.world.winner().is_some();
         // Remember positions for interpolation.
         let u = self.world.units();
         for i in 0..u.len() {
@@ -300,6 +310,7 @@ impl Game {
             }
         }
         self.log.extend(cmds);
+        self.sound_events(&owners, decided);
         if self.world.tick() % self.world.rules().tick_rate == 0 {
             let mut row = [(0u32, 0u32, 0i64); 9];
             let counts = self.world.unit_counts();
@@ -453,6 +464,46 @@ impl Game {
         }
     }
 
+    /// Turns what changed this tick into sounds (spec 6.9).
+    fn sound_events(&mut self, owners: &[u8], decided: bool) {
+        let me = self.me;
+        let team = self.world.team_of(me);
+        for (c, city) in self.world.cities().iter().enumerate() {
+            let before = owners.get(c).copied().unwrap_or(city.owner);
+            if before == city.owner {
+                continue;
+            }
+            if city.owner != 0 && self.world.team_of(city.owner) == team {
+                self.sounds.push(Sfx::CityCaptured);
+            } else if before != 0 && self.world.team_of(before) == team {
+                self.sounds.push(Sfx::CityLost);
+            }
+        }
+        if !decided {
+            if let Some(w) = self.world.winner() {
+                self.sounds.push(if w == team { Sfx::Victory } else { Sfx::Defeat });
+            }
+        }
+        if self.world.stats().deaths > 0 && self.visible_combat.get() > 0 {
+            self.sounds.push(Sfx::Death);
+        }
+        // Once a second: enemies near our capital?
+        if self.world.tick() % self.world.rules().tick_rate == 0 {
+            if let Some(cap) = self.world.cities().iter().find(|c| c.capital_of == me) {
+                let p = cap.center();
+                let r = 8i64 << 16;
+                let u = self.world.units();
+                let threat = (0..u.len()).any(|i| {
+                    let (dx, dy) = (u.pos_x[i] as i64 - p.x.0 as i64, u.pos_y[i] as i64 - p.y.0 as i64);
+                    u.owner[i] != 0 && self.world.team_of(u.owner[i]) != team && dx * dx + dy * dy < r * r
+                });
+                if threat {
+                    self.sounds.push(Sfx::CapitalAttacked);
+                }
+            }
+        }
+    }
+
     /// Replay of the match so far.
     pub fn replay(&self) -> Replay {
         Replay {
@@ -530,12 +581,16 @@ impl Game {
                 self.selection.push(h);
             }
             self.selected_city = None;
+            self.sounds.push(Sfx::Select);
             return;
         }
         if !add {
             self.selection.clear();
         }
         self.selected_city = self.pick_city(w).filter(|&c| self.world.cities()[c].owner == self.me);
+        if self.selected_city.is_some() {
+            self.sounds.push(Sfx::Select);
+        }
     }
 
     /// Double click: every own unit of the same type on screen.
@@ -572,6 +627,9 @@ impl Game {
             }
         }
         self.selected_city = None;
+        if !self.selection.is_empty() {
+            self.sounds.push(Sfx::Select);
+        }
     }
 
     pub fn finish_box(&mut self, viewport: [f32; 2], add: bool) {
@@ -592,11 +650,13 @@ impl Game {
             .map(|p| FxPoint::new(Fx((p[0] * 65536.0) as i32), Fx((p[1] * 65536.0) as i32)))
             .collect();
         self.issue(CommandKind::Move { units: self.selection.clone(), path, queue });
+        self.sounds.push(Sfx::Order);
     }
 
     pub fn stop(&mut self) {
         if !self.selection.is_empty() {
             self.issue(CommandKind::Stop { units: self.selection.clone() });
+            self.sounds.push(Sfx::Order);
         }
     }
 
@@ -608,7 +668,10 @@ impl Game {
 
     pub fn buy(&mut self, kind: UnitKind) {
         match self.selected_city {
-            Some(c) => self.issue(CommandKind::Buy { city: c as u16, kind }),
+            Some(c) => {
+                self.issue(CommandKind::Buy { city: c as u16, kind });
+                self.sounds.push(Sfx::Buy);
+            }
             None => self.message = Some(("Select one of your cities first".into(), 2.0)),
         }
     }
@@ -668,6 +731,7 @@ impl Game {
             }
         }
         let u = self.world.units();
+        let mut fighting = 0u32;
         if self.camera.scale < LOD_SCALE {
             // Bins of about 6 screen pixels.
             let bin = (6.0 / self.camera.scale).max(1.0);
@@ -683,8 +747,11 @@ impl Game {
                 }
                 let cell = &mut counts[cy as usize * cols + cx as usize];
                 cell[u.owner[i] as usize] += 1;
-                cell[9] |= (u.flags[i] & flags::IN_COMBAT != 0) as u32;
+                let f = (u.flags[i] & flags::IN_COMBAT != 0) as u32;
+                cell[9] |= f;
+                fighting += f;
             }
+            self.visible_combat.set(fighting);
             for (k, cell) in counts.iter().enumerate() {
                 let total: u32 = cell[..9].iter().sum();
                 if total == 0 {
@@ -717,6 +784,7 @@ impl Game {
             }
             if u.flags[i] & flags::IN_COMBAT != 0 {
                 f |= mflags::IN_COMBAT;
+                fighting += 1;
             }
             if sel {
                 f |= mflags::SELECTED;
@@ -729,6 +797,7 @@ impl Game {
                 u.morale[i] as f32 / rules.max_morale as f32,
             ));
         }
+        self.visible_combat.set(fighting);
     }
 
     /// Paths of selected units, the path being drawn, the selection box.

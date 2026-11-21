@@ -25,6 +25,7 @@ egui-winit = "0.37"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
 png = "0.18"
+kira = { version = "0.12", default-features = false, features = ["cpal"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.14"

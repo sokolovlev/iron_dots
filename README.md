@@ -116,7 +116,13 @@ speed. Settings live in `%APPDATA%\IronDots\settings.ron` on Windows and
 `~/.config/iron-dots/settings.ron` elsewhere. Arrow keys move the camera.
 
 Keys are matched by physical position, so they work on any keyboard layout.
-Linux needs a Vulkan or GL driver and `libxkbcommon-x11-0` (or Wayland) at runtime.
+Linux needs a Vulkan or GL driver and `libxkbcommon-x11-0` (or Wayland) at runtime,
+and `libasound2-dev` to build (sound). Without an audio device the game runs silent.
+
+Sound is synthesised by the game itself (no audio files): order, selection,
+purchase, losses in view, city captured or lost, capital under attack,
+victory and defeat; a battle bed that grows with the fighting on screen; and
+an ambient pad. Volumes are in Settings.
 
 ## Headless tools
 
