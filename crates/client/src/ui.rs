@@ -4,6 +4,7 @@ use crate::game::{Game, MatchSettings, SPEEDS};
 use ai::Difficulty;
 use egui::{Align2, Color32, RichText};
 use sim_core::UnitKind;
+use sim_core::command::Formation;
 use sim_core::scenario::MAP_PRESETS;
 
 /// What the UI asks the app to do.
@@ -245,6 +246,29 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
             ui.weak(format!("{}:{:02}  {speed}  ·  {} selected", secs / 60, secs % 60, g.selection.len()));
         });
     });
+
+    if g.selection.len() >= 2 && g.selected_city.is_none() {
+        egui::Area::new(egui::Id::unique("formation")).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
+            hud_frame(ui).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{} units", g.selection.len())).strong());
+                    ui.separator();
+                    for (f, name, tip) in [
+                        (Formation::Keep, "Keep", "keep the current spacing"),
+                        (Formation::Line, "Line", "wide front, a few ranks deep"),
+                        (Formation::Staggered, "Staggered", "loose line with gaps"),
+                        (Formation::Box, "Box", "square block"),
+                        (Formation::Column, "Column", "narrow column for marching"),
+                        (Formation::Flank, "Flank", "two wings with a gap in the centre"),
+                    ] {
+                        if ui.selectable_label(g.formation == f, name).on_hover_text(tip).clicked() {
+                            g.set_formation(f);
+                        }
+                    }
+                });
+            });
+        });
+    }
 
     if let Some(c) = g.selected_city {
         egui::Area::new(egui::Id::unique("city")).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {

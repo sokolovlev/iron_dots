@@ -87,7 +87,10 @@ pub struct SupplyParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerritoryParams {
+    /// Control radius of a unit, tiles.
     pub radius: u32,
+    /// Control radius of a city around itself, tiles.
+    pub city_radius: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,8 +193,8 @@ impl Balance {
         range("supply.heal_dps", self.supply.heal_dps, 0, 1_000_000)?;
         range("supply.heal_city_dps", self.supply.heal_city_dps, 0, 1_000_000)?;
         range("supply.heal_delay", self.supply.heal_delay, 0, 600_000)?;
-        if !(1..=16).contains(&self.territory.radius) {
-            return Err("territory.radius must be in [1, 16]".into());
+        if !(1..=16).contains(&self.territory.radius) || !(1..=16).contains(&self.territory.city_radius) {
+            return Err("territory.radius and city_radius must be in [1, 16]".into());
         }
         if !(1..=100).contains(&self.supply.per_city) {
             return Err("supply.per_city must be in [1, 100]".into());
@@ -288,6 +291,7 @@ pub struct Rules {
     pub heal_city_q16: u64,
     pub heal_delay_ticks: u16,
     pub territory_radius: u32,
+    pub city_radius: u32,
     pub capture_ticks: u16,
     pub win_city_share: Milli,
     pub start_light_units: u32,
@@ -365,6 +369,7 @@ impl Rules {
             heal_city_q16: rate_q16(b.supply.heal_city_dps, tr),
             heal_delay_ticks: ((b.supply.heal_delay.0 * tr as i64) / 1000).min(u16::MAX as i64) as u16,
             territory_radius: b.territory.radius,
+            city_radius: b.territory.city_radius,
             capture_ticks: ((b.city.capture_time.0 * tr as i64) / 1000).clamp(1, u16::MAX as i64) as u16,
             win_city_share: b.match_rules.win_city_share,
             start_light_units: b.match_rules.start_light_units,

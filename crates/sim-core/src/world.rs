@@ -14,7 +14,7 @@
 //! 11. state hash (on demand; the runner records it every 30 ticks)
 
 use crate::balance::{Balance, Rules, SHIP_ROW};
-use crate::command::{Command, CommandKind};
+use crate::command::{Command, CommandKind, Formation};
 use crate::flow::{self, Flow, Steer};
 use crate::fx::{Fx, FxPoint, ONE, dist2, isqrt_u64, length};
 use crate::grid::Grid;
@@ -213,8 +213,12 @@ pub struct World {
     player: [PlayerState; MAX_PLAYERS + 1],
     /// Team that won, once decided.
     winner: Option<u8>,
-    /// Pocket label per tile (row-major), owner/limit/used per label.
-    labels: Vec<u32>,
+    /// Connected land per team (index = bit of `team_bit`), see
+    /// [`territory::TeamPockets`]; empty until first computed.
+    pockets: Vec<territory::TeamPockets>,
+    /// First pocket id of each player: pocket id = base + label in the
+    /// player's team labelling. Owner/limit/used are per pocket id.
+    pocket_base: [u32; MAX_PLAYERS + 1],
     pocket_owner: Vec<u8>,
     pocket_limit: Vec<u32>,
     pocket_used: Vec<u32>,
@@ -229,19 +233,28 @@ pub struct World {
     contacts: Vec<u16>,
     dmg_in: Vec<u32>,
     cmd_order: Vec<u32>,
-    stack_scratch: Vec<(u32, u32)>,
     /// Flow-field cache and pending field requests (phase 3).
     flow: Flow,
     /// Terrain costs per unit kind (straight-line checks).
     path_costs: [[u32; Terrain::COUNT]; UnitKind::COUNT],
-    paint_scratch: Vec<Vec<(u16, u16, u8)>>,
+    /// New owners of the chunks recomputed this tick: `(chunk, owners, any owned)`.
+    zone_scratch: Vec<(usize, Vec<u8>, bool, Vec<u8>)>,
+    /// Tiles a unit controls around its own (radius `territory.radius`).
+    zone_disk: Vec<(i32, i32)>,
+    /// Chunks that hold any owned tile (so they must be cleared when
+    /// their units leave).
+    chunk_owned: Vec<bool>,
+    /// Cities whose zone reaches each chunk.
+    chunk_cities: Vec<Vec<u16>>,
+    /// Recompute every chunk's zones on the next territory phase.
+    zones_stale: bool,
+    /// Tile owner for every set of players present (bit p-1 = player p),
+    /// see [`territory::resolve`].
+    owner_of: [u8; 256],
     /// Bit of each player's team (teams numbered in ascending id order).
     team_bit: [u8; MAX_PLAYERS + 1],
     chunk_mask: Vec<u8>,
     hot: Vec<bool>,
-    /// Per chunk (filled for hot chunks that paint this tick): team bits of
-    /// units within the territory radius of each tile, see `stamp_presence`.
-    presence: Vec<Vec<u8>>,
     pool: Arc<rayon::ThreadPool>,
     threads: usize,
     /// SIMD kernel table (chosen once per process; tests may pick a level).
@@ -261,6 +274,7 @@ impl World {
             return Err(format!("need 1..={MAX_PLAYERS} players, got {}", players.len()));
         }
         let rules = Rules::new(balance);
+        let zone_disk = territory::disk(rules.territory_radius);
         let path_costs =
             [pathfind::terrain_costs(&rules, UnitKind::Light), pathfind::terrain_costs(&rules, UnitKind::Heavy)];
         let mut team = [0u8; MAX_PLAYERS + 1];
@@ -280,6 +294,14 @@ impl World {
         for (k, p) in players.iter().enumerate() {
             team_bit[k + 1] = 1 << teams.binary_search(&p.team).expect("team is listed");
         }
+        let mut team_mask = [0u8; 256];
+        for (b, m) in team_mask.iter_mut().enumerate() {
+            for (p, &bit) in team_bit.iter().enumerate().skip(1).take(players.len()) {
+                if b & (1 << (p - 1)) != 0 {
+                    *m |= bit;
+                }
+            }
+        }
         let tiles = (map.width() * map.height()) as usize;
         let chunks = (map.chunks_w() * map.chunks_h()) as usize;
         Ok(World {
@@ -297,7 +319,8 @@ impl World {
             city_area: vec![0; tiles],
             player,
             winner: None,
-            labels: Vec::new(),
+            pockets: Vec::new(),
+            pocket_base: [0; MAX_PLAYERS + 1],
             pocket_owner: Vec::new(),
             pocket_limit: Vec::new(),
             pocket_used: Vec::new(),
@@ -309,14 +332,17 @@ impl World {
             contacts: Vec::new(),
             dmg_in: Vec::new(),
             cmd_order: Vec::new(),
-            stack_scratch: Vec::new(),
             flow: Flow::default(),
             path_costs,
-            paint_scratch: Vec::new(),
+            zone_scratch: Vec::new(),
+            zone_disk,
+            chunk_owned: vec![false; chunks],
+            chunk_cities: vec![Vec::new(); chunks],
+            zones_stale: true,
+            owner_of: territory::owner_table(&team_mask),
             team_bit,
             chunk_mask: Vec::new(),
             hot: Vec::new(),
-            presence: Vec::new(),
             pool: Arc::new(make_pool(1)?),
             threads: 1,
             kernels: simd_kernels::kernels(),
@@ -484,24 +510,29 @@ impl World {
             capture_by: 0,
             capture_ticks: 0,
         });
-        self.territory_changed = true;
-        Ok(idx)
-    }
-
-    /// Gives `player` all non-city tiles within `radius` of tile `(x, y)`
-    /// (match setup: land around starting capitals).
-    pub fn claim(&mut self, player: u8, x: u32, y: u32, radius: u32) {
-        let r = radius as i64;
-        for ny in y.saturating_sub(radius)..=(y + radius).min(self.map.height() - 1) {
-            for nx in x.saturating_sub(radius)..=(x + radius).min(self.map.width() - 1) {
-                let (dx, dy) = (nx as i64 - x as i64, ny as i64 - y as i64);
-                if dx * dx + dy * dy <= r * r && self.map.terrain(nx, ny) != Terrain::City {
-                    self.map.set_owner(nx, ny, player);
-                }
+        // Chunks this city's zone can reach.
+        let r = self.rules.city_radius + 1;
+        let cw = self.map.chunks_w();
+        let (cx0, cx1) = (x.saturating_sub(r) / map::CHUNK, (x + r).min(w - 1) / map::CHUNK);
+        let (cy0, cy1) = (y.saturating_sub(r) / map::CHUNK, (y + r).min(self.map.height() - 1) / map::CHUNK);
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                self.chunk_cities[(cy * cw + cx) as usize].push(idx);
             }
         }
         self.territory_changed = true;
-        self.dirty_chunks.fill(true);
+        self.zones_stale = true;
+        Ok(idx)
+    }
+
+    /// Recomputes every chunk's control zones now (match setup, so the
+    /// first frame already shows them).
+    pub fn refresh_zones(&mut self) {
+        self.zones_stale = true;
+        self.phase_territory();
+        // Units are not in the spatial grid until the first tick builds it:
+        // that tick recomputes everything again.
+        self.zones_stale = true;
     }
 
     /// Index of the city whose 3×3 area contains the unit's tile, if owned by
@@ -518,11 +549,17 @@ impl World {
 
     fn pocket_of_city(&self, c: usize) -> Option<u32> {
         let city = &self.cities[c];
-        if city.owner == 0 || self.labels.is_empty() {
+        if city.owner == 0 || self.pockets.is_empty() {
             return None;
         }
-        let l = self.labels[(city.y as u32 * self.map.width() + city.x as u32) as usize];
-        (l != NO_POCKET).then_some(l)
+        self.pocket_at(city.owner, city.x as u32, city.y as u32)
+    }
+
+    /// Pocket id of `player` at tile `(x, y)`.
+    #[inline]
+    fn pocket_at(&self, player: u8, x: u32, y: u32) -> Option<u32> {
+        let t = self.team_bit[player as usize].trailing_zeros() as usize;
+        self.pockets.get(t)?.at(x, y).map(|l| self.pocket_base[player as usize] + l)
     }
 
     #[inline]
@@ -663,7 +700,7 @@ impl World {
             return false;
         }
         match &c.kind {
-            CommandKind::Move { units, path, queue } => {
+            CommandKind::Move { units, path, queue, formation } => {
                 let idx = self.own_units(c.player, units);
                 if idx.is_empty() || path.is_empty() || path.len() > MAX_PATH_POINTS {
                     return false;
@@ -674,7 +711,7 @@ impl World {
                     path.iter().map(|p| FxPoint::new(p.x.clamp(Fx::ZERO, max_x), p.y.clamp(Fx::ZERO, max_y))).collect();
                 // Routes come from flow fields as units walk (phase 3).
                 let via = vec![false; path.len()];
-                self.apply_move(&idx, path, via, *queue);
+                self.apply_move(&idx, path, via, *queue, *formation);
                 true
             }
             CommandKind::Stop { units } => {
@@ -723,7 +760,7 @@ impl World {
             self.pending_spawns.push((player, kind, city as u16));
             return true;
         }
-        if self.labels.is_empty() {
+        if self.pockets.is_empty() {
             self.recompute_supply();
         }
         let Some(p) = self.pocket_of_city(city) else { return false };
@@ -737,10 +774,12 @@ impl World {
         true
     }
 
-    fn apply_move(&mut self, idx: &[usize], path: Vec<FxPoint>, via: Vec<bool>, queue: bool) {
+    fn apply_move(&mut self, idx: &[usize], path: Vec<FxPoint>, via: Vec<bool>, queue: bool, formation: Formation) {
         let n = idx.len() as i64;
         let cx = idx.iter().map(|&i| self.units.pos_x[i] as i64).sum::<i64>() / n;
         let cy = idx.iter().map(|&i| self.units.pos_y[i] as i64).sum::<i64>() / n;
+        let slots = (formation != Formation::Keep && idx.len() > 1)
+            .then(|| crate::formation::offsets(&self.units, idx, (cx, cy), path[0], formation));
         // Keep the formation, but not wider than ~ (1 + sqrt(n)/2) tiles.
         let cap = ONE as i64 + (isqrt_u64(n as u64) as i64) * (ONE as i64) / 2;
         let new_order = self.orders.alloc_via(path, via, NO_ORDER);
@@ -758,13 +797,19 @@ impl World {
                 self.units.order[i] = head;
                 self.units.waypoint[i] = 0;
             } else {
-                let mut ox = self.units.pos_x[i] as i64 - cx;
-                let mut oy = self.units.pos_y[i] as i64 - cy;
-                let len = isqrt_u64((ox * ox + oy * oy) as u64) as i64;
-                if len > cap {
-                    ox = ox * cap / len;
-                    oy = oy * cap / len;
-                }
+                let (ox, oy) = match &slots {
+                    Some(s) => s[&i],
+                    None => {
+                        let mut ox = self.units.pos_x[i] as i64 - cx;
+                        let mut oy = self.units.pos_y[i] as i64 - cy;
+                        let len = isqrt_u64((ox * ox + oy * oy) as u64) as i64;
+                        if len > cap {
+                            ox = ox * cap / len;
+                            oy = oy * cap / len;
+                        }
+                        (ox, oy)
+                    }
+                };
                 self.units.off_x[i] = ox as i32;
                 self.units.off_y[i] = oy as i32;
                 self.orders.retain(new_order);
@@ -1329,84 +1374,90 @@ impl World {
 
     // ---------------------------------------------------------------- phase 7
 
-    /// Territory. Units paint every 4 ticks, a quarter of the chunks per
-    /// tick ([`territory::chunk_paints`]). For each painting chunk that is
-    /// hot, every tile of the chunk (plus a margin of the radius) first gets
-    /// the team bits of all units within the radius — stamped in parallel
-    /// per chunk — so a unit checks "is an enemy close to this tile" with
-    /// one lookup. Candidate tiles are found in parallel from the
-    /// start-of-phase map; writes are applied in ascending unit order with
-    /// the ally check repeated, which gives exactly the sequential result.
+    /// Control zones (spec 2.2). Each chunk is recomputed every 4 ticks, a
+    /// quarter of the chunks per tick ([`territory::chunk_paints`]), from
+    /// the units and cities that reach it: in parallel per chunk into
+    /// scratch planes, then copied into the map. A pure function of
+    /// positions, so the thread count cannot change the result.
     fn phase_territory(&mut self) {
-        let radius = self.rules.territory_radius;
         let cw = self.map.chunks_w();
+        let n = (cw * self.map.chunks_h()) as usize;
         let tick = self.tick;
-        let painting_hot = |c: usize| self.hot[c] && territory::chunk_paints(c as u32 % cw, c as u32 / cw, tick);
-        if self.stats.hot_chunks > 0 {
-            let mut presence = take(&mut self.presence);
-            presence.resize_with(self.hot.len(), Vec::new);
-            let this = &*self;
-            // Collect first: the selected chunks cluster on the map, and a
-            // list splits evenly across threads where an index range would not.
-            let selected: Vec<(usize, &mut Vec<u8>)> =
-                presence.iter_mut().enumerate().filter(|(c, _)| painting_hot(*c)).collect();
-            this.pool.install(|| {
-                selected.into_par_iter().for_each(|(c, plane)| {
-                    let (cx, cy) = (c as u32 % cw, c as u32 / cw);
-                    // Units whose stamp can reach the grown chunk.
-                    let half = ((map::CHUNK / 2 + 2 * radius + 1) as i32) << 16;
-                    let (mx, my) = (
-                        ((cx * map::CHUNK + map::CHUNK / 2) as i32) << 16,
-                        ((cy * map::CHUNK + map::CHUNK / 2) as i32) << 16,
-                    );
-                    let g = &this.grid;
-                    territory::stamp_presence(plane, cx, cy, radius, |stamp| {
+        let full = std::mem::replace(&mut self.zones_stale, false);
+        let r_city = (self.rules.city_radius as i32) << 16;
+        let mut scratch = take(&mut self.zone_scratch);
+        let selected: Vec<usize> =
+            (0..n).filter(|&c| full || territory::chunk_paints(c as u32 % cw, c as u32 / cw, tick)).collect();
+        if scratch.len() < selected.len() {
+            scratch.resize_with(selected.len(), || (0, vec![0; map::CHUNK_TILES], false, Vec::new()));
+        }
+        let this = &*self;
+        this.pool.install(|| {
+            scratch[..selected.len()].par_iter_mut().zip(selected.par_iter()).for_each(|(out, &c)| {
+                let (cx, cy) = (c as u32 % cw, c as u32 / cw);
+                let g = &this.grid;
+                // Units whose zone can reach the chunk.
+                let half = ((map::CHUNK / 2 + this.rules.territory_radius + 1) as i32) << 16;
+                let (mx, my) = (
+                    ((cx * map::CHUNK + map::CHUNK / 2) as i32) << 16,
+                    ((cy * map::CHUNK + map::CHUNK / 2) as i32) << 16,
+                );
+                // Nothing reaches an empty chunk: leave it as it is.
+                let mut any_unit = false;
+                g.ranges_in_range(mx, my, half, |rg| any_unit |= !rg.is_empty());
+                let mut city_tiles: Vec<(u32, u32, u8)> = Vec::new();
+                let mut zones: Vec<(i32, i32, i32, u8)> = Vec::new();
+                for &k in &this.chunk_cities[c] {
+                    let city = &this.cities[k as usize];
+                    let (x, y) = (city.x as u32, city.y as u32);
+                    if x / map::CHUNK == cx && y / map::CHUNK == cy {
+                        city_tiles.push((x, y, city.owner));
+                    }
+                    if city.owner != 0 {
+                        let p = city.center();
+                        zones.push((p.x.0, p.y.0, r_city, city.owner));
+                    }
+                }
+                if !any_unit && zones.is_empty() && !this.chunk_owned[c] {
+                    out.0 = usize::MAX;
+                    return;
+                }
+                out.0 = c;
+                out.2 = territory::chunk_owners(
+                    &mut out.1,
+                    &mut out.3,
+                    cx,
+                    cy,
+                    this.rules.territory_radius,
+                    &this.zone_disk,
+                    &this.owner_of,
+                    |seed| {
                         g.ranges_in_range(mx, my, half, |rg| {
                             for k in rg {
-                                let owner = this.units.owner[g.cell_units[k] as usize];
-                                stamp(g.sx[k], g.sy[k], this.team_bit[owner as usize]);
+                                seed(g.sx[k], g.sy[k], this.units.owner[g.cell_units[k] as usize]);
                             }
                         });
-                    });
-                });
-            });
-            self.presence = presence;
-        }
-        // Painting units cluster in a few chunks (and so in a few runs of
-        // the spatially sorted unit arrays): small blocks balance the work.
-        // Writes are applied in unit order whatever the block size.
-        const PAINT_BLOCK: usize = 256;
-        let mut out = take(&mut self.paint_scratch);
-        let this = &*self;
-        let n = this.units.len();
-        let blocks = n.div_ceil(PAINT_BLOCK);
-        out.resize_with(blocks.max(out.len()), Vec::new);
-        this.pool.install(|| {
-            out[..blocks].par_iter_mut().enumerate().for_each(|(k, out)| {
-                out.clear();
-                for i in k * PAINT_BLOCK..((k + 1) * PAINT_BLOCK).min(n) {
-                    let (x, y) = (this.units.pos_x[i], this.units.pos_y[i]);
-                    let (cx, cy) = ((x >> 22) as u32, (y >> 22) as u32);
-                    if !territory::chunk_paints(cx, cy, tick) {
-                        continue;
-                    }
-                    let c = (cy * cw + cx) as usize;
-                    let presence = this.hot[c].then(|| this.presence[c].as_slice());
-                    territory::paint_candidates(
-                        &this.map,
-                        &this.units,
-                        &this.team,
-                        radius,
-                        i,
-                        presence,
-                        this.team_bit[this.units.owner[i] as usize],
-                        out,
-                    );
-                }
+                    },
+                    &zones,
+                    &city_tiles,
+                );
             });
         });
-        let changed = territory::apply_paint(&mut self.map, &self.team, &out[..blocks], &mut self.dirty_chunks);
-        self.paint_scratch = out;
+        let plane = self.map.owner_plane_mut();
+        let mut changed = false;
+        for (c, owners, any, _) in &scratch[..selected.len()] {
+            if *c == usize::MAX {
+                continue;
+            }
+            let dst = &mut plane[c * map::CHUNK_TILES..(c + 1) * map::CHUNK_TILES];
+            if dst != &owners[..] {
+                dst.copy_from_slice(owners);
+                self.dirty_chunks[*c] = true;
+                changed = true;
+            }
+            self.chunk_owned[*c] = *any;
+        }
+        self.zone_scratch = scratch;
         self.territory_changed |= changed;
     }
 
@@ -1414,22 +1465,40 @@ impl World {
 
     /// Pockets, supply limits and starvation rates (every 15 ticks).
     fn recompute_supply(&mut self) {
-        if self.territory_changed || self.labels.is_empty() {
-            self.pocket_owner = territory::label_pockets(&self.map, &mut self.labels, &mut self.stack_scratch);
+        if self.territory_changed || self.pockets.is_empty() {
+            // One labelling per team: its land is everything not held by
+            // another team (enemy zones are the only walls).
+            let teams = (1..=self.players as usize).map(|p| self.team_bit[p]).fold(0u8, |a, b| a | b);
+            let nteams = 8 - teams.leading_zeros() as usize;
+            let this = &*self;
+            let pockets: Vec<territory::TeamPockets> = this.pool.install(|| {
+                (0..nteams)
+                    .into_par_iter()
+                    .map(|t| {
+                        let bit = 1u8 << t;
+                        territory::TeamPockets::label(&this.map, |o| o == 0 || this.team_bit[o as usize] == bit)
+                    })
+                    .collect()
+            });
+            self.pockets = pockets;
             self.territory_changed = false;
         }
-        let np = self.pocket_owner.len();
+        let mut total = 0u32;
+        self.pocket_owner.clear();
+        for p in 1..=self.players as usize {
+            self.pocket_base[p] = total;
+            let t = self.team_bit[p].trailing_zeros() as usize;
+            let count = self.pockets.get(t).map_or(0, |tp| tp.count);
+            total += count;
+            self.pocket_owner.extend(std::iter::repeat_n(p as u8, count as usize));
+        }
+        let np = total as usize;
         self.pocket_limit.clear();
         self.pocket_limit.resize(np, 0);
         self.pocket_used.clear();
         self.pocket_used.resize(np, 0);
-        let w = self.map.width();
-        for c in &self.cities {
-            if c.owner == 0 {
-                continue;
-            }
-            let l = self.labels[(c.y as u32 * w + c.x as u32) as usize];
-            if l != NO_POCKET && self.pocket_owner[l as usize] == c.owner {
+        for c in 0..self.cities.len() {
+            if let Some(l) = self.pocket_of_city(c) {
                 let per_city = if self.sandbox { 1 << 20 } else { self.rules.per_city };
                 self.pocket_limit[l as usize] += per_city;
             }
@@ -1443,14 +1512,11 @@ impl World {
                 let u = &this.units;
                 for (j, p) in pocket.iter_mut().enumerate() {
                     let i = k * BLOCK + j;
-                    *p = territory::unit_pocket(
-                        &this.map,
-                        &this.labels,
-                        u.owner[i],
-                        u.pos_x[i],
-                        u.pos_y[i],
-                        this.rules.territory_radius,
-                    );
+                    let o = u.owner[i];
+                    let t = this.team_bit[o as usize].trailing_zeros() as usize;
+                    *p = this.pockets[t]
+                        .near(&this.map, u.pos_x[i], u.pos_y[i], this.rules.territory_radius)
+                        .map_or(NO_POCKET, |l| this.pocket_base[o as usize] + l);
                 }
             });
         });
@@ -1463,13 +1529,14 @@ impl World {
             }
         }
         // Units bought this tick are not spawned yet but already take supply.
-        for &(owner, kind, city) in &self.pending_spawns {
+        for k in 0..self.pending_spawns.len() {
+            let (owner, kind, city) = self.pending_spawns[k];
             let c = &self.cities[city as usize];
-            let l = self.labels[(c.y as u32 * w + c.x as u32) as usize];
-            if l != NO_POCKET && self.pocket_owner[l as usize] == owner {
+            if let Some(l) = self.pocket_at(owner, c.x as u32, c.y as u32) {
                 self.pocket_used[l as usize] += self.rules.supply[kind as usize];
             }
         }
+        let u = &mut self.units;
         let max = self.rules.starve_q16;
         for i in 0..u.len() {
             let p = u.pocket[i];

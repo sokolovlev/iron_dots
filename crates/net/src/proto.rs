@@ -6,7 +6,7 @@ use sim_core::command::{Command, CommandKind};
 use sim_core::scenario::ScenarioSpec;
 
 /// Bump on any change to the messages below (spec 6.5, protocol_version).
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Commands of one tick, as decided by the relay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

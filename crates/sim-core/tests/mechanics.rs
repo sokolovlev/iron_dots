@@ -25,7 +25,17 @@ fn plain() -> Map {
 }
 
 fn mv(tick: u32, player: u8, seq: u32, units: &[UnitHandle], path: &[FxPoint]) -> Command {
-    Command { tick, player, seq, kind: CommandKind::Move { units: units.to_vec(), path: path.to_vec(), queue: false } }
+    Command {
+        tick,
+        player,
+        seq,
+        kind: CommandKind::Move {
+            units: units.to_vec(),
+            path: path.to_vec(),
+            queue: false,
+            formation: Default::default(),
+        },
+    }
 }
 
 fn hp(w: &World, h: UnitHandle) -> Option<u16> {
@@ -188,7 +198,12 @@ fn stop_and_morale_break() {
             tick: 11,
             player: 2,
             seq: 0,
-            kind: CommandKind::Move { units: vec![a], path: vec![pt(0, 0)], queue: false },
+            kind: CommandKind::Move {
+                units: vec![a],
+                path: vec![pt(0, 0)],
+                queue: false,
+                formation: Default::default(),
+            },
         },
     ];
     for _ in 0..40 {
@@ -210,7 +225,12 @@ fn queued_paths_are_followed_in_order() {
             tick: 0,
             player: 1,
             seq: 1,
-            kind: CommandKind::Move { units: vec![a, b], path: vec![pt(14, 30)], queue: true },
+            kind: CommandKind::Move {
+                units: vec![a, b],
+                path: vec![pt(14, 30)],
+                queue: true,
+                formation: Default::default(),
+            },
         },
     ];
     let mut max_x = 0;
@@ -278,4 +298,38 @@ fn flow_fields_lead_around_a_long_wall() {
     assert!(t < 320 * TPS, "took {} s", t / TPS);
     let (fields, coarse) = w.flow_stats();
     assert!(fields > 0 && coarse > 0);
+}
+
+#[test]
+fn line_formation_faces_the_target() {
+    use sim_core::command::Formation;
+    let mut w = world(plain());
+    // A 4×4 blob, ordered east in a line: a front across the march (y),
+    // only a rank or two deep (x).
+    let units: Vec<UnitHandle> =
+        (0..16).map(|k| w.spawn(1, UnitKind::Light, pt(10 + k % 4, 30 + k / 4)).unwrap()).collect();
+    let cmd = Command {
+        tick: 0,
+        player: 1,
+        seq: 0,
+        kind: CommandKind::Move {
+            units: units.clone(),
+            path: vec![pt(40, 31)],
+            queue: false,
+            formation: Formation::Line,
+        },
+    };
+    for t in 0..20 * TPS {
+        let c = Command { tick: t, ..cmd.clone() };
+        w.step(if t == 0 { std::slice::from_ref(&c) } else { &[] });
+    }
+    let ps: Vec<(i32, i32)> = units.iter().map(|&h| pos(&w, h)).collect();
+    let span = |f: fn(&(i32, i32)) -> i32| {
+        let v: Vec<i32> = ps.iter().map(f).collect();
+        (v.iter().max().unwrap() - v.iter().min().unwrap()) / ONE
+    };
+    let (depth, width) = (span(|p| p.0), span(|p| p.1));
+    assert!(width >= 6 && depth <= 3, "line {width} wide, {depth} deep");
+    let cx = ps.iter().map(|p| p.0 as i64).sum::<i64>() / 16 / ONE as i64;
+    assert!((38..=42).contains(&cx), "centred on the target: {cx}");
 }

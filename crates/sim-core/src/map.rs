@@ -206,6 +206,11 @@ impl Map {
         &self.owner
     }
 
+    /// Owner plane, chunk-major: chunk `c` is `[c * CHUNK_TILES ..][..CHUNK_TILES]`.
+    pub fn owner_plane_mut(&mut self) -> &mut [u8] {
+        &mut self.owner
+    }
+
     /// Hash of the map content, used to check that all peers have the same map.
     pub fn content_hash(&self) -> u64 {
         let mut h = xxhash_rust::xxh3::Xxh3::new();

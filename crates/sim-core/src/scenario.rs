@@ -85,14 +85,12 @@ impl ScenarioSpec {
         w.set_sandbox(self.sandbox);
         for c in &self.cities {
             w.add_city(c.x, c.y, c.owner, c.capital)?;
-            if c.owner != 0 && c.claim > 0 {
-                w.claim(c.owner, c.x, c.y, c.claim);
-            }
         }
         for s in &self.spawns {
             w.spawn(s.owner, s.kind, s.at)?;
         }
         w.prepare_pathfinding();
+        w.refresh_zones();
         Ok(w)
     }
 
@@ -364,7 +362,7 @@ impl Controller for ScriptedPlayer {
                 tick,
                 player: me,
                 seq: self.seq,
-                kind: CommandKind::Move { units, path, queue: false },
+                kind: CommandKind::Move { units, path, queue: false, formation: Default::default() },
             });
             self.seq += 1;
         }

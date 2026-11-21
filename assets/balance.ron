@@ -51,7 +51,9 @@
         heal_city_dps: "4",
         heal_delay: "3",
     ),
-    territory: (radius: 3),
+    // Control zones: a tile is held by the side whose units (or cities) are
+    // within this many tiles and no other side's are; else neutral. proposal
+    territory: (radius: 3, city_radius: 5),
     city: (capture_time: "5", defense_bonus: "0.5"),
     match_rules: (start_light_units: 3, win_city_share: "0.8"),
 

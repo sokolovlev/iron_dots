@@ -12,6 +12,7 @@
 pub mod balance;
 pub mod command;
 pub mod flow;
+pub mod formation;
 pub mod fx;
 pub mod grid;
 pub mod map;
@@ -35,7 +36,7 @@ pub use world::{City, Phase, PlayerSetup, PlayerState, World};
 
 /// Version of the simulation code. Bump on any change that can alter the
 /// outcome of a replay; CI fails if a golden replay hash changes without it.
-pub const SIM_CODE_VERSION: u32 = 6;
+pub const SIM_CODE_VERSION: u32 = 7;
 
 /// Full simulation version: code version plus balance content (spec 6.5).
 /// Only clients with equal `sim_version` can play together.

@@ -22,7 +22,12 @@ fn buy(tick: u32, player: u8, seq: u32, city: u16, kind: UnitKind) -> Command {
 }
 
 fn mv(tick: u32, player: u8, units: &[UnitHandle], to: FxPoint) -> Command {
-    Command { tick, player, seq: 100, kind: CommandKind::Move { units: units.to_vec(), path: vec![to], queue: false } }
+    Command {
+        tick,
+        player,
+        seq: 100,
+        kind: CommandKind::Move { units: units.to_vec(), path: vec![to], queue: false, formation: Default::default() },
+    }
 }
 
 fn run(w: &mut World, cmds: &[Command], ticks: u32) {
@@ -35,7 +40,6 @@ fn run(w: &mut World, cmds: &[Command], ticks: u32) {
 fn city_income_and_buying() {
     let mut w = world();
     w.add_city(10, 10, 1, true).unwrap();
-    w.claim(1, 10, 10, 5);
     assert_eq!(w.player(1).money, 200_000);
     // Light costs 200: affordable at once; heavy (400) is not.
     let cmds = [buy(0, 1, 0, 0, UnitKind::Light), buy(0, 1, 1, 0, UnitKind::Heavy)];
@@ -52,7 +56,6 @@ fn city_income_and_buying() {
 fn supply_limit_blocks_buying() {
     let mut w = world();
     w.add_city(10, 10, 1, true).unwrap();
-    w.claim(1, 10, 10, 5);
     run(&mut w, &[], 3 * 60 * TPS); // 1800 money
     let cmds: Vec<Command> = (0..8).map(|k| buy(w.tick(), 1, k, 0, UnitKind::Light)).collect();
     w.step(&cmds);
@@ -65,44 +68,70 @@ fn supply_limit_blocks_buying() {
 }
 
 #[test]
-fn units_paint_territory_unless_enemies_are_near() {
+fn zones_follow_units_and_contested_land_is_neutral() {
     let mut w = world();
     let a = w.spawn(1, UnitKind::Light, pt(20, 20)).unwrap();
-    // Units paint every PAINT_INTERVAL ticks, staggered.
+    // Zones are recomputed every PAINT_INTERVAL ticks, staggered.
     let interval = sim_core::territory::PAINT_INTERVAL;
     run(&mut w, &[], interval);
     assert_eq!(w.map().owner(20, 20), 1);
     assert_eq!(w.map().owner(23, 20), 1);
-    assert_eq!(w.map().owner(24, 20), 0);
-    // An enemy within the radius of a tile blocks repainting it.
-    w.spawn(2, UnitKind::Light, pt(40, 20)).unwrap();
+    assert_eq!(w.map().owner(24, 20), 0, "beyond the radius: neutral");
+    // The zone moves with the unit and does not stay behind.
+    let cmds = [mv(w.tick(), 1, &[a], pt(40, 20))];
+    run(&mut w, &cmds, 15 * TPS);
+    assert_eq!(w.map().owner(40, 20), 1);
+    assert_eq!(w.map().owner(20, 20), 0, "land is not kept after the unit leaves");
+    // Where both sides reach, the land is nobody's.
+    w.spawn(2, UnitKind::Light, pt(45, 20)).unwrap();
     run(&mut w, &[], interval);
-    assert_eq!(w.map().owner(40, 20), 2);
-    let cmds = [mv(w.tick(), 1, &[a], pt(36, 20))];
-    run(&mut w, &cmds, 10 * TPS);
-    assert_eq!(w.map().owner(40, 20), 2, "tile next to the enemy flipped");
+    assert_eq!(w.map().owner(42, 20), 0, "contested");
+    assert_eq!(w.map().owner(38, 20), 1);
+    assert_eq!(w.map().owner(47, 20), 2);
 }
 
 #[test]
-fn encircled_units_starve() {
+fn only_a_closed_ring_of_enemy_control_cuts_supply() {
     let mut w = world();
     w.add_city(5, 5, 1, true).unwrap();
-    w.claim(1, 5, 5, 4);
-    // Group far away from any own city: its pocket has no supply.
-    let lost = w.spawn(1, UnitKind::Light, pt(50, 50)).unwrap();
-    let home = w.spawn(1, UnitKind::Light, pt(6, 6)).unwrap();
+    // Far from the city, but neutral land connects it: supplied.
+    let far = w.spawn(1, UnitKind::Light, pt(45, 45)).unwrap();
+    run(&mut w, &[], 5 * TPS);
+    let hp = |w: &World, h| w.units().hp[w.units().index_of(h).unwrap()];
+    assert_eq!(hp(&w, far), 10_000, "neutral land carries supply");
+    // A ring of enemy units around it (radius 8, every 22.5°) holds a
+    // closed band of land: the unit is cut off and starves.
+    const RING: [(i32, i32); 16] = [
+        (8, 0),
+        (7, 3),
+        (6, 6),
+        (3, 7),
+        (0, 8),
+        (-3, 7),
+        (-6, 6),
+        (-7, 3),
+        (-8, 0),
+        (-7, -3),
+        (-6, -6),
+        (-3, -7),
+        (0, -8),
+        (3, -7),
+        (6, -6),
+        (7, -3),
+    ];
+    for (dx, dy) in RING {
+        w.spawn(2, UnitKind::Light, pt(45 + dx, 45 + dy)).unwrap();
+    }
     run(&mut w, &[], 10 * TPS);
-    let hp = |h| w.units().hp[w.units().index_of(h).unwrap()];
-    assert_eq!(hp(home), 10_000);
-    // 5 HP/s for ~10 s.
-    assert!((4_500..=5_500).contains(&(10_000 - hp(lost) as i32)), "lost {}", 10_000 - hp(lost) as i32);
+    let lost = 10_000 - hp(&w, far) as i32;
+    // 5 HP/s for ~10 s (minus the moment the ring took to close).
+    assert!((3_500..=5_500).contains(&lost), "lost {lost}");
 }
 
 #[test]
 fn overloaded_pocket_starves_proportionally() {
     let mut w = world();
     w.add_city(10, 10, 1, true).unwrap();
-    w.claim(1, 10, 10, 8);
     // 10 light on 5 places: overload 100% → 5 HP/s.
     for k in 0..10 {
         w.spawn(1, UnitKind::Light, pt(6 + k % 5, 12 + k / 5)).unwrap();
@@ -116,7 +145,6 @@ fn overloaded_pocket_starves_proportionally() {
 fn healing_out_of_combat() {
     let mut w = world();
     w.add_city(10, 10, 1, true).unwrap();
-    w.claim(1, 10, 10, 8);
     let a = w.spawn(1, UnitKind::Light, pt(14, 10)).unwrap();
     let c = w.spawn(1, UnitKind::Light, pt(10, 10)).unwrap();
     // Wound them by pushing through water is awkward; instead let an enemy

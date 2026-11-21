@@ -37,17 +37,21 @@ impl Difficulty {
     pub fn profile(self) -> Profile {
         match self {
             Difficulty::Easy => Profile {
-                period: 90,
+                period: 120,
+                strategy_period: 120,
                 defense_weight: 0,
-                reserve: 300_000,
+                reserve: 400_000,
                 tactical: false,
                 margin: 0,
                 rally: false,
                 heavy_every: 0,
                 hold: false,
+                garrison: false,
+                raid: false,
             },
             Difficulty::Normal => Profile {
                 period: 30,
+                strategy_period: 30,
                 defense_weight: 50,
                 reserve: 0,
                 tactical: true,
@@ -55,16 +59,21 @@ impl Difficulty {
                 rally: false,
                 heavy_every: 0,
                 hold: false,
+                garrison: true,
+                raid: true,
             },
             Difficulty::Hard => Profile {
                 period: 10,
-                defense_weight: 100,
+                strategy_period: 30,
+                defense_weight: 50,
                 reserve: 0,
                 tactical: true,
-                margin: 160,
-                rally: true,
+                margin: 250,
+                rally: false,
                 heavy_every: 0,
-                hold: true,
+                hold: false,
+                garrison: true,
+                raid: true,
             },
         }
     }
@@ -74,8 +83,11 @@ impl Difficulty {
 /// of analysis, never cheating). Public so self-play can tune it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Profile {
-    /// Ticks between decisions.
+    /// Ticks between tactical decisions (retreat, holding, defence).
     pub period: u32,
+    /// Ticks between strategic ones (purchases, targets); a multiple of
+    /// `period`. Sending units off every few ticks feeds them in one by one.
+    pub strategy_period: u32,
     /// How much a defended city is avoided when choosing targets: percent
     /// extra distance per full-health light defender (0 = blind).
     pub defense_weight: i64,
@@ -96,6 +108,11 @@ pub struct Profile {
     /// stand: a unit without an order defends (less damage taken, slower
     /// morale loss, terrain bonus) and lets the enemy attack into it.
     pub hold: bool,
+    /// Keep one unit in every own city: a city with a defender inside
+    /// cannot be captured, and a unit in a city costs no upkeep.
+    pub garrison: bool,
+    /// Undefended enemy cities are worth a single raider (otherwise two).
+    pub raid: bool,
 }
 
 impl Profile {
@@ -106,6 +123,7 @@ impl Profile {
             let n: i64 = v.parse().map_err(|_| format!("{kv}: not a number"))?;
             match k {
                 "period" => self.period = n.clamp(1, 600) as u32,
+                "strategy_period" => self.strategy_period = n.clamp(1, 600) as u32,
                 "defense_weight" => self.defense_weight = n,
                 "reserve" => self.reserve = n,
                 "tactical" => self.tactical = n != 0,
@@ -113,6 +131,8 @@ impl Profile {
                 "rally" => self.rally = n != 0,
                 "heavy_every" => self.heavy_every = n.max(0) as u32,
                 "hold" => self.hold = n != 0,
+                "garrison" => self.garrison = n != 0,
+                "raid" => self.raid = n != 0,
                 _ => return Err(format!("unknown AI parameter {k}")),
             }
         }
@@ -130,6 +150,8 @@ pub struct Bot {
     seq: u32,
     /// Units already sent somewhere: handle → target city.
     assigned: BTreeMap<UnitHandle, u16>,
+    /// The unit guarding each own city.
+    garrison: BTreeMap<u16, UnitHandle>,
     bought: u32,
 }
 
@@ -139,7 +161,7 @@ impl Bot {
     }
 
     pub fn with_profile(player: u8, difficulty: Difficulty, p: Profile) -> Bot {
-        Bot { player, difficulty, p, seq: 0, assigned: BTreeMap::new(), bought: 0 }
+        Bot { player, difficulty, p, seq: 0, assigned: BTreeMap::new(), garrison: BTreeMap::new(), bought: 0 }
     }
 
     pub fn difficulty(&self) -> Difficulty {
@@ -250,7 +272,8 @@ impl Bot {
             if left.is_empty() {
                 break;
             }
-            let base = if cities[ci].owner == 0 { LIGHT } else { 2 * LIGHT };
+            let undefended = enemy_near[ci] == 0;
+            let base = if cities[ci].owner == 0 || (self.p.raid && undefended) { LIGHT } else { 2 * LIGHT };
             let need = (enemy_near[ci] * margin / 100).max(base) - en_route[ci];
             if need <= 0 {
                 continue;
@@ -288,7 +311,10 @@ impl Bot {
             .collect();
         if !far.is_empty() {
             let tick = world.tick();
-            out.push(self.cmd(tick, CommandKind::Move { units: far, path: vec![s], queue: false }));
+            out.push(self.cmd(
+                tick,
+                CommandKind::Move { units: far, path: vec![s], queue: false, formation: Default::default() },
+            ));
         }
     }
 }
@@ -301,6 +327,7 @@ impl Controller for Bot {
             return Vec::new();
         }
         let me = self.player;
+        let strategic = (tick + self.player as u32 * 3) % self.p.strategy_period.max(period) < period;
         if world.player(me).eliminated {
             return Vec::new();
         }
@@ -325,27 +352,29 @@ impl Controller for Bot {
         });
 
         // ------------------------------------------------------- economy
-        let money = world.player(me).money;
-        let mut budget = money - self.p.reserve;
-        for (ci, c) in cities.iter().enumerate() {
-            if c.owner != me {
-                continue;
-            }
-            let Some((used, limit)) = world.city_supply(ci) else { continue };
-            let mut free = limit.saturating_sub(used);
-            loop {
-                let every = self.p.heavy_every;
-                let want_heavy = every != 0 && self.bought % every == every - 1;
-                let kind = if want_heavy { UnitKind::Heavy } else { UnitKind::Light };
-                let cost = world.rules().cost[kind as usize];
-                let need = world.rules().supply[kind as usize];
-                if budget < cost || free < need {
-                    break;
+        if strategic {
+            let money = world.player(me).money;
+            let mut budget = money - self.p.reserve;
+            for (ci, c) in cities.iter().enumerate() {
+                if c.owner != me {
+                    continue;
                 }
-                budget -= cost;
-                free -= need;
-                self.bought += 1;
-                out.push(self.cmd(tick, CommandKind::Buy { city: ci as u16, kind }));
+                let Some((used, limit)) = world.city_supply(ci) else { continue };
+                let mut free = limit.saturating_sub(used);
+                loop {
+                    let every = self.p.heavy_every;
+                    let want_heavy = every != 0 && self.bought % every == every - 1;
+                    let kind = if want_heavy { UnitKind::Heavy } else { UnitKind::Light };
+                    let cost = world.rules().cost[kind as usize];
+                    let need = world.rules().supply[kind as usize];
+                    if budget < cost || free < need {
+                        break;
+                    }
+                    budget -= cost;
+                    free -= need;
+                    self.bought += 1;
+                    out.push(self.cmd(tick, CommandKind::Buy { city: ci as u16, kind }));
+                }
             }
         }
 
@@ -396,7 +425,10 @@ impl Controller for Bot {
                 }
                 retreating.extend(units.iter().copied());
                 let to = cities[ci].center();
-                out.push(self.cmd(tick, CommandKind::Move { units, path: vec![to], queue: false }));
+                out.push(self.cmd(
+                    tick,
+                    CommandKind::Move { units, path: vec![to], queue: false, formation: Default::default() },
+                ));
             }
         }
 
@@ -404,7 +436,14 @@ impl Controller for Bot {
         if self.p.hold {
             let holding: Vec<UnitHandle> = (0..u.len())
                 .filter(|&i| {
-                    u.owner[i] == me && u.flags[i] & flags::ATTACKING != 0 && !retreating.contains(&u.handle(i))
+                    u.owner[i] == me
+                        && u.flags[i] & flags::ATTACKING != 0
+                        && !retreating.contains(&u.handle(i))
+                        // At the target city keep pushing, or it is never taken.
+                        && self.assigned.get(&u.handle(i)).is_none_or(|&c| {
+                            let p = cities[c as usize].center();
+                            dist2(u.pos_x[i], u.pos_y[i], p.x.0, p.y.0) > zone2_release
+                        })
                 })
                 .map(|i| u.handle(i))
                 .collect();
@@ -418,7 +457,13 @@ impl Controller for Bot {
         }
 
         // ------------------------------------------------------- strategy
-        // Idle units: no order, not retreating, not assigned.
+        if !strategic {
+            return out;
+        }
+        // Garrisons: forget dead ones and lost cities.
+        self.garrison.retain(|&c, h| u.index_of(*h).is_some() && cities[c as usize].owner == me);
+        let guards: Vec<UnitHandle> = self.garrison.values().copied().collect();
+        // Idle units: no order, not retreating, not assigned, not guarding.
         let idle: Vec<usize> = (0..u.len())
             .filter(|&i| {
                 u.owner[i] == me
@@ -427,8 +472,38 @@ impl Controller for Bot {
                     && !retreating.contains(&u.handle(i))
                     // Holding units finish their fight first.
                     && !(self.p.hold && u.flags[i] & flags::IN_COMBAT != 0)
+                    && !guards.contains(&u.handle(i))
             })
             .collect();
+        // Unguarded own cities take the nearest idle unit.
+        let mut idle = idle;
+        if self.p.garrison {
+            for (ci, c) in cities.iter().enumerate() {
+                if c.owner != me || self.garrison.contains_key(&(ci as u16)) {
+                    continue;
+                }
+                let p = c.center();
+                let Some(k) =
+                    (0..idle.len()).min_by_key(|&k| (dist2(u.pos_x[idle[k]], u.pos_y[idle[k]], p.x.0, p.y.0), k))
+                else {
+                    break;
+                };
+                let i = idle.swap_remove(k);
+                let h = u.handle(i);
+                self.garrison.insert(ci as u16, h);
+                if dist2(u.pos_x[i], u.pos_y[i], p.x.0, p.y.0) > (ONE as i64) * (ONE as i64) {
+                    out.push(self.cmd(
+                        tick,
+                        CommandKind::Move {
+                            units: vec![h],
+                            path: vec![p],
+                            queue: false,
+                            formation: Default::default(),
+                        },
+                    ));
+                }
+            }
+        }
         if idle.is_empty() {
             return out;
         }
@@ -468,7 +543,10 @@ impl Controller for Bot {
                 self.assigned.insert(h, ci);
             }
             let to: FxPoint = cities[ci as usize].center();
-            out.push(self.cmd(tick, CommandKind::Move { units: handles, path: vec![to], queue: false }));
+            out.push(self.cmd(
+                tick,
+                CommandKind::Move { units: handles, path: vec![to], queue: false, formation: Default::default() },
+            ));
         }
         out
     }

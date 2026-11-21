@@ -31,7 +31,7 @@ parallel without changing results.
 | 4 | Intent: desired velocity from the current order | 1 ✓ |
 | 5 | Separation + integration + terrain blocking; waypoints, water/ships | 1 ✓ |
 | 6 | Combat: contacts → pulled damage (combat, water, starvation) → HP and morale | 1–2 ✓ |
-| 7 | Territory painting | 2 ✓ |
+| 7 | Control zones (per chunk, every 4 ticks) | 2 ✓ |
 | 8 | Supply: pockets every 15 ticks, starvation rates, healing | 2 ✓ |
 | 9 | Cities: capture; once per second money and the victory check | 2 ✓ |
 | 10 | Remove the dead (descending swap-remove), then spawn bought units | 1–2 ✓ |
@@ -170,13 +170,27 @@ simulation.
 
 Stage 2 had to pin down details that spec §2 describes only in words:
 
-- **Territory:** a unit claims tiles within `territory.radius` unless an enemy
-  is within that radius of the tile. Allied land and city tiles are never
-  repainted; a city tile always belongs to the city's owner.
-- **Pockets:** 4-connected components of one player's land. A unit belongs to
-  the pocket under it, or the nearest own tile within the territory radius.
-  Otherwise it has no supply and starves at the full rate. Units bought this
-  tick already count against the pocket.
+- **Control zones** (changed after playtesting): a tile belongs to a side
+  while that side has a unit within `territory.radius` (3) of it, or one of
+  its cities within `territory.city_radius` (5), and no other side does.
+  Land nobody reaches, or that two hostile sides reach, is neutral. Zones
+  follow the units: land is not kept after the army leaves, so an
+  encirclement lasts only while the encircling units stay. City tiles always
+  show the city owner. Each chunk is recomputed every 4 ticks (a 2×2
+  checkerboard): units mark their tiles, each marked tile spreads over the
+  radius disk; owner from a 256-entry table of the players present. A pure
+  function of positions, so thread count cannot change it.
+- **Pockets:** per team, 4-connected components of everything not held by
+  another team (own, allied and neutral land), found with row runs and
+  union-find. So supply is cut only by a closed ring of enemy control; an
+  army far from its cities is supplied as long as neutral land connects it.
+  Supply limits are counted per player per pocket. Units bought this tick
+  already count against the pocket.
+- **Formations** (`Move { formation }`): Keep (current spacing), Line
+  (about 4:1, a few ranks), Staggered (line with gaps), Box, Column, Flank
+  (two wings). Facing is from the group's centre to the first path point;
+  the units furthest forward fill the front rank, left to right, so paths
+  rarely cross (`sim_core::formation`).
 - **Upkeep and income** are settled once per second. A unit is "in a city"
   (no upkeep, double healing) inside the city's 3×3 tiles.
 - **Healing** needs 3 s out of combat, no starvation, friendly land, and not
@@ -333,34 +347,38 @@ run on every client in a lockstep game. It follows the same determinism rules
 (integers, ordered containers; a `clippy.toml` enforces it).
 
 Each think: buy as money and supply allow; pull back units with broken
-morale; send idle units to own cities that are outnumbered; then pick
-targets. Levels differ only in decision frequency and depth (spec 6.3), set
-by `ai::Profile`:
+morale; keep a garrison in every city; send idle units to own cities that are
+outnumbered; then pick targets. Levels differ only in decision frequency and
+depth (spec 6.3), set by `ai::Profile`:
 
 | | Easy | Normal | Hard |
 |---|---|---|---|
-| Decisions every | 3 s | 1 s | ⅓ s |
-| Targets | each unit its own nearest city | groups that outweigh the defenders by 20% | by 60% |
-| Defence, retreat | no | yes | yes |
-| Leftover units | wait | wait | gather at the city nearest the next target |
-| Contact while moving | keeps attacking | keeps attacking | stops and defends |
+| Tactical decisions every | 4 s | 1 s | ⅓ s |
+| Purchases and targets every | 4 s | 1 s | 1 s |
+| Treasury kept | 400 | 0 | 0 |
+| Targets | each unit its own nearest city | groups 1.2× the defenders | groups 2.5× the defenders |
+| Garrisons, defence, retreat | no | yes | yes |
+| Single raiders to undefended enemy cities | no | yes | yes |
 
-The last row matters most. A unit with an order is the attacker in a fight
-(25% more damage taken, morale lost four times faster, no terrain bonus), so
-stopping on contact turns an encounter into a defence and lets the enemy
-attack into it.
+With control zones tied to units (see above), a lone raider deep in enemy
+land stays supplied, so undefended cities fall to single units: garrisons
+(one unit per city, free of upkeep) are the answer, and attacking a
+garrisoned city pays only with a large margin, because the defender has the
+city bonus, takes less damage and loses morale four times slower. Hard's
+edge is mostly that margin. Sending units off every third of a second made
+bots weaker (they reached the target one at a time), hence the separate
+strategy period.
 
 Measured with `headless aieval` (100 matches per pairing, both sides of
 each map, unseen seeds):
 
 | Pairing | Small 320×192 | Medium 448×256 |
 |---|---|---|
-| Normal vs Easy | 93% | 99% |
-| Hard vs Normal | 74% | 85% |
+| Normal vs Easy | 86% | 89% |
+| Hard vs Normal | 71% | 79% |
 
-A fixed 10-match sample of the same runs in `cargo test` as a regression
-guard. Heavy units still make bots weaker (Hard with every 4th purchase heavy
-wins 10%), so bots buy light units only.
+A fixed 10-match sample runs in `cargo test` as a regression guard. Heavy
+units still make bots weaker, so bots buy light units only.
 
 ## Rendering
 

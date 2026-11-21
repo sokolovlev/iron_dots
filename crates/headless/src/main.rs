@@ -14,6 +14,7 @@
 //! iron-dots-headless mapgen --map WxH --seed N --out FILE.wmap SYMMETRY LAYOUT [CITIES] [NAME]
 //!                                               fair generated map: SYMMETRY mirror|rotate|quad,
 //!                                               LAYOUT starts of one part as x,y in ‰ ("150,500;...")
+//!       --trace (match): one line of cities, units, money, supply per minute
 //!       --mapfile FILE (match, aieval): play on a .wmap map with its suggested teams
 //! iron-dots-headless netsim [--matches N]       3v3 matches over QUIC through a proxy with
 //!                                               10% loss and 100 ms jitter, one rejoin per
@@ -54,6 +55,7 @@ struct Opts {
     clean: bool,
     tune: String,
     mapfile: Option<String>,
+    trace: bool,
     positional: Vec<String>,
 }
 
@@ -76,6 +78,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         clean: false,
         tune: String::new(),
         mapfile: None,
+        trace: false,
         positional: Vec::new(),
     };
     let mut it = args.iter();
@@ -103,6 +106,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--clean" => o.clean = true,
             "--tune" => o.tune = val("--tune")?,
             "--mapfile" => o.mapfile = Some(val("--mapfile")?),
+            "--trace" => o.trace = true,
             "--threads" => o.threads = num(val("--threads")?)?.max(1) as usize,
             "--difficulty" => {
                 o.difficulty = val("--difficulty")?
@@ -373,7 +377,22 @@ fn play_match(o: &Opts, b: &Balance) -> Result<(), String> {
         .collect();
     let t = Instant::now();
     let mut winner = None;
+    let trace = o.trace;
     let r = Replay::record(&spec, b, o.ticks, &mut bots, |w| {
+        if trace && w.tick() % (60 * b.tick_rate) == 0 {
+            let counts = w.unit_counts();
+            let mut line = format!("{:>2} min:", w.tick() / b.tick_rate / 60);
+            for p in 1..=w.player_count() {
+                let cities = w.cities().iter().filter(|c| c.owner == p).count();
+                let (used, limit) = w.supply_totals(p);
+                line += &format!(
+                    "  p{p} cities {cities:>2} units {:>3} money {:>5} supply {used}/{limit}",
+                    counts[p as usize],
+                    w.player(p).money / 1000
+                );
+            }
+            println!("{line}");
+        }
         winner = w.winner();
         winner.is_some()
     })?;

@@ -9,7 +9,7 @@ use net::lockstep::Lockstep;
 use net::proto::{ClientMsg, ServerMsg};
 use net::{NetClient, NetEvent};
 use render::{Camera, Marker, Overlay, mflags};
-use sim_core::command::{Command, CommandKind};
+use sim_core::command::{Command, CommandKind, Formation};
 use sim_core::fx::{Fx, FxPoint};
 use sim_core::replay::Replay;
 use sim_core::scenario::{Controller, ScenarioSpec};
@@ -75,6 +75,8 @@ pub struct Game {
     pub camera: Camera,
     pub selection: Vec<UnitHandle>,
     pub selected_city: Option<usize>,
+    /// Formation for this player's moves (the panel shown for groups).
+    pub formation: Formation,
     groups: [Vec<UnitHandle>; 10],
     /// Path being drawn with the right button (world coordinates).
     pub drawing: Option<Vec<[f32; 2]>>,
@@ -218,6 +220,7 @@ impl Game {
             camera,
             selection: Vec::new(),
             selected_city: None,
+            formation: Formation::Keep,
             groups: Default::default(),
             drawing: None,
             box_select: None,
@@ -660,7 +663,41 @@ impl Game {
             .into_iter()
             .map(|p| FxPoint::new(Fx((p[0] * 65536.0) as i32), Fx((p[1] * 65536.0) as i32)))
             .collect();
-        self.issue(CommandKind::Move { units: self.selection.clone(), path, queue });
+        self.issue(CommandKind::Move { units: self.selection.clone(), path, queue, formation: self.formation });
+        self.sounds.push(Sfx::Order);
+    }
+
+    /// Picks the formation for the next orders and lines the selected
+    /// group up in it where it stands, facing the nearest enemy.
+    pub fn set_formation(&mut self, f: Formation) {
+        self.formation = f;
+        let u = self.world.units();
+        let idx: Vec<usize> = self.selection.iter().filter_map(|h| u.index_of(*h)).collect();
+        if idx.len() < 2 || f == Formation::Keep {
+            return;
+        }
+        let n = idx.len() as f32;
+        let c = idx.iter().fold([0.0, 0.0], |a, &i| [a[0] + fx(Fx(u.pos_x[i])) / n, a[1] + fx(Fx(u.pos_y[i])) / n]);
+        let team = self.world.team_of(self.me);
+        let enemy = (0..u.len())
+            .filter(|&i| self.world.team_of(u.owner[i]) != team)
+            .map(|i| [fx(Fx(u.pos_x[i])), fx(Fx(u.pos_y[i]))])
+            .min_by(|a, b| {
+                let d = |p: &[f32; 2]| (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2);
+                d(a).total_cmp(&d(b))
+            });
+        // Half a tile towards the enemy (north if there is none).
+        let dir = match enemy {
+            Some(e) => {
+                let (dx, dy) = (e[0] - c[0], e[1] - c[1]);
+                let l = (dx * dx + dy * dy).sqrt().max(1e-3);
+                [dx / l, dy / l]
+            }
+            None => [0.0, -1.0],
+        };
+        let to = [c[0] + dir[0] * 0.5, c[1] + dir[1] * 0.5];
+        let path = vec![FxPoint::new(Fx((to[0] * 65536.0) as i32), Fx((to[1] * 65536.0) as i32))];
+        self.issue(CommandKind::Move { units: self.selection.clone(), path, queue: false, formation: f });
         self.sounds.push(Sfx::Order);
     }
 

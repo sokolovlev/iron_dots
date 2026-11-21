@@ -118,6 +118,17 @@ terrain; or drop a `.png` or `.wmap` onto the window), save, and Play to try
 the map against bots at once. Maps are saved as `.wmap` next to
 `settings.ron`, in `maps/`.
 
+**Territory and supply.** Land belongs to whoever has units (or cities)
+next to it right now; land nobody holds, or both sides contest, is neutral.
+Supply flows over your own and neutral land, so to cut an enemy off you
+must surround it with a closed ring of your own control and keep standing
+there. Keep a unit in each city: a city with a defender inside cannot be
+captured, and units in cities cost no upkeep.
+
+**Formations.** With two or more units selected, a bar at the bottom offers
+Keep, Line, Staggered, Box, Column and Flank. Picking one lines the group up
+facing the nearest enemy and is used for the following orders.
+
 Generated maps are wide like the screen (close to 16:9): from Small 320×192 to
 Colossal 4096×2304. Sides are multiples of the 64-tile chunk, so exact 16:9
 starts at 1024×576. `--map` takes `WxH` or a single number for a square map.
