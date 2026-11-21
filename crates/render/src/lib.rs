@@ -41,6 +41,23 @@ impl Camera {
         ]
     }
 
+    /// Smallest zoom at which a `map`-sized world (tiles) still covers the
+    /// whole viewport.
+    pub fn min_scale_for(map: [f32; 2], viewport: [f32; 2]) -> f32 {
+        (viewport[0] / map[0]).max(viewport[1] / map[1]).clamp(Self::MIN_SCALE, Self::MAX_SCALE)
+    }
+
+    /// Keeps the view inside the map: never zoomed out past
+    /// [`Camera::min_scale_for`], never showing anything beyond an edge.
+    pub fn clamp_to(&mut self, map: [f32; 2], viewport: [f32; 2]) {
+        self.scale = self.scale.clamp(Self::min_scale_for(map, viewport), Self::MAX_SCALE);
+        for k in 0..2 {
+            let half = viewport[k] * 0.5 / self.scale;
+            self.center[k] =
+                if 2.0 * half >= map[k] { map[k] * 0.5 } else { self.center[k].clamp(half, map[k] - half) };
+        }
+    }
+
     /// Zooms by `factor` keeping the world point under `px` fixed.
     pub fn zoom_at(&mut self, factor: f32, px: [f32; 2], viewport: [f32; 2]) {
         let before = self.screen_to_world(px, viewport);
@@ -437,6 +454,20 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_stays_inside_the_map() {
+        let vp = [1280.0, 800.0];
+        let map = [256.0, 256.0];
+        let mut c = Camera { center: [-50.0, 300.0], scale: 1.0 };
+        c.clamp_to(map, vp);
+        assert_eq!(c.scale, 5.0, "zoomed out only until the map covers the screen");
+        let a = c.screen_to_world([0.0, 0.0], vp);
+        let b = c.screen_to_world(vp, vp);
+        assert!(a[0] >= 0.0 && a[1] >= 0.0 && b[0] <= 256.0 && b[1] <= 256.0, "{a:?} {b:?}");
+        assert_eq!(a[0], 0.0);
+        assert_eq!(b[1], 256.0);
+    }
 
     #[test]
     fn marker_is_16_bytes() {

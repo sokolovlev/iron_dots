@@ -219,6 +219,12 @@ impl Game {
         Ok(world)
     }
 
+    /// Map size in tiles, for camera limits.
+    pub fn map_size(&self) -> [f32; 2] {
+        let m = self.world.map();
+        [m.width() as f32, m.height() as f32]
+    }
+
     /// Replaces the local player with a bot (for screenshots and demos).
     pub fn add_bot_for_me(&mut self, d: Difficulty) {
         self.bots.push(Bot::new(self.me, d));

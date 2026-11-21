@@ -293,6 +293,7 @@ impl App {
                     g.camera.center[1] += speed;
                 }
             }
+            g.camera.clamp_to(g.map_size(), vp);
             g.update(dt);
         }
 
@@ -488,7 +489,12 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
                 };
                 if let Some(g) = &mut self.game {
-                    g.camera.zoom_at(1.15f32.powf(steps), self.mouse.pos, vp);
+                    // Stop zooming out where the map still fills the screen,
+                    // so the point under the cursor stays put at the limit.
+                    let min = render::Camera::min_scale_for(g.map_size(), vp);
+                    let target = (g.camera.scale * 1.15f32.powf(steps)).max(min);
+                    g.camera.zoom_at(target / g.camera.scale, self.mouse.pos, vp);
+                    g.camera.clamp_to(g.map_size(), vp);
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
