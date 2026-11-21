@@ -8,7 +8,7 @@ use sim_core::scenario::{Controller, ScenarioSpec};
 
 fn play(map: u32, players: u8, seed: u64, d: &[Difficulty]) -> (Replay, Option<u8>) {
     let b = Balance::default_balance();
-    let spec = ScenarioSpec::standard_match(map, players, seed, &b).unwrap();
+    let spec = ScenarioSpec::standard_match(map, map, players, seed, &b).unwrap();
     let mut bots: Vec<Box<dyn Controller>> =
         (1..=players).map(|p| Box::new(Bot::new(p, d[(p as usize - 1) % d.len()])) as Box<dyn Controller>).collect();
     let mut winner = None;

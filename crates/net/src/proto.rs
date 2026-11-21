@@ -6,7 +6,7 @@ use sim_core::command::{Command, CommandKind};
 use sim_core::scenario::ScenarioSpec;
 
 /// Bump on any change to the messages below (spec 6.5, protocol_version).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Commands of one tick, as decided by the relay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +40,9 @@ pub struct Slot {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LobbySettings {
-    pub map_size: u32,
+    /// Map size in tiles (multiples of 64).
+    pub width: u32,
+    pub height: u32,
     pub seed: u64,
     /// Number of slots (2..=8); one player per slot.
     pub slots: u8,
@@ -62,7 +64,8 @@ pub struct LobbyInfo {
     pub name: String,
     pub humans: u8,
     pub open: u8,
-    pub map_size: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

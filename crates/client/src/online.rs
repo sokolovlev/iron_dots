@@ -66,7 +66,7 @@ impl Default for OnlineMenu {
             hosting: None,
             scanner: None,
             lan: Vec::new(),
-            new_lobby: LobbySettings { map_size: 256, seed: 1, slots: 2 },
+            new_lobby: LobbySettings { width: 320, height: 192, seed: 1, slots: 2 },
             lobby_name: "Iron Dots".into(),
             time: 0.0,
             last_list: -10.0,
@@ -311,7 +311,7 @@ impl OnlineMenu {
         let mut join = None;
         for l in &self.lobbies {
             ui.horizontal(|ui| {
-                ui.label(format!("{}  ·  {} players, {} open  ·  {}²", l.name, l.humans, l.open, l.map_size));
+                ui.label(format!("{}  ·  {} players, {} open  ·  {}×{}", l.name, l.humans, l.open, l.width, l.height));
                 if l.open > 0 && ui.button("Join").clicked() {
                     join = Some(l.id);
                 }
@@ -327,14 +327,10 @@ impl OnlineMenu {
             ui.text_edit_singleline(&mut self.lobby_name);
             ui.end_row();
             ui.label("Map size");
-            egui::ComboBox::from_id_salt("omap").selected_text(format!("{0}×{0}", self.new_lobby.map_size)).show_ui(
-                ui,
-                |ui| {
-                    for s in [128, 256, 512, 1024] {
-                        ui.selectable_value(&mut self.new_lobby.map_size, s, format!("{s}×{s}"));
-                    }
-                },
-            );
+            let mut map = [self.new_lobby.width, self.new_lobby.height];
+            // Up to 2048×1152: the relay's limit.
+            crate::ui::map_picker(ui, "omap", &mut map, 5);
+            [self.new_lobby.width, self.new_lobby.height] = map;
             ui.end_row();
             ui.label("Slots");
             ui.add(egui::Slider::new(&mut self.new_lobby.slots, 2..=8));
@@ -353,7 +349,7 @@ impl OnlineMenu {
         let host = l.host == me;
         ui.label(RichText::new(&l.name).size(20.0).strong());
         let lan = self.hosting.as_ref().map(|h| format!("  ·  LAN, port {}", h.relay.addr.port())).unwrap_or_default();
-        ui.weak(format!("map {0}×{0}, seed {1}{lan}", l.settings.map_size, l.settings.seed));
+        ui.weak(format!("map {}×{}, seed {}{lan}", l.settings.width, l.settings.height, l.settings.seed));
         ui.add_space(8.0);
         let mut msgs = Vec::new();
         egui::Grid::new("slots").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {

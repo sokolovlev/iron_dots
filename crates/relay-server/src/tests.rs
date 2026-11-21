@@ -21,7 +21,7 @@ fn to(out: &[Out], client: u32) -> Vec<ServerMsg> {
 }
 
 fn settings() -> LobbySettings {
-    LobbySettings { map_size: 128, seed: 3, slots: 4 }
+    LobbySettings { width: 256, height: 128, seed: 3, slots: 4 }
 }
 
 /// Two humans and a bot, started; returns (relay, host, guest, game, tokens).

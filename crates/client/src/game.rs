@@ -19,7 +19,8 @@ use std::net::SocketAddr;
 /// Settings chosen in the menu.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatchSettings {
-    pub map_size: u32,
+    /// Map size in tiles, `[width, height]`.
+    pub map: [u32; 2],
     pub opponents: u8,
     pub difficulty: Difficulty,
     pub seed: u64,
@@ -32,7 +33,7 @@ pub struct MatchSettings {
 impl Default for MatchSettings {
     fn default() -> Self {
         MatchSettings {
-            map_size: 256,
+            map: [320, 192],
             opponents: 1,
             difficulty: Difficulty::Normal,
             seed: 1,
@@ -129,9 +130,9 @@ impl Game {
         let balance = Balance::default_balance();
         let players = settings.opponents + 1;
         let spec = if settings.sandbox {
-            ScenarioSpec::battle(settings.map_size, settings.units_per_player, players, settings.seed)?
+            ScenarioSpec::battle(settings.map[0], settings.map[1], settings.units_per_player, players, settings.seed)?
         } else {
-            ScenarioSpec::standard_match(settings.map_size, players, settings.seed, &balance)?
+            ScenarioSpec::standard_match(settings.map[0], settings.map[1], players, settings.seed, &balance)?
         };
         let bots = (2..=players).map(|p| Bot::new(p, settings.difficulty)).collect();
         Game::build(settings, spec, balance, 1, bots)
@@ -141,14 +142,14 @@ impl Game {
     pub fn online(s: Started) -> Result<Game, String> {
         let balance = Balance::default_balance();
         let settings = MatchSettings {
-            map_size: 0,
+            map: [0, 0],
             opponents: s.scenario.players.len().saturating_sub(1) as u8,
             seed: s.scenario.seed,
             ..MatchSettings::default()
         };
         let bots = s.bots.iter().map(|&(p, d)| Bot::new(p, bot_difficulty(d))).collect();
         let mut g = Game::build(settings, s.scenario, balance, s.you, bots)?;
-        g.settings.map_size = g.world.map().width();
+        g.settings.map = [g.world.map().width(), g.world.map().height()];
         let mut lock = Lockstep::new(s.tick_rate);
         for p in s.early {
             lock.receive(p, 0.0);
@@ -830,7 +831,7 @@ mod tests {
 
     #[test]
     fn local_commands_reach_the_world() {
-        let mut g = Game::new(MatchSettings { map_size: 128, ..Default::default() }).unwrap();
+        let mut g = Game::new(MatchSettings { map: [256, 128], ..Default::default() }).unwrap();
         // Select our three starting units by box and send them somewhere.
         let vp = [1280.0, 720.0];
         g.box_select = Some(([0.0, 0.0], vp));
@@ -876,7 +877,7 @@ mod tests {
             .collect();
         clients[0].send(ClientMsg::CreateLobby {
             name: "t".into(),
-            settings: LobbySettings { map_size: 128, seed: 2, slots: 3 },
+            settings: LobbySettings { width: 256, height: 128, seed: 2, slots: 3 },
         });
         let ServerMsg::Lobby(l) = wait(&clients[0], &|m| matches!(m, ServerMsg::Lobby(_))) else { unreachable!() };
         clients[1].send(ClientMsg::JoinLobby { lobby: l.id });

@@ -12,7 +12,7 @@
 //!                                               10% loss and 100 ms jitter, one rejoin per
 //!                                               match; fails on any desync (spec 6.2)
 //!
-//! opts: --map N (tiles, default 256)  --units N (per player, default 200)
+//! opts: --map N or WxH (tiles, default 256)  --units N (per player, default 200)
 //!       --players N (default 2)       --seed N (default 1)
 //!       --ticks N (default 1800)      --balance FILE (default: built-in)
 //!       --threads N (bench; default 1, results are identical for any N)
@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 struct Opts {
     map: u32,
+    map_h: u32,
     units: u32,
     players: u8,
     seed: u64,
@@ -50,6 +51,7 @@ struct Opts {
 fn parse(args: &[String]) -> Result<Opts, String> {
     let mut o = Opts {
         map: 256,
+        map_h: 256,
         units: 200,
         players: 2,
         seed: 1,
@@ -70,7 +72,13 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         let mut val = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
         let num = |s: String| s.parse::<u64>().map_err(|_| format!("not a number: {s}"));
         match a.as_str() {
-            "--map" => o.map = num(val("--map")?)? as u32,
+            "--map" => {
+                // N for a square map, or WxH.
+                let v = val("--map")?;
+                let (w, h) = v.split_once('x').unwrap_or((&v, &v));
+                o.map = num(w.to_string())? as u32;
+                o.map_h = num(h.to_string())? as u32;
+            }
             "--units" => o.units = num(val("--units")?)? as u32,
             "--players" => o.players = num(val("--players")?)? as u8,
             "--seed" => o.seed = num(val("--seed")?)?,
@@ -113,7 +121,7 @@ fn balance(o: &Opts) -> Result<Balance, String> {
 
 fn scenario(o: &Opts) -> Result<ScenarioSpec, String> {
     match o.scenario.as_str() {
-        "battle" => ScenarioSpec::battle(o.map, o.units, o.players, o.seed),
+        "battle" => ScenarioSpec::battle(o.map, o.map_h, o.units, o.players, o.seed),
         "front" => ScenarioSpec::front(o.map, o.units, o.seed),
         s => Err(format!("unknown scenario {s} (battle or front)")),
     }
@@ -265,9 +273,9 @@ fn scaling(o: &Opts, b: &Balance) -> Result<(), String> {
     counts.push(max_threads);
     let repeats = 3;
     let scenarios: [(&str, ScenarioSpec, u32); 3] = [
-        ("10k units, 1024², marching", ScenarioSpec::battle(1024, 5000, 2, 1)?, 600),
+        ("10k units, 1024², marching", ScenarioSpec::battle(1024, 1024, 5000, 2, 1)?, 600),
         ("10k units, 1024², one front", ScenarioSpec::front(1024, 5000, 1)?, 300),
-        ("100k units, 4096², 8 players", ScenarioSpec::battle(4096, 12_500, 8, 1)?, 150),
+        ("100k units, 4096², 8 players", ScenarioSpec::battle(4096, 4096, 12_500, 8, 1)?, 150),
     ];
     println!("# Iron Dots scaling");
     println!();
@@ -327,7 +335,7 @@ fn scaling(o: &Opts, b: &Balance) -> Result<(), String> {
 }
 
 fn play_match(o: &Opts, b: &Balance) -> Result<(), String> {
-    let spec = ScenarioSpec::standard_match(o.map, o.players, o.seed, b)?;
+    let spec = ScenarioSpec::standard_match(o.map, o.map_h, o.players, o.seed, b)?;
     let mut bots: Vec<Box<dyn Controller>> = (1..=o.players)
         .map(|p| {
             let d = o.difficulty.get(p as usize - 1).or(o.difficulty.last()).copied().unwrap_or(ai::Difficulty::Normal);
@@ -372,8 +380,8 @@ fn netsim(o: &Opts) -> Result<(), String> {
     use relay_server::netsim::{self, Options};
     let network = if o.clean { "clean network" } else { "10% loss, 100 ms jitter" };
     println!(
-        "{} matches 3v3, map {}, {} ticks at {} ticks/s, {network}, one rejoin per match",
-        o.matches, o.map, o.ticks, o.tick_rate
+        "{} matches 3v3, map {}×{}, {} ticks at {} ticks/s, {network}, one rejoin per match",
+        o.matches, o.map, o.map_h, o.ticks, o.tick_rate
     );
     let next = std::sync::atomic::AtomicU32::new(0);
     let failures = std::sync::Mutex::new(Vec::new());
@@ -387,7 +395,8 @@ fn netsim(o: &Opts) -> Result<(), String> {
                     }
                     let seed = o.seed + k as u64;
                     let mut opts = Options::three_vs_three(seed, o.ticks);
-                    opts.map_size = o.map;
+                    opts.width = o.map;
+                    opts.height = o.map_h;
                     opts.tick_rate = o.tick_rate;
                     if o.clean {
                         opts.network = None;

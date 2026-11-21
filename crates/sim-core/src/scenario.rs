@@ -40,6 +40,17 @@ pub struct ScenarioSpec {
     pub sandbox: bool,
 }
 
+/// Map sizes offered in the menus, all close to 16:9 (sides must be
+/// multiples of the 64-tile chunk, so exact 16:9 starts at 1024×576).
+pub const MAP_PRESETS: [(&str, u32, u32); 6] = [
+    ("Small", 320, 192),
+    ("Medium", 448, 256),
+    ("Large", 576, 320),
+    ("Huge", 1024, 576),
+    ("Giant", 2048, 1152),
+    ("Colossal", 4096, 2304),
+];
+
 /// Directions of starting positions on a ring, in eighths of the half-size
 /// (no trigonometry): W, E, N, S, NW, SE, NE, SW.
 const DIRS: [(i32, i32); 8] = [(-6, 0), (6, 0), (0, -6), (0, 6), (-4, -4), (4, 4), (4, -4), (-4, 4)];
@@ -88,18 +99,26 @@ impl ScenarioSpec {
     /// A normal match (spec 2.8 "match start"): every player gets a capital
     /// with some land and `start_light_units` light units; neutral cities are
     /// scattered over the map. Free-for-all teams unless `teams` is given.
-    pub fn standard_match(map_size: u32, players: u8, seed: u64, balance: &Balance) -> Result<ScenarioSpec, String> {
+    /// A standard match on a generated `width`×`height` map: capitals on an
+    /// ellipse around the centre, neutral cities spread over the map.
+    pub fn standard_match(
+        width: u32,
+        height: u32,
+        players: u8,
+        seed: u64,
+        balance: &Balance,
+    ) -> Result<ScenarioSpec, String> {
         if !(2..=MAX_PLAYERS as u8).contains(&players) {
             return Err(format!("players must be in 2..={MAX_PLAYERS}"));
         }
-        let source = MapSource::Generated { width: map_size, height: map_size, seed };
+        let source = MapSource::Generated { width, height, seed };
         let map = source.build()?;
-        let half = map_size as i32 / 2;
+        let (hw, hh) = (width as i32 / 2, height as i32 / 2);
         let mut cities: Vec<CitySpawn> = Vec::new();
         let mut spawns = Vec::new();
         for p in 0..players {
             let (dx, dy) = DIRS[p as usize];
-            let (x, y) = nearest_land(&map, half + dx * half / 8, half + dy * half / 8).ok_or("map has no land")?;
+            let (x, y) = nearest_land(&map, hw + dx * hw / 8, hh + dy * hh / 8).ok_or("map has no land")?;
             cities.push(CitySpawn { x: x as u32, y: y as u32, owner: p + 1, capital: true, claim: 6 });
             let start = balance.match_rules.start_light_units;
             for at in army_positions(&map, x + 2, y, start) {
@@ -108,16 +127,15 @@ impl ScenarioSpec {
         }
         // Neutral cities: rejection sampling with a minimum spacing.
         // Roughly 20 cities on a 256² map; never fewer than 3 per player.
-        let spacing = (map_size as i64 / 8).clamp(16, 48);
-        let target = ((map_size as i64 / spacing).pow(2) / 3).max(players as i64 * 3) as usize;
+        let spacing = (width.min(height) as i64 / 8).clamp(16, 48);
+        let target = ((width as i64 / spacing) * (height as i64 / spacing) / 3).max(players as i64 * 3) as usize;
         let mut attempt = 0u32;
         while cities.len() < target + players as usize && attempt < 20_000 {
             let r = rand(seed, attempt, 0, Purpose::Scenario);
             attempt += 1;
             let margin = 4;
-            let span = map_size as u64 - 2 * margin;
-            let x = (margin + (r & 0xFFFF_FFFF) % span) as i32;
-            let y = (margin + (r >> 32) % span) as i32;
+            let x = (margin + (r & 0xFFFF_FFFF) % (width as u64 - 2 * margin)) as i32;
+            let y = (margin + (r >> 32) % (height as u64 - 2 * margin)) as i32;
             if !is_land(&map, x, y) {
                 continue;
             }
@@ -142,18 +160,24 @@ impl ScenarioSpec {
     /// Sandbox battle for benchmarks: generated map with `players` armies
     /// (each `units_per_player` strong, every 4th unit heavy) around the
     /// centre, each with a capital. Free-for-all teams.
-    pub fn battle(map_size: u32, units_per_player: u32, players: u8, seed: u64) -> Result<ScenarioSpec, String> {
+    pub fn battle(
+        width: u32,
+        height: u32,
+        units_per_player: u32,
+        players: u8,
+        seed: u64,
+    ) -> Result<ScenarioSpec, String> {
         if !(1..=MAX_PLAYERS as u8).contains(&players) {
             return Err(format!("players must be in 1..={MAX_PLAYERS}"));
         }
-        let source = MapSource::Generated { width: map_size, height: map_size, seed };
+        let source = MapSource::Generated { width, height, seed };
         let map = source.build()?;
-        let half = map_size as i32 / 2;
+        let (hw, hh) = (width as i32 / 2, height as i32 / 2);
         let mut spawns = Vec::new();
         let mut cities = Vec::new();
         for p in 0..players {
             let (dx, dy) = DIRS[p as usize];
-            let (cx, cy) = nearest_land(&map, half + dx * half / 8, half + dy * half / 8).ok_or("map has no land")?;
+            let (cx, cy) = nearest_land(&map, hw + dx * hw / 8, hh + dy * hh / 8).ok_or("map has no land")?;
             cities.push(CitySpawn { x: cx as u32, y: cy as u32, owner: p + 1, capital: true, claim: 4 });
             for (k, at) in army_positions(&map, cx, cy + 2, units_per_player).into_iter().enumerate() {
                 let kind = if k % 4 == 3 { UnitKind::Heavy } else { UnitKind::Light };

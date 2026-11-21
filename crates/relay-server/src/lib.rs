@@ -50,7 +50,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { tick_rate: 30, max_lobbies: 256, max_map: 1024 }
+        Config { tick_rate: 30, max_lobbies: 256, max_map: 2048 }
     }
 }
 
@@ -349,7 +349,9 @@ impl Relay {
             out.push(Out::Send(client, ServerMsg::Error("server is full".into())));
             return;
         }
-        if !(2..=8).contains(&s.slots) || !(64..=self.config.max_map).contains(&s.map_size) {
+        if !(2..=8).contains(&s.slots)
+            || ![s.width, s.height].iter().all(|v| (64..=self.config.max_map).contains(v) && v % 64 == 0)
+        {
             out.push(Out::Send(client, ServerMsg::Error("bad lobby settings".into())));
             return;
         }
@@ -470,10 +472,11 @@ impl Relay {
             return fail(out, "need at least two teams");
         }
         let s = &l.settings;
-        let mut scenario = match ScenarioSpec::standard_match(s.map_size, taken.len() as u8, s.seed, &self.balance) {
-            Ok(sc) => sc,
-            Err(e) => return fail(out, &e),
-        };
+        let mut scenario =
+            match ScenarioSpec::standard_match(s.width, s.height, taken.len() as u8, s.seed, &self.balance) {
+                Ok(sc) => sc,
+                Err(e) => return fail(out, &e),
+            };
         let mut players = Vec::new();
         let mut bots = Vec::new();
         for (k, slot) in taken.iter().enumerate() {
@@ -616,7 +619,8 @@ fn info(l: &LobbyState) -> LobbyInfo {
         name: l.name.clone(),
         humans: humans(l).count() as u8,
         open: l.slots.iter().filter(|s| s.kind == SlotKind::Open).count() as u8,
-        map_size: l.settings.map_size,
+        width: l.settings.width,
+        height: l.settings.height,
     }
 }
 

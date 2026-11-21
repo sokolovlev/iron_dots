@@ -30,7 +30,7 @@ fn golden_replays() {
     let b = Balance::default_balance();
     let mut failures = Vec::new();
     for g in GOLDEN {
-        let spec = ScenarioSpec::battle(g.map, g.units, g.players, g.seed).unwrap();
+        let spec = ScenarioSpec::battle(g.map, g.map, g.units, g.players, g.seed).unwrap();
         let r = Replay::record_scripted(&spec, &b, g.ticks).unwrap();
         let w = r.verify(&b).unwrap();
         let start = (g.units * g.players as u32) as usize;
@@ -47,7 +47,7 @@ fn golden_replays() {
 #[test]
 fn same_input_same_hashes() {
     let b = Balance::default_balance();
-    let spec = ScenarioSpec::battle(128, 80, 3, 99).unwrap();
+    let spec = ScenarioSpec::battle(128, 128, 80, 3, 99).unwrap();
     let a = Replay::record_scripted(&spec, &b, 600).unwrap();
     let c = Replay::record_scripted(&spec, &b, 600).unwrap();
     assert_eq!(a.checkpoints, c.checkpoints);
@@ -57,7 +57,7 @@ fn same_input_same_hashes() {
 #[test]
 fn replay_round_trip_and_desync_detection() {
     let b = Balance::default_balance();
-    let spec = ScenarioSpec::battle(128, 60, 2, 5).unwrap();
+    let spec = ScenarioSpec::battle(128, 128, 60, 2, 5).unwrap();
     let r = Replay::record_scripted(&spec, &b, 900).unwrap();
     let decoded = Replay::decode(&r.encode()).unwrap();
     assert_eq!(decoded, r);
@@ -93,7 +93,7 @@ fn hash_is_independent_of_thread_count() {
     let b = Balance::default_balance();
     let mut runs: Vec<(usize, Vec<u64>)> = Vec::new();
     for threads in [1, 2, 3, 4, 8, 16] {
-        let spec = ScenarioSpec::battle(256, 3000, 3, 11).unwrap();
+        let spec = ScenarioSpec::battle(256, 256, 3000, 3, 11).unwrap();
         let mut w = spec.build(&b).unwrap();
         w.set_threads(threads).unwrap();
         let mut bots: Vec<ScriptedPlayer> = (1..=3).map(ScriptedPlayer::new).collect();
@@ -122,7 +122,7 @@ fn standard_match_is_independent_of_thread_count() {
     let b = Balance::default_balance();
     let mut finals = Vec::new();
     for threads in [1, 4, 7] {
-        let spec = ScenarioSpec::standard_match(256, 4, 5, &b).unwrap();
+        let spec = ScenarioSpec::standard_match(256, 256, 4, 5, &b).unwrap();
         let mut w = spec.build(&b).unwrap();
         w.set_threads(threads).unwrap();
         let mut bots: Vec<ScriptedPlayer> = (1..=4).map(ScriptedPlayer::new).collect();
@@ -146,7 +146,9 @@ fn hash_is_independent_of_simd_level() {
     assert!(levels.contains(&Level::Scalar));
     let mut runs = Vec::new();
     for &level in &levels {
-        for scenario in [ScenarioSpec::battle(256, 3000, 3, 11).unwrap(), ScenarioSpec::front(256, 1500, 2).unwrap()] {
+        for scenario in
+            [ScenarioSpec::battle(256, 256, 3000, 3, 11).unwrap(), ScenarioSpec::front(256, 1500, 2).unwrap()]
+        {
             let mut w = scenario.build(&b).unwrap();
             w.set_simd_level(level).unwrap();
             w.set_threads(2).unwrap();

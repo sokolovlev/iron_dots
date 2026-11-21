@@ -21,7 +21,8 @@ pub type BotFactory = fn(u8, u8) -> Box<dyn Controller + Send>;
 
 #[derive(Clone, Debug)]
 pub struct Options {
-    pub map_size: u32,
+    pub width: u32,
+    pub height: u32,
     pub seed: u64,
     /// Team of each human client (6 entries for 3v3).
     pub teams: Vec<u8>,
@@ -37,7 +38,8 @@ pub struct Options {
 impl Options {
     pub fn three_vs_three(seed: u64, ticks: u32) -> Options {
         Options {
-            map_size: 256,
+            width: 448,
+            height: 256,
             seed,
             teams: vec![1, 1, 1, 2, 2, 2],
             bots: Vec::new(),
@@ -206,7 +208,7 @@ pub fn run(opts: &Options, make_bot: BotFactory) -> Result<Outcome, String> {
     let host = &clients[0];
     host.send(ClientMsg::CreateLobby {
         name: "netsim".into(),
-        settings: LobbySettings { map_size: opts.map_size, seed: opts.seed, slots },
+        settings: LobbySettings { width: opts.width, height: opts.height, seed: opts.seed, slots },
     });
     let ServerMsg::Lobby(lobby) = wait(host, Duration::from_secs(20), |m| matches!(m, ServerMsg::Lobby(_)))? else {
         unreachable!()

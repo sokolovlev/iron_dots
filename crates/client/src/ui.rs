@@ -4,6 +4,7 @@ use crate::game::{Game, MatchSettings, SPEEDS};
 use ai::Difficulty;
 use egui::{Align2, Color32, RichText};
 use sim_core::UnitKind;
+use sim_core::scenario::MAP_PRESETS;
 
 /// What the UI asks the app to do.
 pub enum UiAction {
@@ -53,14 +54,7 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
             ui.add_space(24.0);
             egui::Grid::new("settings").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                 ui.label("Map size");
-                egui::ComboBox::from_id_salt("map").selected_text(format!("{0}×{0}", m.settings.map_size)).show_ui(
-                    ui,
-                    |ui| {
-                        for s in [128, 256, 512, 1024, 2048, 4096] {
-                            ui.selectable_value(&mut m.settings.map_size, s, format!("{s}×{s}"));
-                        }
-                    },
-                );
+                map_picker(ui, "map", &mut m.settings.map, MAP_PRESETS.len());
                 ui.end_row();
                 ui.label("Opponents");
                 ui.add(egui::Slider::new(&mut m.settings.opponents, 1..=7));
@@ -110,6 +104,19 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
         });
     });
     action
+}
+
+/// Combo box over the 16:9-ish map presets (the first `count` of them).
+pub fn map_picker(ui: &mut egui::Ui, id: &str, map: &mut [u32; 2], count: usize) {
+    let label = |w: u32, h: u32| match MAP_PRESETS.iter().find(|p| p.1 == w && p.2 == h) {
+        Some((name, ..)) => format!("{name}  {w}×{h}"),
+        None => format!("{w}×{h}"),
+    };
+    egui::ComboBox::from_id_salt(id).selected_text(label(map[0], map[1])).show_ui(ui, |ui| {
+        for &(_, w, h) in &MAP_PRESETS[..count] {
+            ui.selectable_value(map, [w, h], label(w, h));
+        }
+    });
 }
 
 fn money(v: i64) -> String {

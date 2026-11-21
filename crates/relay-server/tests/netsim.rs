@@ -17,7 +17,8 @@ fn bot(player: u8, difficulty: u8) -> Box<dyn Controller + Send> {
 fn three_vs_three_on_a_bad_network() {
     let mut o = Options::three_vs_three(11, 900);
     o.tick_rate = 60;
-    o.map_size = 128;
+    o.width = 256;
+    o.height = 128;
     let r = netsim::run(&o, bot).expect("match runs");
     eprintln!("{r:?}");
     assert_eq!(r.ticks, 900);
@@ -33,7 +34,8 @@ fn bots_in_slots_run_on_every_client() {
     o.teams = vec![1, 2];
     o.bots = vec![(1, 1), (2, 2)];
     o.tick_rate = 120;
-    o.map_size = 128;
+    o.width = 256;
+    o.height = 128;
     o.network = None;
     o.reconnect = false;
     let r = netsim::run(&o, bot).expect("match runs");

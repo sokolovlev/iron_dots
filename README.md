@@ -72,13 +72,13 @@ cargo run --release -p client
 Or jump straight into a match:
 
 ```bash
-cargo run --release -p client -- --play --map 256 --opponents 1 --difficulty normal
+cargo run --release -p client -- --play --map 448x256 --opponents 1 --difficulty normal
 ```
 
-Or the sandbox (spec 2.7), 8 sides × 12 500 units on a 4096² map:
+Or the sandbox (spec 2.7), 8 sides × 12 500 units on the largest map:
 
 ```bash
-cargo run --release -p client -- --play --sandbox --map 4096 --opponents 7 --units 12500
+cargo run --release -p client -- --play --sandbox --map 4096x2304 --opponents 7 --units 12500
 ```
 
 | Action | Input |
@@ -105,6 +105,10 @@ the match ends for everyone; a dedicated server avoids that:
 ```bash
 cargo run --release -p relay-server -- --port 27960
 ```
+
+Maps are wide like the screen (close to 16:9): from Small 320×192 to
+Colossal 4096×2304. Sides are multiples of the 64-tile chunk, so exact 16:9
+starts at 1024×576. `--map` takes `WxH` or a single number for a square map.
 
 Keys are matched by physical position, so they work on any keyboard layout.
 Linux needs a Vulkan or GL driver and `libxkbcommon-x11-0` (or Wayland) at runtime.

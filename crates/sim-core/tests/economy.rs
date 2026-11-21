@@ -173,10 +173,30 @@ fn taking_capital_and_most_cities_wins() {
 #[test]
 fn standard_match_setup() {
     let b = Balance::default_balance();
-    let spec = ScenarioSpec::standard_match(256, 2, 3, &b).unwrap();
+    let spec = ScenarioSpec::standard_match(256, 256, 2, 3, &b).unwrap();
     let w = spec.build(&b).unwrap();
     assert_eq!(w.cities().iter().filter(|c| c.capital_of != 0).count(), 2);
     assert!(w.cities().len() >= 8, "only {} cities", w.cities().len());
     assert_eq!(w.units().len(), 6);
     assert_eq!(w.unit_counts()[1], 3);
+}
+
+#[test]
+fn wide_map_presets_make_fair_matches() {
+    use sim_core::scenario::MAP_PRESETS;
+    let b = Balance::default_balance();
+    for &(name, w, h) in &MAP_PRESETS[..4] {
+        for players in [2u8, 8] {
+            let spec = ScenarioSpec::standard_match(w, h, players, 1, &b).unwrap();
+            let caps: Vec<_> = spec.cities.iter().filter(|c| c.capital).collect();
+            assert_eq!(caps.len(), players as usize, "{name}");
+            // Capitals spread over the long side too, not squeezed in a square.
+            let xs = caps.iter().map(|c| c.x);
+            let span = xs.clone().max().unwrap() - xs.min().unwrap();
+            assert!(span > w / 3, "{name}: capitals span {span} of {w}");
+            let neutral = spec.cities.iter().filter(|c| !c.capital).count();
+            assert!(neutral >= 3 * players as usize, "{name}: {neutral} neutral cities");
+            spec.build(&b).unwrap();
+        }
+    }
 }
