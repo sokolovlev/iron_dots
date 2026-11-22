@@ -246,16 +246,16 @@ impl ScenarioSpec {
     pub fn front(map_size: u32, units_per_player: u32, seed: u64) -> Result<ScenarioSpec, String> {
         let map = Map::new(map_size, map_size, Terrain::Plain)?;
         let mid = map_size as i32 / 2;
-        // Rows of units 0.75 tiles apart, as long as the map allows.
-        let per_row = ((map_size as i32 - 16) * 4 / 3).max(1) as u32;
+        // Rows of units 1.5 tiles apart (touching), as long as the map allows.
+        let per_row = ((map_size as i32 - 16) * 2 / 3).max(1) as u32;
         let rows = units_per_player.div_ceil(per_row);
         let mut spawns = Vec::new();
         for p in 0..2u8 {
             for k in 0..units_per_player {
                 let (row, col) = ((k / per_row) as i32, (k % per_row) as i32);
-                let x = 8 * ONE + col * ONE * 3 / 4;
+                let x = 8 * ONE + col * ONE * 3 / 2;
                 // Player 1 above the line, player 2 below; first rows touch.
-                let dy = (row * ONE * 3 / 4) + ONE / 2;
+                let dy = (row * ONE * 3 / 2) + ONE * 3 / 4;
                 let y = if p == 0 { mid * ONE - dy } else { mid * ONE + dy };
                 let kind = if k % 4 == 3 { UnitKind::Heavy } else { UnitKind::Light };
                 spawns.push(Spawn { owner: p + 1, kind, at: FxPoint::new(Fx(x), Fx(y)) });
@@ -280,7 +280,8 @@ impl ScenarioSpec {
 /// `count` positions on dry land around tile `(cx, cy)`, spaced 0.75 tile,
 /// filled in growing square rings so armies are compact.
 fn army_positions(map: &Map, cx: i32, cy: i32, count: u32) -> Vec<FxPoint> {
-    let step = ONE * 3 / 4;
+    // One body diameter apart (separation radius 1.5).
+    let step = ONE * 3 / 2;
     let mut out = Vec::with_capacity(count as usize);
     let max_ring = (map.width().max(map.height()) as i32) * 2;
     let land = |x: i32, y: i32| {

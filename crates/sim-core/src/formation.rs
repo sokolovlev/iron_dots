@@ -10,8 +10,9 @@ use crate::fx::{FxPoint, ONE, isqrt_u64};
 use crate::unit::UnitStore;
 use std::collections::BTreeMap;
 
-/// Distance between neighbouring slots (1.25 tiles, raw Q16.16).
-pub const SPACING: i64 = (ONE as i64) * 5 / 4;
+/// Distance between neighbouring slots (1.6 tiles, raw Q16.16): bodies
+/// are 1.5 tiles across.
+pub const SPACING: i64 = (ONE as i64) * 8 / 5;
 
 /// `(columns, ranks)` for `n` units.
 fn shape(f: Formation, n: i64) -> (i64, i64) {

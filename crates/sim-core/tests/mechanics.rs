@@ -333,3 +333,28 @@ fn line_formation_faces_the_target() {
     let cx = ps.iter().map(|p| p.0 as i64).sum::<i64>() / 16 / ONE as i64;
     assert!((38..=42).contains(&cx), "centred on the target: {cx}");
 }
+
+#[test]
+fn in_contact_units_can_only_move_away() {
+    // Enemy B touches A from below (centres 1.6 apart). Moving along the
+    // tangent or into A it stays put; straight away it walks off.
+    let run = |to: FxPoint| {
+        let mut w = world(plain());
+        w.spawn(1, UnitKind::Light, FxPoint::new(Fx(30 * ONE), Fx(30 * ONE))).unwrap();
+        let b = w.spawn(2, UnitKind::Light, FxPoint::new(Fx(30 * ONE), Fx(30 * ONE + ONE * 8 / 5))).unwrap();
+        let start = pos(&w, b);
+        for t in 0..TPS {
+            let c = mv(t, 2, 0, &[b], &[to]);
+            w.step(if t == 0 { std::slice::from_ref(&c) } else { &[] });
+        }
+        let end = pos(&w, b);
+        // Displacement in thousandths of a tile.
+        ((end.0 - start.0) as i64 * 1000 / ONE as i64, (end.1 - start.1) as i64 * 1000 / ONE as i64)
+    };
+    let (dx, _) = run(FxPoint::new(Fx(50 * ONE), Fx(31 * ONE + ONE * 3 / 5)));
+    assert!(dx.abs() < 200, "slid along the tangent by {dx}‰");
+    let (_, dy) = run(FxPoint::new(Fx(30 * ONE), Fx(20 * ONE)));
+    assert!(dy > -200, "pushed through head-on by {dy}‰");
+    let (_, dy) = run(FxPoint::new(Fx(30 * ONE), Fx(50 * ONE)));
+    assert!(dy > 500, "could not back away: {dy}‰");
+}

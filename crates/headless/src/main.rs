@@ -385,8 +385,15 @@ fn play_match(o: &Opts, b: &Balance) -> Result<(), String> {
             for p in 1..=w.player_count() {
                 let cities = w.cities().iter().filter(|c| c.owner == p).count();
                 let (used, limit) = w.supply_totals(p);
+                let u = w.units();
+                let mine = (0..u.len()).filter(|&i| u.owner[i] == p);
+                let (mut idle, mut fight) = (0, 0);
+                for i in mine {
+                    idle += (u.order[i] == sim_core::unit::NO_ORDER) as u32;
+                    fight += (u.flags[i] & sim_core::unit::flags::IN_COMBAT != 0) as u32;
+                }
                 line += &format!(
-                    "  p{p} cities {cities:>2} units {:>3} money {:>5} supply {used}/{limit}",
+                    "  p{p} cities {cities:>2} units {:>3} (idle {idle:>3} fighting {fight:>3}) money {:>5} supply {used}/{limit}",
                     counts[p as usize],
                     w.player(p).money / 1000
                 );

@@ -11,8 +11,9 @@
 
     unit: (
         max_hp: 100,
-        // Soft push between dots so they don't pass through each other. proposal
-        separation_radius: "0.6",
+        // Distance between the centres of two touching units: dots are solid
+        // bodies 1.5 tiles across and are pushed apart when closer. proposal
+        separation_radius: "1.5",
         // Speed multiplier while in contact with an enemy. proposal
         engaged_speed: "0.5",
         light: (speed: "2.0", atk: "1.0", def: "1.0", supply: 1, cost: 200, upkeep: "1"),
@@ -21,7 +22,8 @@
 
     combat: (
         // Also the spatial grid cell size.
-        contact_radius: "1.5",
+        // Units fight when their centres are this close: touching bodies.
+        contact_radius: "1.75",
         // HP/s; a duel of two equal light units without morale lasts ~15 s.
         base_dps: "9.2",
         // Damage multiplier taken by the attacking side. proposal

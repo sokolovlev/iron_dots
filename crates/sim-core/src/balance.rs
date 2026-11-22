@@ -166,7 +166,7 @@ impl Balance {
         if !(1..=655).contains(&self.morale.max) {
             return Err("morale.max must be in [1, 655]".into());
         }
-        range("unit.separation_radius", self.unit.separation_radius, 0, 1_000)?;
+        range("unit.separation_radius", self.unit.separation_radius, 0, 4_000)?;
         range("unit.engaged_speed", self.unit.engaged_speed, 0, 1_000)?;
         for (n, u) in [("light", &self.unit.light), ("heavy", &self.unit.heavy)] {
             range(&format!("unit.{n}.speed"), u.speed, 0, 20_000)?;
@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_values() {
-        let bad = DEFAULT_BALANCE_RON.replace("contact_radius: \"1.5\"", "contact_radius: \"100\"");
+        let bad = DEFAULT_BALANCE_RON.replace("contact_radius: \"1.75\"", "contact_radius: \"100\"");
         assert!(Balance::from_ron(&bad).unwrap_err().contains("contact_radius"));
         let float = DEFAULT_BALANCE_RON.replace("base_dps: \"9.2\"", "base_dps: 9.2");
         assert!(Balance::from_ron(&float).is_err());

@@ -127,7 +127,9 @@ const QUAD = array<vec2<f32>, 6>(
 @vertex
 fn vs_marker(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32, m: Marker) -> MarkerOut {
     let shape = (m.info >> 8u) & 3u;
-    var radius = max(0.9, 8.0 / cam.scale);
+    // Exactly the body radius (half of unit.separation_radius), so touching
+    // units touch on screen and never overlap.
+    var radius = max(0.75, 2.0 / cam.scale);
     if (shape != 0u) {
         radius = max(1.1, 10.0 / cam.scale);
     }

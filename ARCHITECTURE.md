@@ -191,6 +191,19 @@ Stage 2 had to pin down details that spec §2 describes only in words:
   (two wings). Facing is from the group's centre to the first path point;
   the units furthest forward fill the front rank, left to right, so paths
   rarely cross (`sim_core::formation`).
+- **Solid bodies** (changed after playtesting): a unit is a disc 1.5 tiles
+  across (`unit.separation_radius` is the centre distance of touching
+  units); overlapping units are pushed apart by up to a quarter diameter per
+  tick, and the renderer draws exactly that disc, so dots never overlap on
+  screen. Units fight when their centres are within `combat.contact_radius`
+  (1.75): touching. Starting armies and formation slots are spaced to fit.
+- **Movement in contact:** a unit touching enemies can only move away from
+  them. For each enemy it touches, its speed is multiplied by
+  max(0, cos θ), θ being the angle between its heading and the direction
+  straight away from that enemy (equivalently sin of the angle to the
+  tangent); the smallest factor wins. Head-on or along the tangent it stays
+  put, straight back it walks at the engaged speed. So an attacker cannot
+  slide past a defender it has touched.
 - **Upkeep and income** are settled once per second. A unit is "in a city"
   (no upkeep, double healing) inside the city's 3×3 tiles.
 - **Healing** needs 3 s out of combat, no starvation, friendly land, and not
@@ -370,12 +383,17 @@ bots weaker (they reached the target one at a time), hence the separate
 strategy period.
 
 Measured with `headless aieval` (100 matches per pairing, both sides of
-each map, unseen seeds):
+each map, unseen seeds), with control zones but before solid bodies and
+contact movement:
 
 | Pairing | Small 320×192 | Medium 448×256 |
 |---|---|---|
 | Normal vs Easy | 86% | 89% |
 | Hard vs Normal | 71% | 79% |
+
+With solid bodies and contact movement (sim version 8) the bots are not
+retuned yet: Normal vs Easy 49% / 57%, Hard vs Normal 64% / 63%. Matches
+also last longer. Retuning waits until the rules settle after playtesting.
 
 A fixed 10-match sample runs in `cargo test` as a regression guard. Heavy
 units still make bots weaker, so bots buy light units only.

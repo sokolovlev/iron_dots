@@ -139,6 +139,20 @@ impl Hood {
     }
 }
 
+/// Result of the separation pass for one unit: its push away from
+/// overlapping neighbours, and the directions away from the enemies it
+/// touches (unit vectors, Q14), which limit how it may move in contact.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sep {
+    push: (i32, i32),
+    away: [(i16, i16); MAX_CONTACT_NORMALS],
+    n: u8,
+}
+
+/// Enemies in contact whose direction limits movement (the nearest ones in
+/// grid order; four cover every practical case of being surrounded).
+const MAX_CONTACT_NORMALS: usize = 4;
+
 /// Tick phases as reported to the probe of [`World::step_with`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
@@ -260,7 +274,7 @@ pub struct World {
     /// SIMD kernel table (chosen once per process; tests may pick a level).
     kernels: &'static Kernels,
     // Per-unit results computed in grid order.
-    push_sorted: Vec<(i32, i32)>,
+    push_sorted: Vec<Sep>,
     strike: Vec<u64>,
     contacts_sorted: Vec<u16>,
     dmg_sorted: Vec<u32>,
@@ -781,7 +795,7 @@ impl World {
         let slots = (formation != Formation::Keep && idx.len() > 1)
             .then(|| crate::formation::offsets(&self.units, idx, (cx, cy), path[0], formation));
         // Keep the formation, but not wider than ~ (1 + sqrt(n)/2) tiles.
-        let cap = ONE as i64 + (isqrt_u64(n as u64) as i64) * (ONE as i64) / 2;
+        let cap = ONE as i64 + (isqrt_u64(n as u64) as i64) * (ONE as i64);
         let new_order = self.orders.alloc_via(path, via, NO_ORDER);
         let mut queued_copies: BTreeMap<(u32, u8), u32> = BTreeMap::new();
         for &i in idx {
@@ -847,19 +861,22 @@ impl World {
 
     // ---------------------------------------------------------------- phase 4-5
 
-    /// Soft separation push for unit `i` (capped), pulled from neighbours'
-    /// start-of-tick positions in `hood`.
+    /// Separation push for unit `i` (capped), pulled from neighbours'
+    /// start-of-tick positions in `hood`, and the directions away from the
+    /// enemies it touches (within the contact radius).
     #[inline]
-    fn separation_of(&self, i: usize, hood: &Hood) -> (i32, i32) {
+    fn separation_of(&self, i: usize, hood: &Hood) -> Sep {
         let r = self.rules.separation_radius.0 as i64;
-        if r == 0 {
-            return (0, 0);
-        }
-        let r2 = r * r;
-        let cap = (r / 8).max(1);
+        let c = self.rules.contact_radius.0 as i64;
+        let reach = r.max(c);
+        let r2 = reach * reach;
+        // Bodies are solid: a strong push, a quarter of the body diameter.
+        let cap = (r / 4).max(1);
         let u = &self.units;
         let (x, y) = (u.pos_x[i], u.pos_y[i]);
+        let my_team = self.team[u.owner[i] as usize];
         let (mut px, mut py) = (0i64, 0i64);
+        let mut sep = Sep::default();
         hood.query(self.kernels, x, y, r2, None, |h| {
             let j = hood.ids[h] as usize;
             if j == i {
@@ -869,6 +886,13 @@ impl World {
             let d2 = dist2(jx, jy, x, y);
             let (mut dx, mut dy) = ((x - jx) as i64, (y - jy) as i64);
             let dist = isqrt_u64(d2 as u64) as i64;
+            if hood.teams[h] != my_team && dist > 0 && (sep.n as usize) < MAX_CONTACT_NORMALS && dist < c {
+                sep.away[sep.n as usize] = ((dx * 16_384 / dist) as i16, (dy * 16_384 / dist) as i16);
+                sep.n += 1;
+            }
+            if dist >= r {
+                return;
+            }
             let mut d = dist;
             if d == 0 {
                 // Same spot: split along a direction derived from the
@@ -895,15 +919,15 @@ impl World {
             px = px * cap / len;
             py = py * cap / len;
         }
-        (px as i32, py as i32)
+        sep.push = (px as i32, py as i32);
+        sep
     }
 
     /// Separation (phase 5a): push of every unit, computed in grid order.
     fn phase_separation(&mut self) {
         let mut push = take(&mut self.push_sorted);
-        push.resize(self.units.len(), (0, 0));
-        let separation = self.rules.separation_radius.0 > 0;
-        self.par_by_grid(&mut push, |_| separation, |i, hood| hood.map_or((0, 0), |h| self.separation_of(i, h)));
+        push.resize(self.units.len(), Sep::default());
+        self.par_by_grid(&mut push, |_| true, |i, hood| hood.map_or(Sep::default(), |h| self.separation_of(i, h)));
         self.push_sorted = push;
     }
 
@@ -1027,7 +1051,24 @@ impl World {
                         };
                         // Walk, pushed by neighbours; impassable tiles: slide
                         // along an axis, otherwise stay.
-                        let (ppx, ppy) = this.push_sorted[this.grid.rank[i] as usize];
+                        let sep = &this.push_sorted[this.grid.rank[i] as usize];
+                        let (ppx, ppy) = sep.push;
+                        // In contact, a unit can only move away from the
+                        // enemies it touches: speed × cos of the angle to
+                        // the direction straight away from each (sin of the
+                        // angle to the tangent); head-on or along the
+                        // tangent it stays put. The tightest contact wins.
+                        let (vx, vy) = if sep.n > 0 && (vx, vy) != (0, 0) {
+                            let len = length(vx, vy).max(1) as i64;
+                            let mut f = 16_384i64;
+                            for &(ax, ay) in &sep.away[..sep.n as usize] {
+                                let dot = (vx as i64 * ax as i64 + vy as i64 * ay as i64) / len;
+                                f = f.min(dot.max(0));
+                            }
+                            (((vx as i64 * f) >> 14) as i32, ((vy as i64 * f) >> 14) as i32)
+                        } else {
+                            (vx, vy)
+                        };
                         let nx = (x as i64 + vx as i64 + ppx as i64).clamp(0, max_x as i64) as i32;
                         let ny = (y as i64 + vy as i64 + ppy as i64).clamp(0, max_y as i64) as i32;
                         let pass = |x: i32, y: i32| {
