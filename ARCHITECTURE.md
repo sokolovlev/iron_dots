@@ -201,8 +201,8 @@ Stage 2 had to pin down details that spec §2 describes only in words:
   (`ScenarioSpec::limited_war(n)`): every neutral city goes to the player
   whose capital is nearest, so each side starts with its half of the map and
   a front between; every city gets a light defender; each team may create
-  `n` units in the whole match (`World::unit_budget`), purchases only, and
-  empty cities raise nothing. A player with no units and nothing left to
+  `n` units in the whole match (`World::unit_budget`), counting purchases
+  and units raised by empty cities alike. A player with no units and nothing left to
   create is out. Lobbies carry the mode (`LobbySettings::unit_budget`).
 - **Positions** (client helper, `client::fronts`): the player draws a curve;
   places every 1.6 tiles along it (none on impassable tiles) are taken by

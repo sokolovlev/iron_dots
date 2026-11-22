@@ -38,8 +38,8 @@ pub struct ScenarioSpec {
     pub spawns: Vec<Spawn>,
     /// Sandbox rules (spec 2.7): unbounded supply, no upkeep.
     pub sandbox: bool,
-    /// Limited war: units each team may create in the whole match
-    /// (`None` = war of attrition, cities raise units without limit).
+    /// Limited war: units each team may create in the whole match, bought
+    /// or raised by empty cities (`None` = war of attrition, no limit).
     #[serde(default)]
     pub unit_budget: Option<u32>,
 }

@@ -167,7 +167,7 @@ fn single_player(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                         (
                             GameMode::Limited { units: limited_units },
                             "Limited war",
-                            "The map is split in half from the start, with a front between.\nEvery city has a defender, and each side may create only so many units.",
+                            "The map is split in half from the start, with a front between.\nEvery city has a defender, and each side may create only so many units, bought or raised.",
                         ),
                     ] {
                         let on = std::mem::discriminant(&m.settings.mode) == std::mem::discriminant(&mode);

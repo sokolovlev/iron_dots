@@ -135,7 +135,9 @@ captured, and units in cities cost no upkeep.
 attrition*: everyone starts from a capital, empty cities keep raising units
 while you can pay. *Limited war*: the cities are split between the sides
 from the start, with a front between them; every city has a defender, and
-each side may create only N units in the whole match (shown in the HUD). The
+each side may create only N units in the whole match (shown in the HUD);
+empty cities raise units in both modes, and in a limited war each one counts
+against N. The
 same choice is offered when creating an online lobby.
 
 **Positions.** Press F (or *Draw a front* in the Positions panel, bottom

@@ -542,8 +542,8 @@ impl World {
     }
 
     /// Limited war: every team may create `n` more units in the whole
-    /// match (purchases only; empty cities do not raise units). `None` is
-    /// the usual war of attrition.
+    /// match, bought or raised by empty cities. `None` is the usual war of
+    /// attrition.
     pub fn set_unit_budget(&mut self, n: Option<u32>) {
         self.team_budget = [n; 8];
     }
@@ -1885,8 +1885,7 @@ impl World {
                 city.empty_ticks = 0;
             }
         }
-        // Only in a war of attrition (no unit budget).
-        if self.sandbox || self.team_budget.iter().any(|b| b.is_some()) {
+        if self.sandbox {
             return;
         }
         for c in raise {
@@ -1902,10 +1901,16 @@ impl World {
             let need = self.rules.supply[kind as usize];
             let owner = self.cities[c].owner;
             let cost = self.rules.cost[kind as usize];
+            // In a limited war it also uses up the team's unit budget.
+            let t = self.team_bit[owner as usize].trailing_zeros() as usize;
             if self.pocket_used[p as usize] + need > self.pocket_limit[p as usize]
                 || self.player[owner as usize].money < cost
+                || self.team_budget[t] == Some(0)
             {
                 continue;
+            }
+            if let Some(b) = &mut self.team_budget[t] {
+                *b -= 1;
             }
             self.pocket_used[p as usize] += need;
             self.player[owner as usize].money -= cost;

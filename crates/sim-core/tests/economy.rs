@@ -326,13 +326,27 @@ fn limited_war_splits_the_map_and_counts_units() {
     assert!((ones - twos).abs() * 4 <= ones + twos, "roughly halves: {ones} vs {twos}");
     let mut w = spec.build(&b).unwrap();
     assert_eq!(w.unit_budget(1), Some(2));
-    let units = w.units().len();
-    // Empty cities raise nothing here; purchases use up the budget.
-    run(&mut w, &[], 30 * TPS);
-    assert_eq!(w.units().len(), units);
     let cap = w.cities().iter().position(|c| c.capital_of == 1).unwrap() as u16;
+    run(&mut w, &[], 10 * TPS); // money; every city has a defender
+    assert_eq!(w.unit_budget(1), Some(2));
+    // Purchases use up the budget…
     let buys: Vec<Command> = (0..3).map(|k| buy(w.tick(), 1, k, cap, UnitKind::Light)).collect();
     w.step(&buys);
     assert_eq!(w.unit_budget(1), Some(0));
     assert_eq!(w.stats().commands_rejected, 1, "the third is over budget");
+    // …and so do units raised by empty cities, which stop at zero.
+    let two_budget = ScenarioSpec::standard_match(320, 192, 2, 3, &b).unwrap().limited_war(2);
+    let mut w = two_budget.build(&b).unwrap();
+    let units = w.units().len();
+    // Empty a city: send its defender away; it raises a replacement.
+    let city = w.cities().iter().position(|c| c.owner == 1 && c.capital_of == 0).unwrap();
+    let (cx, cy) = (w.cities()[city].x as i32, w.cities()[city].y as i32);
+    let defender = (0..w.units().len())
+        .find(|&i| w.units().pos_x[i] >> 16 == cx && w.units().pos_y[i] >> 16 == cy)
+        .map(|i| w.units().handle(i))
+        .unwrap();
+    let away = [mv(0, 1, &[defender], pt(cx, (cy + 20).min(180)))];
+    run(&mut w, &away, 15 * TPS);
+    assert_eq!(w.units().len(), units + 1, "the empty city raised a unit");
+    assert_eq!(w.unit_budget(1), Some(1));
 }
