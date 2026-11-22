@@ -70,7 +70,7 @@ impl Default for OnlineMenu {
             hosting: None,
             scanner: None,
             lan: Vec::new(),
-            new_lobby: LobbySettings { width: 320, height: 192, seed: 1, slots: 2, map: None },
+            new_lobby: LobbySettings { width: 320, height: 192, seed: 1, slots: 2, map: None, unit_budget: None },
             new_map: None,
             maps: Vec::new(),
             lobby_name: "Iron Dots".into(),
@@ -361,6 +361,23 @@ impl OnlineMenu {
                 let maps: Vec<_> = self.maps.iter().filter(|m| m.width <= 2048).cloned().collect();
                 crate::ui::map_choice(ui, "omapfile", &maps, &mut self.new_map);
                 ui.end_row();
+                ui.label("Mode");
+                ui.horizontal(|ui| {
+                    let mut limited = self.new_lobby.unit_budget.is_some();
+                    ui.selectable_value(&mut limited, false, "War of attrition");
+                    ui.selectable_value(&mut limited, true, "Limited war");
+                    match (limited, self.new_lobby.unit_budget) {
+                        (true, None) => self.new_lobby.unit_budget = Some(150),
+                        (false, Some(_)) => self.new_lobby.unit_budget = None,
+                        _ => {}
+                    }
+                });
+                ui.end_row();
+                if let Some(n) = &mut self.new_lobby.unit_budget {
+                    ui.label("Units per side");
+                    ui.add(egui::Slider::new(n, 10..=1000).logarithmic(true));
+                    ui.end_row();
+                }
                 if let Some(m) = &self.new_map {
                     ui.label("Slots");
                     ui.weak(format!("{} ({} starts)", m.mode(), m.players()));
@@ -387,6 +404,11 @@ impl OnlineMenu {
         let host = l.host == me;
         ui.label(RichText::new(&l.name).size(20.0).strong());
         let lan = self.hosting.as_ref().map(|h| format!("  ·  LAN, port {}", h.relay.addr.port())).unwrap_or_default();
+        let mode = match l.settings.unit_budget {
+            Some(n) => format!("limited war, {n} units per side  ·  "),
+            None => "war of attrition  ·  ".to_string(),
+        };
+        ui.weak(mode);
         let map = match &l.settings.map {
             Some(m) => format!("map {} {}×{}", m.name, l.settings.width, l.settings.height),
             None => format!("random map {}×{}, seed {}", l.settings.width, l.settings.height, l.settings.seed),

@@ -24,10 +24,11 @@ pub enum Action {
     CameraUp,
     CameraDown,
     Fullscreen,
+    DrawFront,
 }
 
 impl Action {
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 14] = [
         Action::Stop,
         Action::ClearQueue,
         Action::BuyLight,
@@ -41,6 +42,7 @@ impl Action {
         Action::CameraUp,
         Action::CameraDown,
         Action::Fullscreen,
+        Action::DrawFront,
     ];
 
     pub fn label(self) -> &'static str {
@@ -58,6 +60,7 @@ impl Action {
             Action::CameraUp => "Camera up",
             Action::CameraDown => "Camera down",
             Action::Fullscreen => "Full screen / window",
+            Action::DrawFront => "Draw a front (positions)",
         }
     }
 
@@ -76,6 +79,7 @@ impl Action {
             Action::CameraUp => KeyCode::ArrowUp,
             Action::CameraDown => KeyCode::ArrowDown,
             Action::Fullscreen => KeyCode::F11,
+            Action::DrawFront => KeyCode::KeyF,
         }
     }
 }

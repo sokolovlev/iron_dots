@@ -21,8 +21,8 @@ struct Golden {
 }
 
 const GOLDEN: &[Golden] = &[
-    Golden { name: "duel-128", map: 128, units: 200, players: 2, seed: 1, ticks: 2400, hash: 0xd187_7913_97bc_a278 },
-    Golden { name: "ffa4-128", map: 128, units: 100, players: 4, seed: 7, ticks: 2400, hash: 0x4fda_f307_bf62_dad1 },
+    Golden { name: "duel-128", map: 128, units: 200, players: 2, seed: 1, ticks: 2400, hash: 0x0528_ec2e_83dc_1d5f },
+    Golden { name: "ffa4-128", map: 128, units: 100, players: 4, seed: 7, ticks: 2400, hash: 0x9f2c_6cde_9209_b717 },
 ];
 
 #[test]

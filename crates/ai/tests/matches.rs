@@ -32,7 +32,7 @@ fn duel_reaches_victory_and_replays_exactly() {
     // Golden hash: bots + simulation must give the same match on every
     // platform (CI runs this on Linux, Windows, macOS and ARM64). Update it
     // together with SIM_CODE_VERSION when gameplay or bots change on purpose.
-    assert_eq!(r.final_hash(), Some(0x993f_fc91_43c1_a1fe), "golden AI match changed");
+    assert_eq!(r.final_hash(), Some(0x868b_9ea3_d383_c620), "golden AI match changed");
 }
 
 #[test]

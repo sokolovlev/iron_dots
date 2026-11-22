@@ -1,6 +1,6 @@
 //! egui screens: main menu, HUD, city panel, pause menu, end of match.
 
-use crate::game::{Game, MatchSettings, SPEEDS};
+use crate::game::{Game, GameMode, MatchSettings, SPEEDS};
 use ai::Difficulty;
 use egui::{Align2, Color32, RichText};
 use sim_core::UnitKind;
@@ -25,12 +25,22 @@ pub struct Menu {
     pub online: crate::online::OnlineMenu,
     /// Built-in maps, then the player's own.
     pub maps: Vec<std::sync::Arc<crate::maps::MapEntry>>,
+    /// The "Play vs AI" page is open.
+    pub single_open: bool,
+    /// Last unit budget chosen for a limited war.
+    pub limited_units: u32,
 }
 
 impl Default for Menu {
     fn default() -> Self {
-        let mut m =
-            Menu { settings: MatchSettings::default(), error: None, online: Default::default(), maps: Vec::new() };
+        let mut m = Menu {
+            settings: MatchSettings::default(),
+            error: None,
+            online: Default::default(),
+            maps: Vec::new(),
+            single_open: false,
+            limited_units: 150,
+        };
         m.reload_maps();
         m
     }
@@ -96,14 +106,101 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
         });
         return action;
     }
+    if m.single_open {
+        return single_player(root, m);
+    }
     egui::CentralPanel::default().show(root, |ui| {
         ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.2);
+            ui.add_space(ui.available_height() * 0.25);
             ui.label(RichText::new("IRON DOTS").size(48.0).strong());
             ui.label("minimalist real-time strategy");
+            ui.add_space(32.0);
+            if ui.button(RichText::new("  Play vs AI  ").size(20.0)).clicked() {
+                m.single_open = true;
+            }
+            ui.add_space(8.0);
+            if ui.button(RichText::new("  Online  ").size(20.0)).clicked() {
+                m.online.open = true;
+            }
+            ui.add_space(8.0);
+            if ui.button("Map editor").clicked() {
+                action = UiAction::OpenEditor;
+            }
+            if ui.button("Settings").clicked() {
+                action = UiAction::OpenSettings;
+            }
+            if ui.button("Quit").clicked() {
+                action = UiAction::Quit;
+            }
+            if let Some(e) = &m.error {
+                ui.colored_label(Color32::LIGHT_RED, e);
+            }
             ui.add_space(24.0);
+            ui.weak("Replay viewer and tutorial arrive in later updates.");
+        });
+    });
+    action
+}
+
+/// "Play vs AI": game mode, then the match settings.
+fn single_player(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
+    let mut action = UiAction::None;
+    egui::CentralPanel::default().show(root, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.1);
+            ui.label(RichText::new("PLAY VS AI").size(32.0).strong());
+            ui.add_space(16.0);
+            ui.label(RichText::new("Game mode").strong());
+            ui.add_space(6.0);
+            let limited_units = match m.settings.mode {
+                GameMode::Limited { units } => units,
+                GameMode::Attrition => m.limited_units,
+            };
+            crate::ui::centered(ui, 640.0, |ui| {
+                ui.horizontal(|ui| {
+                    for (mode, title, text) in [
+                        (
+                            GameMode::Attrition,
+                            "War of attrition",
+                            "Start from your capital. Empty cities keep raising units for as long as\nyou can pay: the war goes on until one side breaks.",
+                        ),
+                        (
+                            GameMode::Limited { units: limited_units },
+                            "Limited war",
+                            "The map is split in half from the start, with a front between.\nEvery city has a defender, and each side may create only so many units.",
+                        ),
+                    ] {
+                        let on = std::mem::discriminant(&m.settings.mode) == std::mem::discriminant(&mode);
+                        let fill = if on { Color32::from_rgb(30, 70, 110) } else { Color32::from_rgb(34, 37, 42) };
+                        let r = egui::Frame::new()
+                            .fill(fill)
+                            .corner_radius(6.0)
+                            .inner_margin(12.0)
+                            .show(ui, |ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_width(290.0);
+                                    ui.label(RichText::new(title).size(18.0).strong());
+                                    ui.add_space(4.0);
+                                    ui.label(text.replace('\n', " "));
+                                });
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        if r.clicked() {
+                            m.settings.mode = mode;
+                        }
+                    }
+                });
+            });
+            ui.add_space(12.0);
             crate::ui::centered(ui, 420.0, |ui| {
                 egui::Grid::new("settings").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                    if let GameMode::Limited { units } = &mut m.settings.mode {
+                        ui.label("Units per side");
+                        ui.add(egui::Slider::new(units, 10..=1000).logarithmic(true));
+                        m.limited_units = *units;
+                        ui.end_row();
+                    }
                     ui.label("Map");
                     map_choice(ui, "mapfile", &m.maps, &mut m.settings.map_file);
                     ui.end_row();
@@ -128,48 +225,41 @@ pub fn main_menu(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                         }
                     });
                     ui.end_row();
+                    let attrition = m.settings.mode == GameMode::Attrition;
                     if m.settings.map_file.is_none() {
                         ui.label("Map seed");
                         ui.add(egui::DragValue::new(&mut m.settings.seed));
                         ui.end_row();
-                        ui.label("Sandbox");
-                        ui.checkbox(&mut m.settings.sandbox, "huge armies, no upkeep or supply limits");
-                        ui.end_row();
+                        if attrition {
+                            ui.label("Sandbox");
+                            ui.checkbox(&mut m.settings.sandbox, "huge armies, no upkeep or supply limits");
+                            ui.end_row();
+                        }
                     }
-                    if m.settings.sandbox && m.settings.map_file.is_none() {
+                    if m.settings.sandbox && m.settings.map_file.is_none() && attrition {
                         ui.label("Units per side");
                         ui.add(egui::Slider::new(&mut m.settings.units_per_player, 100..=12_500).logarithmic(true));
-                        ui.end_row();
-                        let total = m.settings.units_per_player as u64 * (m.settings.opponents as u64 + 1);
-                        ui.label("");
-                        ui.weak(format!("{total} units in total"));
                         ui.end_row();
                     }
                 });
             });
             ui.add_space(16.0);
-            if ui.button(RichText::new("  Play vs AI  ").size(20.0)).clicked() {
-                action = UiAction::StartMatch(m.settings.clone());
-            }
-            ui.add_space(8.0);
-            if ui.button(RichText::new("  Online  ").size(20.0)).clicked() {
-                m.online.open = true;
-            }
-            ui.add_space(8.0);
-            if ui.button("Map editor").clicked() {
-                action = UiAction::OpenEditor;
-            }
-            if ui.button("Settings").clicked() {
-                action = UiAction::OpenSettings;
-            }
-            if ui.button("Quit").clicked() {
-                action = UiAction::Quit;
-            }
+            ui.horizontal(|ui| {
+                ui.add_space((ui.available_width() - 220.0).max(0.0) / 2.0);
+                if ui.button(RichText::new("  Start  ").size(20.0)).clicked() {
+                    let mut s = m.settings.clone();
+                    if s.mode != GameMode::Attrition {
+                        s.sandbox = false;
+                    }
+                    action = UiAction::StartMatch(s);
+                }
+                if ui.button(RichText::new("  Back  ").size(20.0)).clicked() {
+                    m.single_open = false;
+                }
+            });
             if let Some(e) = &m.error {
                 ui.colored_label(Color32::LIGHT_RED, e);
             }
-            ui.add_space(24.0);
-            ui.weak("Replay viewer and tutorial arrive in later updates.");
         });
     });
     action
@@ -229,6 +319,11 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                 ui.colored_label(supply_col, format!("Supply {used}/{limit}"));
                 ui.separator();
                 ui.label(format!("Cities {mine}/{total} ({share}% of {goal}%)"));
+                if let Some(b) = w.unit_budget(me) {
+                    ui.separator();
+                    let col = if b == 0 { Color32::LIGHT_RED } else { ui.visuals().text_color() };
+                    ui.colored_label(col, format!("Units left to create {b}"));
+                }
                 if st.broke {
                     ui.separator();
                     ui.colored_label(Color32::LIGHT_RED, "Treasury empty: troops starve");
@@ -244,6 +339,34 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                 None => format!("×{}", SPEEDS[g.speed]),
             };
             ui.weak(format!("{}:{:02}  {speed}  ·  {} selected", secs / 60, secs % 60, g.selection.len()));
+        });
+    });
+
+    // Positions: draw fronts that units hold and refill from the cities.
+    egui::Area::new(egui::Id::unique("positions")).anchor(Align2::LEFT_BOTTOM, [8.0, -8.0]).show(ctx, |ui| {
+        hud_frame(ui).show(ui, |ui| {
+            ui.label(RichText::new("Positions").strong());
+            let text = if g.front_tool { "Drawing: drag with the left button…" } else { "Draw a front  [F]" };
+            if ui.selectable_label(g.front_tool, text).clicked() {
+                g.front_tool = !g.front_tool;
+                g.front_draft = None;
+            }
+            let mut remove = None;
+            for (k, f) in g.fronts.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Front {}: {}/{} held", k + 1, f.filled(g.world.units()), f.places.len()));
+                    if ui.small_button("remove").clicked() {
+                        remove = Some(k);
+                    }
+                });
+            }
+            if let Some(k) = remove {
+                g.fronts.remove(k);
+            }
+            if g.fronts.is_empty() && !g.front_tool {
+                ui.weak("Selected units (or the nearest) take the places;");
+                ui.weak("idle units in your cities fill the empty ones.");
+            }
         });
     });
 

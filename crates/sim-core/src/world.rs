@@ -292,6 +292,9 @@ pub struct World {
     /// Chunks with any city zone.
     chunk_city: Vec<bool>,
     city_plane_dirty: bool,
+    /// Units each team may still create (index = bit of `team_bit`);
+    /// `None` = no limit (war of attrition).
+    team_budget: [Option<u32>; 8],
     /// Supply corridors per team (index = bit of `team_bit`).
     corridors: Vec<territory::Corridors>,
     /// Player bits of the corridor cells drawn as own land.
@@ -393,6 +396,7 @@ impl World {
             city_plane: vec![0; tiles],
             chunk_city: vec![false; chunks],
             city_plane_dirty: true,
+            team_budget: [None; 8],
             corridors: Vec::new(),
             corridor_marks: Vec::new(),
             chunk_corridor: vec![false; chunks],
@@ -535,6 +539,18 @@ impl World {
     /// starve, and there is no upkeep.
     pub fn set_sandbox(&mut self, on: bool) {
         self.sandbox = on;
+    }
+
+    /// Limited war: every team may create `n` more units in the whole
+    /// match (purchases only; empty cities do not raise units). `None` is
+    /// the usual war of attrition.
+    pub fn set_unit_budget(&mut self, n: Option<u32>) {
+        self.team_budget = [n; 8];
+    }
+
+    /// Units `player`'s team may still create (`None` = unlimited).
+    pub fn unit_budget(&self, player: u8) -> Option<u32> {
+        self.team_budget[self.team_bit[player as usize].trailing_zeros() as usize]
     }
 
     /// Adds a city (match setup). Its tile becomes [`Terrain::City`] owned by
@@ -823,6 +839,9 @@ impl World {
         if self.cities[city].capture_by != 0 {
             return false;
         }
+        if self.unit_budget(player) == Some(0) {
+            return false;
+        }
         let cost = self.rules.cost[kind as usize];
         if self.player[player as usize].money < cost {
             return false;
@@ -843,6 +862,10 @@ impl World {
         self.pocket_used[p as usize] += need;
         self.player[player as usize].money -= cost;
         self.pending_spawns.push((player, kind, city as u16));
+        let t = self.team_bit[player as usize].trailing_zeros() as usize;
+        if let Some(b) = &mut self.team_budget[t] {
+            *b -= 1;
+        }
         true
     }
 
@@ -1862,7 +1885,8 @@ impl World {
                 city.empty_ticks = 0;
             }
         }
-        if self.sandbox {
+        // Only in a war of attrition (no unit budget).
+        if self.sandbox || self.team_budget.iter().any(|b| b.is_some()) {
             return;
         }
         for c in raise {
@@ -1926,7 +1950,9 @@ impl World {
             cities_of[c.owner as usize] += 1;
         }
         for p in 1..=self.players as usize {
-            if !self.player[p].eliminated && cities_of[p] == 0 && counts[p] == 0 {
+            // Out of units with none left to create (limited war) is out too.
+            let spent = self.team_budget[self.team_bit[p].trailing_zeros() as usize] == Some(0);
+            if !self.player[p].eliminated && counts[p] == 0 && (cities_of[p] == 0 || spent) {
                 self.player[p].eliminated = true;
             }
         }
@@ -2000,6 +2026,9 @@ impl World {
         h.update(&self.tick.to_le_bytes());
         h.update(&self.seed.to_le_bytes());
         h.update(&self.rules.balance_hash.to_le_bytes());
+        for b in self.team_budget {
+            h.update(&b.map_or(u32::MAX, |n| n).to_le_bytes());
+        }
         h.update(&(self.units.len() as u64).to_le_bytes());
         let u = &self.units;
         hash_i32s(&mut h, &u.pos_x);

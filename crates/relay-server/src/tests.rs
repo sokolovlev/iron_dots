@@ -21,7 +21,7 @@ fn to(out: &[Out], client: u32) -> Vec<ServerMsg> {
 }
 
 fn settings() -> LobbySettings {
-    LobbySettings { width: 256, height: 128, seed: 3, slots: 4, map: None }
+    LobbySettings { width: 256, height: 128, seed: 3, slots: 4, map: None, unit_budget: None }
 }
 
 /// Two humans and a bot, started; returns (relay, host, guest, game, tokens).
@@ -199,6 +199,7 @@ fn map_lobby_uses_the_map_starts_and_teams() {
         seed: 0,
         slots: 2,
         map: Some(net::proto::LobbyMap { name: "Test".into(), bytes: bytes.clone() }),
+        unit_budget: None,
     };
     r.message(a, C::CreateLobby { name: "m".into(), settings }, &mut out);
     let Some(ServerMsg::Lobby(l)) = to(&out, a).pop() else { panic!("{out:?}") };

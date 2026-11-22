@@ -205,6 +205,9 @@ impl App {
         if code == KeyCode::Escape {
             if self.settings_open {
                 self.close_settings();
+            } else if let Some(g) = self.game.as_mut().filter(|g| g.front_tool) {
+                g.front_tool = false;
+                g.front_draft = None;
             } else if self.game.is_some() {
                 self.esc_menu = !self.esc_menu;
             } else if self.editor.is_none() && self.menu.online.open {
@@ -261,6 +264,10 @@ impl App {
         };
         let offline = g.online.is_none();
         match action {
+            Some(Action::DrawFront) => {
+                g.front_tool = !g.front_tool;
+                g.front_draft = None;
+            }
             Some(Action::Stop) => g.stop(),
             Some(Action::ClearQueue) => g.clear_queue(),
             Some(Action::BuyLight) => g.buy(UnitKind::Light),
@@ -304,6 +311,17 @@ impl App {
         }
         let Some(g) = &mut self.game else { return };
         let dist = |a: [f32; 2]| ((a[0] - pos[0]).powi(2) + (a[1] - pos[1]).powi(2)).sqrt();
+        // Drawing a front: the left button draws instead of selecting.
+        if g.front_tool && button == MouseButton::Left {
+            match state {
+                ElementState::Pressed => g.front_draft = Some(vec![g.camera.screen_to_world(pos, vp)]),
+                ElementState::Released => {
+                    g.finish_front();
+                    g.front_tool = false;
+                }
+            }
+            return;
+        }
         match (button, state) {
             (MouseButton::Left, ElementState::Pressed) => self.mouse.left_down = Some(pos),
             (MouseButton::Left, ElementState::Released) => {
@@ -368,6 +386,13 @@ impl App {
             let d = ((start[0] - pos[0]).powi(2) + (start[1] - pos[1]).powi(2)).sqrt();
             if d > CLICK_SLOP {
                 g.box_select = Some((start, pos));
+            }
+        }
+        if let Some(line) = &mut g.front_draft {
+            let w = g.camera.screen_to_world(pos, vp);
+            let last = *line.last().expect("draft starts with a point");
+            if (w[0] - last[0]).powi(2) + (w[1] - last[1]).powi(2) > 0.25 {
+                line.push(w);
             }
         }
         if let Some(path) = &mut g.drawing {

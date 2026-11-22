@@ -501,7 +501,10 @@ impl Relay {
             None => ScenarioSpec::standard_match(s.width, s.height, taken.len() as u8, s.seed, &self.balance),
         };
         let mut scenario = match scenario {
-            Ok(sc) => sc,
+            Ok(sc) => match s.unit_budget {
+                Some(n) => sc.limited_war(n.clamp(1, 100_000)),
+                None => sc,
+            },
             Err(e) => return fail(out, &e),
         };
         let mut players = Vec::new();

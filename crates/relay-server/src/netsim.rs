@@ -217,6 +217,7 @@ pub fn run(opts: &Options, make_bot: BotFactory) -> Result<Outcome, String> {
             seed: opts.seed,
             slots,
             map: opts.map_file.clone().map(|bytes| net::proto::LobbyMap { name: "netsim".into(), bytes }),
+            unit_budget: None,
         },
     });
     let ServerMsg::Lobby(lobby) = wait(host, Duration::from_secs(20), |m| matches!(m, ServerMsg::Lobby(_)))? else {

@@ -33,6 +33,18 @@ pub struct MatchSettings {
     /// Play on this map instead of a generated one; every start gets a
     /// player (you in the first), with the map's suggested teams.
     pub map_file: Option<std::sync::Arc<crate::maps::MapEntry>>,
+    pub mode: GameMode,
+}
+
+/// How a match is played (chosen on the "Play vs AI" page).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GameMode {
+    /// War of attrition: start from capitals, empty cities raise units
+    /// without end.
+    Attrition,
+    /// Limited war: the cities split between the sides from the start, a
+    /// front between them, and each side may create `units` units.
+    Limited { units: u32 },
 }
 
 impl Default for MatchSettings {
@@ -45,6 +57,7 @@ impl Default for MatchSettings {
             sandbox: false,
             units_per_player: 2_000,
             map_file: None,
+            mode: GameMode::Attrition,
         }
     }
 }
@@ -80,6 +93,14 @@ pub struct Game {
     groups: [Vec<UnitHandle>; 10],
     /// Path being drawn with the right button (world coordinates).
     pub drawing: Option<Vec<[f32; 2]>>,
+    /// Positions: front lines whose places units hold and refill.
+    pub fronts: Vec<crate::fronts::Front>,
+    /// The "draw a front" tool is on (left drag draws instead of selecting).
+    pub front_tool: bool,
+    /// The front being drawn.
+    pub front_draft: Option<Vec<[f32; 2]>>,
+    /// Seconds until the fronts are next refilled.
+    front_timer: f32,
     /// Selection rectangle in screen pixels: (start, current).
     pub box_select: Option<([f32; 2], [f32; 2])>,
     /// Time in seconds, for animation.
@@ -142,7 +163,10 @@ impl Game {
         let balance = Balance::default_balance();
         if let Some(m) = &settings.map_file {
             let slots: Vec<Option<u8>> = m.teams.iter().map(|&t| Some(t)).collect();
-            let spec = ScenarioSpec::from_map_file(&m.bytes, &slots, &balance)?;
+            let mut spec = ScenarioSpec::from_map_file(&m.bytes, &slots, &balance)?;
+            if let GameMode::Limited { units } = settings.mode {
+                spec = spec.limited_war(units);
+            }
             let players = slots.len() as u8;
             let bots = (2..=players).map(|p| Bot::new(p, settings.difficulty)).collect();
             return Game::build(settings, spec, balance, 1, bots);
@@ -151,7 +175,12 @@ impl Game {
         let spec = if settings.sandbox {
             ScenarioSpec::battle(settings.map[0], settings.map[1], settings.units_per_player, players, settings.seed)?
         } else {
-            ScenarioSpec::standard_match(settings.map[0], settings.map[1], players, settings.seed, &balance)?
+            let spec =
+                ScenarioSpec::standard_match(settings.map[0], settings.map[1], players, settings.seed, &balance)?;
+            match settings.mode {
+                GameMode::Attrition => spec,
+                GameMode::Limited { units } => spec.limited_war(units),
+            }
         };
         let bots = (2..=players).map(|p| Bot::new(p, settings.difficulty)).collect();
         Game::build(settings, spec, balance, 1, bots)
@@ -223,6 +252,10 @@ impl Game {
             formation: Formation::Keep,
             groups: Default::default(),
             drawing: None,
+            fronts: Vec::new(),
+            front_tool: false,
+            front_draft: None,
+            front_timer: 0.0,
             box_select: None,
             time: 0.0,
             message: None,
@@ -260,6 +293,7 @@ impl Game {
     /// Advances real time by `dt` seconds; steps the simulation as needed.
     pub fn update(&mut self, dt: f32) {
         self.time += dt;
+        self.refill_fronts(dt);
         if let Some((_, t)) = &mut self.message {
             *t -= dt;
             if *t <= 0.0 {
@@ -655,7 +689,117 @@ impl Game {
     }
 
     /// Right click (or a finished drawn path): move the selection.
+    /// Units given an order by the player leave their front places.
+    fn release_from_fronts(&mut self) {
+        for f in &mut self.fronts {
+            for h in &mut f.held {
+                if h.is_some_and(|x| self.selection.contains(&x)) {
+                    *h = None;
+                }
+            }
+        }
+    }
+
+    /// Finishes drawing a front: places along the curve, taken by the
+    /// selected units, or else by the nearest own units not in combat.
+    pub fn finish_front(&mut self) {
+        let Some(line) = self.front_draft.take() else { return };
+        let line = simplify(&line, 64);
+        if line.len() < 2 {
+            return;
+        }
+        let mut front = crate::fronts::Front::new(line);
+        // No places where nobody can stand (mountains).
+        let (map, rules) = (self.world.map(), self.world.rules());
+        let keep: Vec<bool> = front
+            .places
+            .iter()
+            .map(|p| {
+                let (x, y) = (p[0].max(0.0) as u32, p[1].max(0.0) as u32);
+                x < map.width() && y < map.height() && rules.passable[map.terrain_raw(x, y) as usize]
+            })
+            .collect();
+        let mut it = keep.iter();
+        front.places.retain(|_| *it.next().expect("same length"));
+        front.held.truncate(front.places.len());
+        if front.places.is_empty() {
+            return;
+        }
+        let u = self.world.units();
+        let held: Vec<UnitHandle> = self.fronts.iter().flat_map(|f| f.held.iter().flatten().copied()).collect();
+        let sel: Vec<usize> = self.selection.iter().filter_map(|h| u.index_of(*h)).collect();
+        let mut cand: Vec<usize> = if sel.is_empty() {
+            (0..u.len())
+                .filter(|&i| {
+                    u.owner[i] == self.me && u.flags[i] & flags::IN_COMBAT == 0 && !held.contains(&u.handle(i))
+                })
+                .collect()
+        } else {
+            sel
+        };
+        // The nearest units to the curve.
+        let near = |i: usize| {
+            let p = [u.pos_x[i] as f32 / 65536.0, u.pos_y[i] as f32 / 65536.0];
+            front.places.iter().map(|q| (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).fold(f32::MAX, f32::min)
+        };
+        cand.sort_by(|&a, &b| near(a).total_cmp(&near(b)));
+        cand.truncate(front.places.len());
+        for f in &mut self.fronts {
+            for h in &mut f.held {
+                if h.is_some_and(|x| cand.iter().any(|&i| u.handle(i) == x)) {
+                    *h = None;
+                }
+            }
+        }
+        let moves = crate::fronts::fill(&mut front, u, &mut cand);
+        self.fronts.push(front);
+        self.order_places(moves);
+        self.sounds.push(Sfx::Order);
+    }
+
+    fn order_places(&mut self, moves: Vec<(UnitHandle, [f32; 2])>) {
+        for (h, p) in moves {
+            let path = vec![FxPoint::new(Fx((p[0] * 65536.0) as i32), Fx((p[1] * 65536.0) as i32))];
+            self.issue(CommandKind::Move { units: vec![h], path, queue: false, formation: Formation::Keep });
+        }
+    }
+
+    /// Once a second: free places whose units are gone and send idle units
+    /// from own cities to the empty ones.
+    fn refill_fronts(&mut self, dt: f32) {
+        self.front_timer -= dt;
+        if self.fronts.is_empty() || self.front_timer > 0.0 {
+            return;
+        }
+        self.front_timer = 1.0;
+        let u = self.world.units();
+        for f in &mut self.fronts {
+            crate::fronts::refresh(f, u, &[]);
+        }
+        let held: Vec<UnitHandle> = self.fronts.iter().flat_map(|f| f.held.iter().flatten().copied()).collect();
+        let w = &self.world;
+        let in_own_city = |i: usize| {
+            let (x, y) = (u.pos_x[i] >> 16, u.pos_y[i] >> 16);
+            w.cities().iter().any(|c| c.owner == self.me && (c.x as i32 - x).abs() <= 1 && (c.y as i32 - y).abs() <= 1)
+        };
+        let mut cand: Vec<usize> = (0..u.len())
+            .filter(|&i| {
+                u.owner[i] == self.me
+                    && u.order[i] == NO_ORDER
+                    && u.flags[i] & flags::IN_COMBAT == 0
+                    && !held.contains(&u.handle(i))
+                    && in_own_city(i)
+            })
+            .collect();
+        let mut moves = Vec::new();
+        for f in &mut self.fronts {
+            moves.extend(crate::fronts::fill(f, u, &mut cand));
+        }
+        self.order_places(moves);
+    }
+
     pub fn order_move(&mut self, path_world: &[[f32; 2]], queue: bool) {
+        self.release_from_fronts();
         if self.selection.is_empty() || path_world.is_empty() {
             return;
         }
@@ -702,6 +846,7 @@ impl Game {
     }
 
     pub fn stop(&mut self) {
+        self.release_from_fronts();
         if !self.selection.is_empty() {
             self.issue(CommandKind::Stop { units: self.selection.clone() });
             self.sounds.push(Sfx::Order);
@@ -877,6 +1022,24 @@ impl Game {
         if let Some(path) = &self.drawing {
             o.polyline(path, 3.0 * px, [1.0, 1.0, 1.0, 0.9]);
         }
+        // Fronts: the curve, and a small square on every empty place.
+        let u = self.world.units();
+        for f in &self.fronts {
+            o.polyline(&f.line, 2.5 * px, [0.55, 0.85, 1.0, 0.55]);
+            for (k, p) in f.places.iter().enumerate() {
+                let here = f.held[k].and_then(|h| u.index_of(h)).is_some_and(|i| {
+                    let q = [u.pos_x[i] as f32 / 65536.0, u.pos_y[i] as f32 / 65536.0];
+                    (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) < 1.0
+                });
+                if !here {
+                    let r = 0.35;
+                    o.rect([p[0] - r, p[1] - r], [p[0] + r, p[1] + r], 1.5 * px, [0.55, 0.85, 1.0, 0.9]);
+                }
+            }
+        }
+        if let Some(path) = &self.front_draft {
+            o.polyline(path, 3.0 * px, [0.55, 0.85, 1.0, 0.95]);
+        }
         if let Some((a, b)) = self.box_select {
             let wa = self.camera.screen_to_world(a, viewport);
             let wb = self.camera.screen_to_world(b, viewport);
@@ -994,7 +1157,7 @@ mod tests {
             .collect();
         clients[0].send(ClientMsg::CreateLobby {
             name: "t".into(),
-            settings: LobbySettings { width: 256, height: 128, seed: 2, slots: 3, map: None },
+            settings: LobbySettings { width: 256, height: 128, seed: 2, slots: 3, map: None, unit_budget: None },
         });
         let ServerMsg::Lobby(l) = wait(&clients[0], &|m| matches!(m, ServerMsg::Lobby(_))) else { unreachable!() };
         clients[1].send(ClientMsg::JoinLobby { lobby: l.id });

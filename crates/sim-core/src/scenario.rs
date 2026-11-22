@@ -38,6 +38,10 @@ pub struct ScenarioSpec {
     pub spawns: Vec<Spawn>,
     /// Sandbox rules (spec 2.7): unbounded supply, no upkeep.
     pub sandbox: bool,
+    /// Limited war: units each team may create in the whole match
+    /// (`None` = war of attrition, cities raise units without limit).
+    #[serde(default)]
+    pub unit_budget: Option<u32>,
 }
 
 /// Map sizes offered in the menus, all close to 16:9 (sides must be
@@ -89,6 +93,7 @@ impl ScenarioSpec {
         for s in &self.spawns {
             w.spawn(s.owner, s.kind, s.at)?;
         }
+        w.set_unit_budget(self.unit_budget);
         w.prepare_pathfinding();
         w.refresh_zones();
         Ok(w)
@@ -152,6 +157,7 @@ impl ScenarioSpec {
             cities,
             spawns,
             sandbox: false,
+            unit_budget: None,
         })
     }
 
@@ -198,7 +204,30 @@ impl ScenarioSpec {
             cities,
             spawns,
             sandbox: false,
+            unit_budget: None,
         })
+    }
+
+    /// Turns a match into a limited war: every neutral city goes to the
+    /// player whose capital is nearest (so each side starts with its half
+    /// of the map and a front between), every city gets a light defender,
+    /// and each team may create `units` more units in the whole match.
+    pub fn limited_war(mut self, units: u32) -> ScenarioSpec {
+        let capitals: Vec<(i64, i64, u8)> =
+            self.cities.iter().filter(|c| c.capital).map(|c| (c.x as i64, c.y as i64, c.owner)).collect();
+        for c in self.cities.iter_mut().filter(|c| c.owner == 0) {
+            let nearest =
+                capitals.iter().min_by_key(|&&(x, y, o)| ((x - c.x as i64).pow(2) + (y - c.y as i64).pow(2), o));
+            if let Some(&(_, _, o)) = nearest {
+                c.owner = o;
+            }
+        }
+        for c in self.cities.iter().filter(|c| !c.capital && c.owner != 0) {
+            let at = FxPoint::tile_center(c.x as i32, c.y as i32);
+            self.spawns.push(Spawn { owner: c.owner, kind: UnitKind::Light, at });
+        }
+        self.unit_budget = Some(units);
+        self
     }
 
     /// Sandbox battle for benchmarks: generated map with `players` armies
@@ -235,6 +264,7 @@ impl ScenarioSpec {
             cities,
             spawns,
             sandbox: true,
+            unit_budget: None,
         })
     }
 }
@@ -273,6 +303,7 @@ impl ScenarioSpec {
             cities,
             spawns,
             sandbox: true,
+            unit_budget: None,
         })
     }
 }

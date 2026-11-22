@@ -131,6 +131,18 @@ quarter rate. A city left without your units for 5 s raises one at the usual pri
 is being captured cannot raise or buy units. Keep a unit in each city: a city with a defender inside cannot be
 captured, and units in cities cost no upkeep.
 
+**Game modes.** *Play vs AI* opens a page to pick the mode. *War of
+attrition*: everyone starts from a capital, empty cities keep raising units
+while you can pay. *Limited war*: the cities are split between the sides
+from the start, with a front between them; every city has a defender, and
+each side may create only N units in the whole match (shown in the HUD). The
+same choice is offered when creating an online lobby.
+
+**Positions.** Press F (or *Draw a front* in the Positions panel, bottom
+left) and drag a line: the selected units, or the nearest ones, take places
+along it. Places that empty are refilled by idle units from your cities.
+Remove a front in the panel; an order to a unit takes it off its front.
+
 **Formations.** With two or more units selected, a bar at the bottom offers
 Keep, Line, Staggered, Box, Column and Flank. Picking one lines the group up
 facing the nearest enemy and is used for the following orders.

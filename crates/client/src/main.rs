@@ -14,6 +14,7 @@
 
 mod app;
 mod editor;
+mod fronts;
 mod game;
 mod gpu;
 mod maps;

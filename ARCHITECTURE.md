@@ -196,6 +196,21 @@ Stage 2 had to pin down details that spec §2 describes only in words:
   (two wings). Facing is from the group's centre to the first path point;
   the units furthest forward fill the front rank, left to right, so paths
   rarely cross (`sim_core::formation`).
+- **Game modes:** *war of attrition* (the default: start from the
+  capitals, empty cities raise units without end) and *limited war*
+  (`ScenarioSpec::limited_war(n)`): every neutral city goes to the player
+  whose capital is nearest, so each side starts with its half of the map and
+  a front between; every city gets a light defender; each team may create
+  `n` units in the whole match (`World::unit_budget`), purchases only, and
+  empty cities raise nothing. A player with no units and nothing left to
+  create is out. Lobbies carry the mode (`LobbySettings::unit_budget`).
+- **Positions** (client helper, `client::fronts`): the player draws a curve;
+  places every 1.6 tiles along it (none on impassable tiles) are taken by
+  the selected units, or the nearest own units not in combat. Once a second
+  empty places (unit dead, ordered elsewhere by the player, or left idle far
+  from it) are given to idle units standing in own cities. It only issues
+  ordinary Move commands, so it is not part of the simulation and works
+  online unchanged.
 - **Supply corridors** (playtesting): every 15 ticks each team gets a
   distance field (4×4-tile cells, BFS) from its cities over cells with no
   tile held by another team. From every unit the shortest way back to a

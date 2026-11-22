@@ -6,7 +6,7 @@ use sim_core::command::{Command, CommandKind};
 use sim_core::scenario::ScenarioSpec;
 
 /// Bump on any change to the messages below (spec 6.5, protocol_version).
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Commands of one tick, as decided by the relay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +50,8 @@ pub struct LobbySettings {
     /// A `.wmap` map (built-in or the host's own); `None` = generated from
     /// `width`, `height` and `seed`.
     pub map: Option<LobbyMap>,
+    /// Limited war: units each team may create (`None` = war of attrition).
+    pub unit_budget: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

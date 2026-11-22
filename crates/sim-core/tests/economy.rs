@@ -315,3 +315,24 @@ fn a_blockaded_city_heals_less() {
     // 1 of 4 reachable cities: a quarter of the city healing rate.
     assert!(linked > 3 * alone && alone > 0, "alone {alone} linked {linked}");
 }
+
+#[test]
+fn limited_war_splits_the_map_and_counts_units() {
+    let b = Balance::default_balance();
+    let spec = ScenarioSpec::standard_match(320, 192, 2, 3, &b).unwrap().limited_war(2);
+    assert!(spec.cities.iter().all(|c| c.owner != 0), "every city taken");
+    let ones = spec.cities.iter().filter(|c| c.owner == 1).count() as i64;
+    let twos = spec.cities.iter().filter(|c| c.owner == 2).count() as i64;
+    assert!((ones - twos).abs() * 4 <= ones + twos, "roughly halves: {ones} vs {twos}");
+    let mut w = spec.build(&b).unwrap();
+    assert_eq!(w.unit_budget(1), Some(2));
+    let units = w.units().len();
+    // Empty cities raise nothing here; purchases use up the budget.
+    run(&mut w, &[], 30 * TPS);
+    assert_eq!(w.units().len(), units);
+    let cap = w.cities().iter().position(|c| c.capital_of == 1).unwrap() as u16;
+    let buys: Vec<Command> = (0..3).map(|k| buy(w.tick(), 1, k, cap, UnitKind::Light)).collect();
+    w.step(&buys);
+    assert_eq!(w.unit_budget(1), Some(0));
+    assert_eq!(w.stats().commands_rejected, 1, "the third is over budget");
+}
