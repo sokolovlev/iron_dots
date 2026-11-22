@@ -257,7 +257,7 @@ pub fn symmetric(
     }
     // Neutral cities in the part by rejection sampling, spaced apart and
     // away from the starts.
-    let spacing = (w.min(h) / 9).clamp(12, 40) as i64;
+    let spacing = (w.min(h) / 12).clamp(10, 32) as i64;
     let mut part_cities: Vec<(u32, u32)> = Vec::new();
     let mut attempt = 0u32;
     while part_cities.len() < cities_per_part && attempt < 50_000 {

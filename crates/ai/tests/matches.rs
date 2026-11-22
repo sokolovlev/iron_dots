@@ -26,13 +26,13 @@ fn duel_reaches_victory_and_replays_exactly() {
     let (r, winner) = play(256, 2, 1, &[Difficulty::Normal]);
     assert!(winner.is_some(), "no winner after {} ticks", r.ticks);
     let minutes = r.ticks / 30 / 60;
-    assert!((2..=20).contains(&minutes), "match lasted {minutes} min");
+    assert!((2..=25).contains(&minutes), "match lasted {minutes} min");
     let w = r.verify(&Balance::default_balance()).unwrap();
     assert_eq!(w.winner(), winner);
     // Golden hash: bots + simulation must give the same match on every
     // platform (CI runs this on Linux, Windows, macOS and ARM64). Update it
     // together with SIM_CODE_VERSION when gameplay or bots change on purpose.
-    assert_eq!(r.final_hash(), Some(0xb851_dabe_6e95_3a4e), "golden AI match changed");
+    assert_eq!(r.final_hash(), Some(0xfc3d_5c78_fb23_426d), "golden AI match changed");
 }
 
 #[test]

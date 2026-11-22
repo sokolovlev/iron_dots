@@ -91,6 +91,9 @@ pub struct TerritoryParams {
     pub radius: u32,
     /// Control radius of a city around itself, tiles.
     pub city_radius: u32,
+    /// Rear: land within this many tiles of two or more cities of one
+    /// team, and of no city of another team, is that team's.
+    pub rear_radius: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,8 +196,11 @@ impl Balance {
         range("supply.heal_dps", self.supply.heal_dps, 0, 1_000_000)?;
         range("supply.heal_city_dps", self.supply.heal_city_dps, 0, 1_000_000)?;
         range("supply.heal_delay", self.supply.heal_delay, 0, 600_000)?;
-        if !(1..=16).contains(&self.territory.radius) || !(1..=16).contains(&self.territory.city_radius) {
-            return Err("territory.radius and city_radius must be in [1, 16]".into());
+        if !(1..=16).contains(&self.territory.radius) {
+            return Err("territory.radius must be in [1, 16]".into());
+        }
+        if !(1..=64).contains(&self.territory.city_radius) || !(0..=64).contains(&self.territory.rear_radius) {
+            return Err("territory.city_radius must be in [1, 64] and rear_radius in [0, 64]".into());
         }
         if !(1..=100).contains(&self.supply.per_city) {
             return Err("supply.per_city must be in [1, 100]".into());
@@ -292,6 +298,7 @@ pub struct Rules {
     pub heal_delay_ticks: u16,
     pub territory_radius: u32,
     pub city_radius: u32,
+    pub rear_radius: u32,
     pub capture_ticks: u16,
     pub win_city_share: Milli,
     pub start_light_units: u32,
@@ -370,6 +377,7 @@ impl Rules {
             heal_delay_ticks: ((b.supply.heal_delay.0 * tr as i64) / 1000).min(u16::MAX as i64) as u16,
             territory_radius: b.territory.radius,
             city_radius: b.territory.city_radius,
+            rear_radius: b.territory.rear_radius,
             capture_ticks: ((b.city.capture_time.0 * tr as i64) / 1000).clamp(1, u16::MAX as i64) as u16,
             win_city_share: b.match_rules.win_city_share,
             start_light_units: b.match_rules.start_light_units,

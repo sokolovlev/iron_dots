@@ -118,8 +118,9 @@ terrain; or drop a `.png` or `.wmap` onto the window), save, and Play to try
 the map against bots at once. Maps are saved as `.wmap` next to
 `settings.ron`, in `maps/`.
 
-**Territory and supply.** Land belongs to whoever has units (or cities)
-next to it right now; land nobody holds, or both sides contest, is neutral.
+**Territory and supply.** Land belongs to whoever has units next to it right
+now, or cities within 15 tiles; land between two or more of your cities with
+no enemy city near is your rear and is yours too; land nobody holds, or both sides contest, is neutral.
 Supply flows over your own and neutral land, so to cut an enemy off you
 must surround it with a closed ring of your own control and keep standing
 there. Keep a unit in each city: a city with a defender inside cannot be

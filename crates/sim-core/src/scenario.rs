@@ -123,10 +123,10 @@ impl ScenarioSpec {
                 spawns.push(Spawn { owner: p + 1, kind: UnitKind::Light, at });
             }
         }
-        // Neutral cities: rejection sampling with a minimum spacing.
-        // Roughly 20 cities on a 256² map; never fewer than 3 per player.
-        let spacing = (width.min(height) as i64 / 8).clamp(16, 48);
-        let target = ((width as i64 / spacing) * (height as i64 / spacing) / 3).max(players as i64 * 3) as usize;
+        // Neutral cities: rejection sampling with a minimum spacing. About
+        // 70 cities on a 320×192 map; never fewer than 6 per player.
+        let spacing = (width.min(height) as i64 / 9).clamp(14, 44);
+        let target = ((width as i64 / spacing) * (height as i64 / spacing) / 2).max(players as i64 * 6) as usize;
         let mut attempt = 0u32;
         while cities.len() < target + players as usize && attempt < 20_000 {
             let r = rand(seed, attempt, 0, Purpose::Scenario);

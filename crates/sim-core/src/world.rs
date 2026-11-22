@@ -258,8 +258,14 @@ pub struct World {
     /// Chunks that hold any owned tile (so they must be cleared when
     /// their units leave).
     chunk_owned: Vec<bool>,
-    /// Cities whose zone reaches each chunk.
+    /// Cities whose zone or rear reaches each chunk.
     chunk_cities: Vec<Vec<u16>>,
+    /// Player bits of city zones and rears per tile (chunk-major, like the
+    /// owner plane); recomputed when a city changes hands.
+    city_plane: Vec<u8>,
+    /// Chunks with any city zone.
+    chunk_city: Vec<bool>,
+    city_plane_dirty: bool,
     /// Recompute every chunk's zones on the next territory phase.
     zones_stale: bool,
     /// Tile owner for every set of players present (bit p-1 = player p),
@@ -352,6 +358,9 @@ impl World {
             zone_disk,
             chunk_owned: vec![false; chunks],
             chunk_cities: vec![Vec::new(); chunks],
+            city_plane: vec![0; tiles],
+            chunk_city: vec![false; chunks],
+            city_plane_dirty: true,
             zones_stale: true,
             owner_of: territory::owner_table(&team_mask),
             team_bit,
@@ -525,7 +534,7 @@ impl World {
             capture_ticks: 0,
         });
         // Chunks this city's zone can reach.
-        let r = self.rules.city_radius + 1;
+        let r = self.rules.city_radius.max(self.rules.rear_radius) + 1;
         let cw = self.map.chunks_w();
         let (cx0, cx1) = (x.saturating_sub(r) / map::CHUNK, (x + r).min(w - 1) / map::CHUNK);
         let (cy0, cy1) = (y.saturating_sub(r) / map::CHUNK, (y + r).min(self.map.height() - 1) / map::CHUNK);
@@ -536,6 +545,7 @@ impl World {
         }
         self.territory_changed = true;
         self.zones_stale = true;
+        self.city_plane_dirty = true;
         Ok(idx)
     }
 
@@ -1415,6 +1425,41 @@ impl World {
 
     // ---------------------------------------------------------------- phase 7
 
+    /// City zones and rears for every chunk (parallel); only when a city
+    /// is added or changes hands.
+    fn recompute_city_plane(&mut self) {
+        let cw = self.map.chunks_w();
+        let mut plane = take(&mut self.city_plane);
+        let mut flags = take(&mut self.chunk_city);
+        let this = &*self;
+        this.pool.install(|| {
+            plane.par_chunks_mut(map::CHUNK_TILES).zip(flags.par_iter_mut()).enumerate().for_each(
+                |(c, (out, flag))| {
+                    let cities: Vec<(u32, u32, u8, u8)> = this.chunk_cities[c]
+                        .iter()
+                        .map(|&k| &this.cities[k as usize])
+                        .filter(|city| city.owner != 0)
+                        .map(|city| (city.x as u32, city.y as u32, city.owner, this.team_bit[city.owner as usize]))
+                        .collect();
+                    *flag = !cities.is_empty()
+                        && territory::city_zones(
+                            out,
+                            c as u32 % cw,
+                            c as u32 / cw,
+                            &cities,
+                            this.rules.city_radius,
+                            this.rules.rear_radius,
+                        );
+                    if cities.is_empty() {
+                        out.fill(0);
+                    }
+                },
+            );
+        });
+        self.city_plane = plane;
+        self.chunk_city = flags;
+    }
+
     /// Control zones (spec 2.2). Each chunk is recomputed every 4 ticks, a
     /// quarter of the chunks per tick ([`territory::chunk_paints`]), from
     /// the units and cities that reach it: in parallel per chunk into
@@ -1424,8 +1469,11 @@ impl World {
         let cw = self.map.chunks_w();
         let n = (cw * self.map.chunks_h()) as usize;
         let tick = self.tick;
+        if std::mem::replace(&mut self.city_plane_dirty, false) {
+            self.recompute_city_plane();
+            self.zones_stale = true;
+        }
         let full = std::mem::replace(&mut self.zones_stale, false);
-        let r_city = (self.rules.city_radius as i32) << 16;
         let mut scratch = take(&mut self.zone_scratch);
         let selected: Vec<usize> =
             (0..n).filter(|&c| full || territory::chunk_paints(c as u32 % cw, c as u32 / cw, tick)).collect();
@@ -1447,19 +1495,14 @@ impl World {
                 let mut any_unit = false;
                 g.ranges_in_range(mx, my, half, |rg| any_unit |= !rg.is_empty());
                 let mut city_tiles: Vec<(u32, u32, u8)> = Vec::new();
-                let mut zones: Vec<(i32, i32, i32, u8)> = Vec::new();
                 for &k in &this.chunk_cities[c] {
                     let city = &this.cities[k as usize];
                     let (x, y) = (city.x as u32, city.y as u32);
                     if x / map::CHUNK == cx && y / map::CHUNK == cy {
                         city_tiles.push((x, y, city.owner));
                     }
-                    if city.owner != 0 {
-                        let p = city.center();
-                        zones.push((p.x.0, p.y.0, r_city, city.owner));
-                    }
                 }
-                if !any_unit && zones.is_empty() && !this.chunk_owned[c] {
+                if !any_unit && !this.chunk_city[c] && !this.chunk_owned[c] {
                     out.0 = usize::MAX;
                     return;
                 }
@@ -1479,7 +1522,7 @@ impl World {
                             }
                         });
                     },
-                    &zones,
+                    &this.city_plane[c * map::CHUNK_TILES..(c + 1) * map::CHUNK_TILES],
                     &city_tiles,
                 );
             });
@@ -1694,6 +1737,7 @@ impl World {
                         let cw = self.map.chunks_w() as usize;
                         self.dirty_chunks[(y as usize >> 6) * cw + (x as usize >> 6)] = true;
                         self.territory_changed = true;
+                        self.city_plane_dirty = true;
                     }
                 }
                 Some(_) if contested && !defended => {} // frozen while contested

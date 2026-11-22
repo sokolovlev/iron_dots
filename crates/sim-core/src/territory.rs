@@ -2,7 +2,9 @@
 //!
 //! * Control zones: a tile belongs to a side while that side has a unit
 //!   within `territory.radius` of it (or one of its cities within
-//!   `territory.city_radius`) and no other side does. Tiles nobody reaches,
+//!   `territory.city_radius`, or it lies in that side's rear: within
+//!   `territory.rear_radius` of two or more of its cities and of no city of
+//!   another side) and no other side does. Tiles nobody reaches,
 //!   or that two sides reach, are neutral. Zones follow the units: land is
 //!   not kept after the army leaves. City tiles always show the city owner.
 //! * Pockets: per team, 4-connected components of the land that is not
@@ -78,6 +80,43 @@ pub fn stamp(plane: &mut [u8], ox: i32, oy: i32, side: i32, r_raw: i32, x: i32, 
     }
 }
 
+/// Player bits of the city zones over chunk `(cx, cy)` (`out` is its
+/// slice of the city plane). `cities` are `(x, y, owner, team bit)` of
+/// owned cities that may reach the chunk. A tile gets:
+/// * the owner of every city within `city_r` tiles;
+/// * the rear: if at least two cities lie within `rear_r` tiles and all of
+///   them are on one team, the owners of those cities.
+pub fn city_zones(out: &mut [u8], cx: u32, cy: u32, cities: &[(u32, u32, u8, u8)], city_r: u32, rear_r: u32) -> bool {
+    let out = &mut out[..CHUNK_TILES];
+    out.fill(0);
+    let (cr2, rr2) = ((city_r * city_r) as i64, (rear_r * rear_r) as i64);
+    let mut any = 0u8;
+    for ly in 0..CHUNK {
+        for lx in 0..CHUNK {
+            let (x, y) = ((cx * CHUNK + lx) as i64, (cy * CHUNK + ly) as i64);
+            let (mut bits, mut rear_bits, mut teams, mut near) = (0u8, 0u8, 0u8, 0u32);
+            for &(ccx, ccy, owner, team) in cities {
+                let (dx, dy) = (ccx as i64 - x, ccy as i64 - y);
+                let d2 = dx * dx + dy * dy;
+                if d2 <= cr2 {
+                    bits |= player_bit(owner);
+                }
+                if d2 <= rr2 {
+                    rear_bits |= player_bit(owner);
+                    teams |= team;
+                    near += 1;
+                }
+            }
+            if near >= 2 && teams.is_power_of_two() {
+                bits |= rear_bits;
+            }
+            out[(ly * CHUNK + lx) as usize] = bits;
+            any |= bits;
+        }
+    }
+    any != 0
+}
+
 /// Tile offsets within `r` tiles of a tile (centre to centre), the disk a
 /// unit standing on that tile controls.
 pub fn disk(r: u32) -> Vec<(i32, i32)> {
@@ -99,7 +138,7 @@ pub fn disk(r: u32) -> Vec<(i32, i32)> {
 /// * `units` yields `(x, y, player)` of every unit that may reach the
 ///   chunk. Units mark their tile first (many units share a tile in a dense
 ///   army), then each marked tile spreads over `disk` (radius `r` tiles).
-/// * `cities` are `(x, y, radius_raw, owner)` zones of owned cities;
+/// * `city_bits` is the chunk's slice of the city plane ([`city_zones`]);
 ///   `city_tiles` the `(x, y, owner)` city tiles inside the chunk.
 ///
 /// `seeds` is scratch. Returns whether anything is owned.
@@ -113,7 +152,7 @@ pub fn chunk_owners(
     disk: &[(i32, i32)],
     owner_of: &[u8; 256],
     units: impl FnOnce(&mut dyn FnMut(i32, i32, u8)),
-    cities: &[(i32, i32, i32, u8)],
+    city_bits: &[u8],
     city_tiles: &[(u32, u32, u8)],
 ) -> bool {
     let out = &mut out[..CHUNK_TILES];
@@ -147,8 +186,8 @@ pub fn chunk_owners(
             }
         }
     }
-    for &(x, y, rr, p) in cities {
-        stamp(out, ox, oy, c, rr, x, y, player_bit(p));
+    for (o, &b) in out.iter_mut().zip(city_bits) {
+        *o |= b;
     }
     let mut any = 0u8;
     for v in out.iter_mut() {
@@ -329,7 +368,7 @@ mod tests {
             &disk(3),
             &owner_table(&mask),
             |f| f(10 << 16, 10 << 16, 2),
-            &[],
+            &[0; CHUNK_TILES],
             &[(40, 40, 1)],
         );
         assert!(any);
@@ -357,5 +396,29 @@ mod tests {
         assert_eq!(p.count, 2);
         assert_ne!(p.at(5, 5), p.at(50, 50));
         assert_eq!(p.near(&m, 20 << 16, 5 << 16, 1), p.at(19, 5));
+    }
+}
+
+#[cfg(test)]
+mod city_tests {
+    use super::*;
+
+    #[test]
+    fn rear_fills_between_own_cities_only() {
+        let mut out = vec![0u8; CHUNK_TILES];
+        // Two cities of player 1 (team bit 1), 40 tiles apart: the middle
+        // (20 from each) is beyond city_r 15 but in the rear.
+        let mine = [(10, 32, 1, 1), (50, 32, 1, 1)];
+        assert!(city_zones(&mut out, 0, 0, &mine, 15, 30));
+        assert_eq!(out[32 * 64 + 30], 1, "rear between own cities");
+        assert_eq!(out[32 * 64 + 12], 1, "near a city");
+        // An enemy city nearby: no rear, only the city circles.
+        let mixed = [(10, 32, 1, 1), (50, 32, 1, 1), (30, 60, 2, 2)];
+        city_zones(&mut out, 0, 0, &mixed, 15, 30);
+        assert_eq!(out[32 * 64 + 30], 0, "contested rear stays grey");
+        assert_eq!(out[32 * 64 + 12], 1);
+        // A single city: no rear beyond its circle.
+        city_zones(&mut out, 0, 0, &[(10, 32, 1, 1)], 15, 30);
+        assert_eq!(out[32 * 64 + 35], 0);
     }
 }

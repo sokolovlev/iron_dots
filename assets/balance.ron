@@ -55,7 +55,9 @@
     ),
     // Control zones: a tile is held by the side whose units (or cities) are
     // within this many tiles and no other side's are; else neutral. proposal
-    territory: (radius: 3, city_radius: 5),
+    // Rear: land within rear_radius of two or more cities of one side, and of
+    // no city of another side, is that side's (no grey gaps behind the front).
+    territory: (radius: 3, city_radius: 15, rear_radius: 30),
     city: (capture_time: "5", defense_bonus: "0.5"),
     match_rules: (start_light_units: 3, win_city_share: "0.8"),
 
