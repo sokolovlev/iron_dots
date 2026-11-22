@@ -52,13 +52,23 @@
         heal_dps: "2",
         heal_city_dps: "4",
         heal_delay: "3",
+        // Supply corridors (shortest way to an own city over land no enemy
+        // holds): full healing up to corridor_full tiles, falling linearly to
+        // corridor_min of it at corridor_max tiles and beyond. proposal
+        corridor_full: "40",
+        corridor_max: "200",
+        corridor_min: "0.25",
+        // City healing × min(1, reachable own cities / blockade_cities). proposal
+        blockade_cities: 4,
     ),
     // Control zones: a tile is held by the side whose units (or cities) are
     // within this many tiles and no other side's are; else neutral. proposal
     // Rear: land within rear_radius of two or more cities of one side, and of
     // no city of another side, is that side's (no grey gaps behind the front).
     territory: (radius: 3, city_radius: 15, rear_radius: 30),
-    city: (capture_time: "5", defense_bonus: "0.5"),
+    // An empty city (no own unit inside for spawn_time s) raises a unit for
+    // free when its pocket has supply to spare; spawn_heavy of them heavy.
+    city: (capture_time: "5", defense_bonus: "0.5", spawn_time: "5", spawn_heavy: "0.34"),
     match_rules: (start_light_units: 3, win_city_share: "0.8"),
 
     water: (

@@ -82,6 +82,16 @@ pub struct SupplyParams {
     pub heal_dps: Milli,
     pub heal_city_dps: Milli,
     pub heal_delay: Milli,
+    /// Supply corridors: full strength up to this length (tiles) of the
+    /// shortest way to an own city over land no enemy holds…
+    pub corridor_full: Milli,
+    /// …falling linearly to `corridor_min` at this length and beyond.
+    pub corridor_max: Milli,
+    /// Share of healing a unit at the end of the longest corridor gets.
+    pub corridor_min: Milli,
+    /// A city heals at full rate when it can reach this many own cities
+    /// (itself included); fewer: proportionally less (a blockade).
+    pub blockade_cities: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +111,11 @@ pub struct TerritoryParams {
 pub struct CityParams {
     pub capture_time: Milli,
     pub defense_bonus: Milli,
+    /// A city with none of its owner's units inside for this long (s)
+    /// raises a unit for free, if its pocket has supply to spare.
+    pub spawn_time: Milli,
+    /// Share of those units that are heavy (the rest are light).
+    pub spawn_heavy: Milli,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +205,14 @@ impl Balance {
         range("water.ship_after", self.water.ship_after, 0, 600_000)?;
         range("city.defense_bonus", self.city.defense_bonus, 0, 10_000)?;
         range("city.capture_time", self.city.capture_time, 0, 600_000)?;
+        range("city.spawn_time", self.city.spawn_time, 100, 600_000)?;
+        range("city.spawn_heavy", self.city.spawn_heavy, 0, 1_000)?;
+        range("supply.corridor_full", self.supply.corridor_full, 0, 4_096_000)?;
+        range("supply.corridor_max", self.supply.corridor_max, self.supply.corridor_full.0 + 1, 8_192_000)?;
+        range("supply.corridor_min", self.supply.corridor_min, 0, 1_000)?;
+        if !(1..=64).contains(&self.supply.blockade_cities) {
+            return Err("supply.blockade_cities must be in [1, 64]".into());
+        }
         range("economy.city_income", self.economy.city_income, 0, 1_000_000)?;
         range("supply.starve_dps", self.supply.starve_dps, 0, 1_000_000)?;
         range("supply.broke_starve_dps", self.supply.broke_starve_dps, 0, 1_000_000)?;
@@ -300,6 +323,13 @@ pub struct Rules {
     pub city_radius: u32,
     pub rear_radius: u32,
     pub capture_ticks: u16,
+    pub spawn_ticks: u16,
+    pub spawn_heavy: Milli,
+    /// Corridor lengths in coarse cells of [`crate::territory::CELL`] tiles.
+    pub corridor_full_cells: u32,
+    pub corridor_max_cells: u32,
+    pub corridor_min: Milli,
+    pub blockade_cities: u32,
     pub win_city_share: Milli,
     pub start_light_units: u32,
     pub balance_hash: u64,
@@ -379,6 +409,12 @@ impl Rules {
             city_radius: b.territory.city_radius,
             rear_radius: b.territory.rear_radius,
             capture_ticks: ((b.city.capture_time.0 * tr as i64) / 1000).clamp(1, u16::MAX as i64) as u16,
+            spawn_ticks: ((b.city.spawn_time.0 * tr as i64) / 1000).clamp(1, u16::MAX as i64) as u16,
+            spawn_heavy: b.city.spawn_heavy,
+            corridor_full_cells: (b.supply.corridor_full.0 / (1000 * crate::territory::CELL as i64)) as u32,
+            corridor_max_cells: (b.supply.corridor_max.0 / (1000 * crate::territory::CELL as i64)).max(1) as u32,
+            corridor_min: b.supply.corridor_min,
+            blockade_cities: b.supply.blockade_cities,
             win_city_share: b.match_rules.win_city_share,
             start_light_units: b.match_rules.start_light_units,
             balance_hash: b.content_hash(),

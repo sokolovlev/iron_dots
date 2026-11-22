@@ -13,6 +13,7 @@ pub enum Purpose {
     Separation = 4,
     MapGen = 5,
     Scenario = 6,
+    CitySpawn = 7,
 }
 
 #[inline]

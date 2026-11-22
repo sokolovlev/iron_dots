@@ -59,12 +59,16 @@ fn supply_limit_blocks_buying() {
     run(&mut w, &[], 3 * 60 * TPS); // 1800 money
     let cmds: Vec<Command> = (0..8).map(|k| buy(w.tick(), 1, k, 0, UnitKind::Light)).collect();
     w.step(&cmds);
-    // 5 places per city.
-    assert_eq!(w.units().len(), 5, "money {} supply {:?} stats {:?}", w.player(1).money, w.city_supply(0), w.stats());
+    // 5 places per city (one already taken by the unit the empty city
+    // raised for free).
+    // (It may be heavy and take two places.)
+    w.step(&[]);
+    let n = w.units().len();
+    assert!((4..=5).contains(&n), "{n} units, supply {:?} stats {:?}", w.city_supply(0), w.stats());
     assert_eq!(w.city_supply(0), Some((5, 5)));
     let heavy = [buy(w.tick(), 1, 99, 0, UnitKind::Heavy)];
     w.step(&heavy);
-    assert_eq!(w.units().len(), 5);
+    assert_eq!(w.units().len(), n);
 }
 
 #[test]
@@ -227,4 +231,66 @@ fn wide_map_presets_make_fair_matches() {
             spec.build(&b).unwrap();
         }
     }
+}
+
+#[test]
+fn empty_cities_raise_units_mostly_light() {
+    let mut w = world();
+    for k in 0..12 {
+        w.add_city(6 + (k % 4) * 14, 6 + (k / 4) * 20, 1, k == 0).unwrap();
+    }
+    // Nothing inside: each city raises one unit after 5 s, then has a
+    // defender and stops.
+    run(&mut w, &[], 5 * TPS + 2);
+    assert_eq!(w.units().len(), 12);
+    run(&mut w, &[], 10 * TPS);
+    assert_eq!(w.units().len(), 12, "a city with a defender does not raise more");
+    let heavy = w.units().kind.iter().filter(|&&k| k == UnitKind::Heavy as u8).count();
+    assert!((1..=8).contains(&heavy), "{heavy} heavy of 12");
+}
+
+#[test]
+fn long_corridors_heal_slower_and_blockaded_cities_less() {
+    // A wounded unit next to its city heals at the full rate; the same far
+    // away along a long way round heals slower.
+    let hp_after = |x: i32, y: i32, wall: bool| {
+        let mut w = world();
+        w.add_city(4, 4, 1, true).unwrap();
+        if wall {
+            // An enemy line across the map with a gap at the bottom: the
+            // way round is long.
+            for k in 0..19 {
+                w.spawn(2, UnitKind::Light, pt(30, 2 + k * 3)).unwrap();
+            }
+        }
+        let u = w.spawn(1, UnitKind::Light, pt(x, y)).unwrap();
+        // Wound it by standing in water briefly is awkward: set up the HP
+        // through combat is noisy, so compare healing from a scratch.
+        run(&mut w, &[], 2);
+        w.debug_set_hp(u, 5_000);
+        run(&mut w, &[], 10 * TPS);
+        w.units().hp[w.units().index_of(u).unwrap()]
+    };
+    let near = hp_after(10, 4, false);
+    let far = hp_after(40, 4, true);
+    assert!(near > far + 100, "near {near} far {far}");
+}
+
+#[test]
+fn a_blockaded_city_heals_less() {
+    let healed = |cities: u32| {
+        let mut w = world();
+        w.add_city(10, 10, 1, true).unwrap();
+        for k in 1..cities {
+            w.add_city(10 + 12 * k, 40, 1, false).unwrap();
+        }
+        let u = w.spawn(1, UnitKind::Light, pt(10, 10)).unwrap();
+        run(&mut w, &[], 2);
+        w.debug_set_hp(u, 5_000);
+        run(&mut w, &[], 10 * TPS);
+        w.units().hp[w.units().index_of(u).unwrap()] as i32 - 5_000
+    };
+    let (alone, linked) = (healed(1), healed(4));
+    // 1 of 4 reachable cities: a quarter of the city healing rate.
+    assert!(linked > 3 * alone && alone > 0, "alone {alone} linked {linked}");
 }

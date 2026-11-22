@@ -62,6 +62,8 @@ pub struct City {
     /// Player currently capturing it and for how many ticks.
     pub capture_by: u8,
     pub capture_ticks: u16,
+    /// Ticks without any of the owner's units inside (city spawn).
+    pub empty_ticks: u16,
 }
 
 impl City {
@@ -137,6 +139,30 @@ impl Hood {
             start = end;
         }
     }
+}
+
+/// Corridor distance fields for every team (parallel).
+fn this_corridors(w: &World, nteams: usize) -> Vec<territory::Corridors> {
+    w.pool.install(|| {
+        (0..nteams)
+            .into_par_iter()
+            .map(|t| {
+                let bit = 1u8 << t;
+                let cities: Vec<(u32, u32)> = w
+                    .cities
+                    .iter()
+                    .filter(|c| c.owner != 0 && w.team_bit[c.owner as usize] == bit)
+                    .map(|c| (c.x as u32, c.y as u32))
+                    .collect();
+                territory::Corridors::compute(
+                    &w.map,
+                    |o| o != 0 && w.team_bit[o as usize] != bit,
+                    |x, y| !w.rules.passable[w.map.terrain_raw(x, y) as usize],
+                    &cities,
+                )
+            })
+            .collect()
+    })
 }
 
 /// Result of the separation pass for one unit: its push away from
@@ -266,6 +292,12 @@ pub struct World {
     /// Chunks with any city zone.
     chunk_city: Vec<bool>,
     city_plane_dirty: bool,
+    /// Supply corridors per team (index = bit of `team_bit`).
+    corridors: Vec<territory::Corridors>,
+    /// Player bits of the corridor cells drawn as own land.
+    corridor_marks: Vec<u8>,
+    /// Chunks crossed by a corridor.
+    chunk_corridor: Vec<bool>,
     /// Recompute every chunk's zones on the next territory phase.
     zones_stale: bool,
     /// Tile owner for every set of players present (bit p-1 = player p),
@@ -361,6 +393,9 @@ impl World {
             city_plane: vec![0; tiles],
             chunk_city: vec![false; chunks],
             city_plane_dirty: true,
+            corridors: Vec::new(),
+            corridor_marks: Vec::new(),
+            chunk_corridor: vec![false; chunks],
             zones_stale: true,
             owner_of: territory::owner_table(&team_mask),
             team_bit,
@@ -532,6 +567,7 @@ impl World {
             capital_of: if capital { owner } else { 0 },
             capture_by: 0,
             capture_ticks: 0,
+            empty_ticks: 0,
         });
         // Chunks this city's zone can reach.
         let r = self.rules.city_radius.max(self.rules.rear_radius) + 1;
@@ -593,6 +629,14 @@ impl World {
 
     /// Places a full-health unit. Used for match setup and (from stage 2) by
     /// city production at the end of a tick.
+    /// Sets a unit's HP (tests and tools, never from commands).
+    #[doc(hidden)]
+    pub fn debug_set_hp(&mut self, h: UnitHandle, hp: u16) {
+        if let Some(i) = self.units.index_of(h) {
+            self.units.hp[i] = hp.min(self.rules.max_hp);
+        }
+    }
+
     pub fn spawn(&mut self, owner: u8, kind: UnitKind, at: FxPoint) -> Result<UnitHandle, String> {
         if owner == 0 || owner > self.players {
             return Err(format!("no player {owner}"));
@@ -1502,7 +1546,7 @@ impl World {
                         city_tiles.push((x, y, city.owner));
                     }
                 }
-                if !any_unit && !this.chunk_city[c] && !this.chunk_owned[c] {
+                if !any_unit && !this.chunk_city[c] && !this.chunk_owned[c] && !this.chunk_corridor[c] {
                     out.0 = usize::MAX;
                     return;
                 }
@@ -1523,6 +1567,10 @@ impl World {
                         });
                     },
                     &this.city_plane[c * map::CHUNK_TILES..(c + 1) * map::CHUNK_TILES],
+                    this.corridors
+                        .first()
+                        .filter(|_| !this.corridor_marks.is_empty())
+                        .map(|k| (&this.corridor_marks[..], k.w)),
                     &city_tiles,
                 );
             });
@@ -1547,6 +1595,33 @@ impl World {
 
     // ---------------------------------------------------------------- phase 8
 
+    /// Draws the supply corridors: from every unit, the shortest way to an
+    /// own city over land no enemy holds (ways merge into a tree).
+    fn trace_corridors(&mut self) {
+        let Some(first) = self.corridors.first() else { return };
+        let cells = (first.w * first.h) as usize;
+        let mut marks = take(&mut self.corridor_marks);
+        marks.clear();
+        marks.resize(cells, 0);
+        let u = &self.units;
+        for i in 0..u.len() {
+            let o = u.owner[i];
+            let t = self.team_bit[o as usize].trailing_zeros() as usize;
+            if let Some(c) = self.corridors.get(t) {
+                c.trace(&mut marks, (u.pos_x[i] >> 16) as u32, (u.pos_y[i] >> 16) as u32, territory::player_bit(o));
+            }
+        }
+        let (cw, w) = (self.map.chunks_w() as usize, first.w as usize);
+        self.chunk_corridor.fill(false);
+        let per = (map::CHUNK / territory::CELL) as usize;
+        for (k, &m) in marks.iter().enumerate() {
+            if m != 0 {
+                self.chunk_corridor[(k / w / per) * cw + (k % w) / per] = true;
+            }
+        }
+        self.corridor_marks = marks;
+    }
+
     /// Pockets, supply limits and starvation rates (every 15 ticks).
     fn recompute_supply(&mut self) {
         if self.territory_changed || self.pockets.is_empty() {
@@ -1566,7 +1641,12 @@ impl World {
             });
             self.pockets = pockets;
             self.territory_changed = false;
+            // Supply corridors: distances to own cities per team…
+            let corridors: Vec<territory::Corridors> = this_corridors(self, nteams);
+            self.corridors = corridors;
         }
+        // …and the ways from every unit to them, drawn as own land.
+        self.trace_corridors();
         let mut total = 0u32;
         self.pocket_owner.clear();
         for p in 1..=self.players as usize {
@@ -1674,7 +1754,27 @@ impl World {
         if self.player[me as usize].broke && !in_city {
             return hp;
         }
+        // Supply quality: in a city, how many own cities it reaches (a
+        // blockaded city heals less); outside, the corridor length.
+        let share = if self.sandbox {
+            1000
+        } else if let Some(c) = self.friendly_city_at(x, y, me) {
+            let n = self
+                .pocket_of_city(c)
+                .map_or(1, |p| (self.pocket_limit[p as usize] / self.rules.per_city.max(1)).max(1));
+            (n as i64 * 1000 / self.rules.blockade_cities.max(1) as i64).min(1000)
+        } else {
+            let t = self.team_bit[me as usize].trailing_zeros() as usize;
+            let d = self.corridors.get(t).map_or(territory::NO_WAY, |c| c.at((x >> 16) as u32, (y >> 16) as u32));
+            territory::corridor_share(
+                d,
+                self.rules.corridor_full_cells,
+                self.rules.corridor_max_cells,
+                self.rules.corridor_min.0,
+            )
+        };
         let q16 = if in_city { self.rules.heal_city_q16 } else { self.rules.heal_q16 };
+        let q16 = q16 * share as u64 / 1000;
         let heal = stochastic_round_q16(q16, rand(self.seed, self.tick, u.slot[i], Purpose::Environment));
         (hp as u64 + heal).min(self.rules.max_hp as u64) as u16
     }
@@ -1690,6 +1790,7 @@ impl World {
     }
 
     fn capture_cities(&mut self) {
+        let mut raise: Vec<usize> = Vec::new();
         for c in 0..self.cities.len() {
             let city = &self.cities[c];
             let (cx, cy, owner) = (city.x as i32, city.y as i32, city.owner);
@@ -1746,6 +1847,34 @@ impl World {
                     city.capture_ticks = 0;
                 }
             }
+            // An empty city (no owner's unit, nobody capturing) raises a unit.
+            if city.owner != 0 && !defended && attacker.is_none() {
+                city.empty_ticks = city.empty_ticks.saturating_add(1);
+                if city.empty_ticks >= self.rules.spawn_ticks {
+                    raise.push(c);
+                }
+            } else {
+                city.empty_ticks = 0;
+            }
+        }
+        if self.sandbox {
+            return;
+        }
+        for c in raise {
+            // Free, but only with supply to spare in the city's pocket;
+            // otherwise it tries again next tick.
+            let Some(p) = self.pocket_of_city(c) else { continue };
+            let r = rand(self.seed, self.tick, c as u32, Purpose::CitySpawn);
+            let heavy = (r % 1000) < self.rules.spawn_heavy.0 as u64;
+            let kind = if heavy { UnitKind::Heavy } else { UnitKind::Light };
+            let need = self.rules.supply[kind as usize];
+            if self.pocket_used[p as usize] + need > self.pocket_limit[p as usize] {
+                continue;
+            }
+            self.pocket_used[p as usize] += need;
+            let owner = self.cities[c].owner;
+            self.pending_spawns.push((owner, kind, c as u16));
+            self.cities[c].empty_ticks = 0;
         }
     }
 
@@ -1883,6 +2012,7 @@ impl World {
         for c in &self.cities {
             h.update(&[c.owner, c.capital_of, c.capture_by]);
             h.update(&c.capture_ticks.to_le_bytes());
+            h.update(&c.empty_ticks.to_le_bytes());
             h.update(&c.x.to_le_bytes());
             h.update(&c.y.to_le_bytes());
         }

@@ -123,7 +123,11 @@ now, or cities within 15 tiles; land between two or more of your cities with
 no enemy city near is your rear and is yours too; land nobody holds, or both sides contest, is neutral.
 Supply flows over your own and neutral land, so to cut an enemy off you
 must surround it with a closed ring of your own control and keep standing
-there. Keep a unit in each city: a city with a defender inside cannot be
+there. The shortest supply way from each army to a city shows as a strip of
+your colour; the longer it is, the slower your units heal (full up to 40
+tiles, a quarter at 200). A city cut off from your other cities heals at a
+quarter rate. A city left without your units for 5 s raises one for free
+(two out of three light), if its supply allows. Keep a unit in each city: a city with a defender inside cannot be
 captured, and units in cities cost no upkeep.
 
 **Formations.** With two or more units selected, a bar at the bottom offers

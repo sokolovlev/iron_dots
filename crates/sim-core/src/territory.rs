@@ -153,6 +153,7 @@ pub fn chunk_owners(
     owner_of: &[u8; 256],
     units: impl FnOnce(&mut dyn FnMut(i32, i32, u8)),
     city_bits: &[u8],
+    corridor: Option<(&[u8], u32)>,
     city_tiles: &[(u32, u32, u8)],
 ) -> bool {
     let out = &mut out[..CHUNK_TILES];
@@ -194,12 +195,152 @@ pub fn chunk_owners(
         *v = owner_of[*v as usize];
         any |= *v;
     }
+    // Supply corridors (marks per coarse cell, `cells_w` cells per row)
+    // colour only neutral land: they never contest land units hold, or a
+    // corridor would open the very ring it was cut by.
+    if let Some((marks, cells_w)) = corridor {
+        for ly in 0..c {
+            let row = ((oy + ly) as u32 / CELL * cells_w) as usize;
+            for lx in 0..c {
+                let v = &mut out[(ly * c + lx) as usize];
+                if *v == 0 {
+                    *v = owner_of[marks[row + ((ox + lx) as u32 / CELL) as usize] as usize];
+                    any |= *v;
+                }
+            }
+        }
+    }
     let mut any = any != 0;
     for &(x, y, o) in city_tiles {
         out[((y - cy * CHUNK) * CHUNK + (x - cx * CHUNK)) as usize] = o;
         any |= o != 0;
     }
     any
+}
+
+/// Side of a coarse supply cell, tiles.
+pub const CELL: u32 = 4;
+/// "Unreachable" in a corridor distance field.
+pub const NO_WAY: u16 = u16::MAX;
+
+/// Distance (in cells, 4-connected) from every coarse cell to the nearest
+/// own city over cells a team may cross: no tile held by another team and
+/// not all impassable. The basis of supply corridors.
+#[derive(Clone, Debug, Default)]
+pub struct Corridors {
+    pub w: u32,
+    pub h: u32,
+    pub dist: Vec<u16>,
+}
+
+impl Corridors {
+    /// `enemy(owner)` says whether a tile owner is hostile, `impassable(x, y)`
+    /// whether a tile can be walked; `cities` are own city tiles.
+    pub fn compute(
+        map: &Map,
+        enemy: impl Fn(u8) -> bool,
+        impassable: impl Fn(u32, u32) -> bool,
+        cities: &[(u32, u32)],
+    ) -> Corridors {
+        let (w, h) = (map.width().div_ceil(CELL), map.height().div_ceil(CELL));
+        let mut open = vec![true; (w * h) as usize];
+        for cy in 0..h {
+            for cx in 0..w {
+                let (mut walls, mut tiles) = (0, 0);
+                let mut hostile = false;
+                'cell: for y in cy * CELL..((cy + 1) * CELL).min(map.height()) {
+                    for x in cx * CELL..((cx + 1) * CELL).min(map.width()) {
+                        if enemy(map.owner(x, y)) {
+                            hostile = true;
+                            break 'cell;
+                        }
+                        tiles += 1;
+                        walls += impassable(x, y) as u32;
+                    }
+                }
+                open[(cy * w + cx) as usize] = !hostile && walls < tiles;
+            }
+        }
+        let mut dist = vec![NO_WAY; (w * h) as usize];
+        let mut queue = std::collections::VecDeque::new();
+        for &(x, y) in cities {
+            let k = ((y / CELL) * w + x / CELL) as usize;
+            if dist[k] != 0 {
+                dist[k] = 0;
+                queue.push_back(k);
+            }
+        }
+        while let Some(k) = queue.pop_front() {
+            let (cx, cy) = (k as u32 % w, k as u32 / w);
+            let d = dist[k] + 1;
+            for (nx, ny) in [(cx.wrapping_sub(1), cy), (cx + 1, cy), (cx, cy.wrapping_sub(1)), (cx, cy + 1)] {
+                if nx >= w || ny >= h {
+                    continue;
+                }
+                let n = (ny * w + nx) as usize;
+                if open[n] && dist[n] == NO_WAY && d < NO_WAY {
+                    dist[n] = d;
+                    queue.push_back(n);
+                }
+            }
+        }
+        Corridors { w, h, dist }
+    }
+
+    /// Corridor length at tile `(x, y)`, in cells.
+    #[inline]
+    pub fn at(&self, x: u32, y: u32) -> u16 {
+        self.dist.get(((y / CELL) * self.w + x / CELL) as usize).copied().unwrap_or(NO_WAY)
+    }
+
+    /// Marks with `bit` the cells of the way from the cell of tile `(x, y)`
+    /// down to a city (steepest descent, fixed neighbour order), stopping
+    /// where `marks` already has the bit: ways merge into a tree.
+    pub fn trace(&self, marks: &mut [u8], x: u32, y: u32, bit: u8) {
+        let mut k = ((y / CELL) * self.w + x / CELL) as usize;
+        if self.dist.get(k).is_none_or(|&d| d == NO_WAY) {
+            return;
+        }
+        loop {
+            if marks[k] & bit != 0 {
+                return;
+            }
+            marks[k] |= bit;
+            let d = self.dist[k];
+            if d == 0 {
+                return;
+            }
+            let (cx, cy) = (k as u32 % self.w, k as u32 / self.w);
+            let mut next = None;
+            for (nx, ny) in [(cx.wrapping_sub(1), cy), (cx + 1, cy), (cx, cy.wrapping_sub(1)), (cx, cy + 1)] {
+                if nx < self.w && ny < self.h && self.dist[(ny * self.w + nx) as usize] == d - 1 {
+                    next = Some((ny * self.w + nx) as usize);
+                    break;
+                }
+            }
+            match next {
+                Some(n) => k = n,
+                None => return,
+            }
+        }
+    }
+}
+
+/// Healing share (thousandths) at the end of a corridor `d` cells long:
+/// full up to `full`, falling linearly to `min` at `max` and beyond; the
+/// minimum too if no way is known (the pocket decides about starving).
+pub fn corridor_share(d: u16, full: u32, max: u32, min: i64) -> i64 {
+    if d == NO_WAY {
+        return min;
+    }
+    let d = d as u32;
+    if d <= full {
+        1000
+    } else if d >= max {
+        min
+    } else {
+        1000 - (1000 - min) * (d - full) as i64 / (max - full).max(1) as i64
+    }
 }
 
 /// Connected land of one team: rows of runs of passable tiles, each run
@@ -369,6 +510,7 @@ mod tests {
             &owner_table(&mask),
             |f| f(10 << 16, 10 << 16, 2),
             &[0; CHUNK_TILES],
+            None,
             &[(40, 40, 1)],
         );
         assert!(any);
@@ -420,5 +562,33 @@ mod city_tests {
         // A single city: no rear beyond its circle.
         city_zones(&mut out, 0, 0, &[(10, 32, 1, 1)], 15, 30);
         assert_eq!(out[32 * 64 + 35], 0);
+    }
+}
+
+#[cfg(test)]
+mod corridor_tests {
+    use super::*;
+    use crate::map::Terrain;
+
+    #[test]
+    fn corridors_go_round_enemy_land() {
+        let mut m = Map::new(64, 64, Terrain::Plain).unwrap();
+        // An enemy wall at x 28..32 from the top down to y 48.
+        for y in 0..48 {
+            for x in 28..32 {
+                m.set_owner(x, y, 2);
+            }
+        }
+        let c = Corridors::compute(&m, |o| o == 2, |_, _| false, &[(4, 4)]);
+        // Straight across is 10 cells; round the wall's end much longer.
+        let d = c.at(40, 4);
+        assert!(d > 20 && d != NO_WAY, "{d}");
+        assert_eq!(c.at(28, 4), NO_WAY);
+        let mut marks = vec![0u8; (c.w * c.h) as usize];
+        c.trace(&mut marks, 40, 4, 1);
+        assert!(marks[(12 * c.w + 7) as usize] == 1, "the way passes under the wall");
+        assert_eq!(corridor_share(5, 10, 50, 250), 1000);
+        assert_eq!(corridor_share(30, 10, 50, 250), 625);
+        assert_eq!(corridor_share(80, 10, 50, 250), 250);
     }
 }

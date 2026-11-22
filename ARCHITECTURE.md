@@ -196,6 +196,24 @@ Stage 2 had to pin down details that spec §2 describes only in words:
   (two wings). Facing is from the group's centre to the first path point;
   the units furthest forward fill the front rank, left to right, so paths
   rarely cross (`sim_core::formation`).
+- **Supply corridors** (playtesting): every 15 ticks each team gets a
+  distance field (4×4-tile cells, BFS) from its cities over cells with no
+  tile held by another team. From every unit the shortest way back to a
+  city is traced (ways merge into a tree) and painted as the team's land,
+  4 tiles wide, on neutral tiles only: a corridor never contests land units
+  hold, or it could reopen the ring that cut it. Healing outside cities is
+  multiplied by the corridor share: 100% up to `supply.corridor_full` (40
+  tiles), falling linearly to `supply.corridor_min` (25%) at
+  `supply.corridor_max` (200 tiles) and beyond. Units cut off completely
+  (no city in their pocket) starve as before.
+- **Blockaded cities:** healing in a city is multiplied by
+  min(1, n / `supply.blockade_cities`) where n is the number of the owner's
+  cities in that city's pocket (itself included): a city cut off from all
+  others heals at a quarter rate, but still supplies its pocket.
+- **City spawn:** an owned city with none of its owner's units inside for
+  `city.spawn_time` (5 s), and nobody capturing it, raises a unit for free
+  if its pocket has supply to spare: heavy with probability
+  `city.spawn_heavy` (0.34), otherwise light (deterministic RNG).
 - **Solid bodies** (changed after playtesting): a unit is a disc 1.5 tiles
   across (`unit.separation_radius` is the centre distance of touching
   units); overlapping units are pushed apart by up to a quarter diameter per
@@ -400,7 +418,10 @@ With solid bodies and contact movement (sim version 8) the bots are not
 retuned yet: Normal vs Easy 49% / 57%, Hard vs Normal 64% / 63%. Matches
 also last longer. With city rears and twice as many cities (version 9) the
 ordering is off too, so the strength tests are `#[ignore]`d until bots are
-retuned, which waits until the rules settle after playtesting.
+retuned, which waits until the rules settle after playtesting. Since city
+spawns (version 10) bots no longer finish matches within 25 minutes; the
+"reaches victory" tests are ignored for the same reason (the golden replay
+is still checked).
 
 A fixed 10-match sample runs in `cargo test` as a regression guard. Heavy
 units still make bots weaker, so bots buy light units only.
