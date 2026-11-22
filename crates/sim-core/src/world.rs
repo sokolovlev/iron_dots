@@ -548,6 +548,12 @@ impl World {
         self.team_budget = [n; 8];
     }
 
+    /// Limited war: no money (no income, upkeep or prices).
+    #[inline]
+    pub fn moneyless(&self) -> bool {
+        self.team_budget.iter().any(|b| b.is_some())
+    }
+
     /// Units `player`'s team may still create (`None` = unlimited).
     pub fn unit_budget(&self, player: u8) -> Option<u32> {
         self.team_budget[self.team_bit[player as usize].trailing_zeros() as usize]
@@ -842,7 +848,7 @@ impl World {
         if self.unit_budget(player) == Some(0) {
             return false;
         }
-        let cost = self.rules.cost[kind as usize];
+        let cost = if self.moneyless() { 0 } else { self.rules.cost[kind as usize] };
         if self.player[player as usize].money < cost {
             return false;
         }
@@ -1800,6 +1806,21 @@ impl World {
                 self.rules.corridor_min.0,
             )
         };
+        // Limited war: the more supply places per unit in the pocket, the
+        // faster wounds heal (×0.25 to ×2): many cities and few units heal
+        // fast, one city and a crowd slowly.
+        let share = if self.moneyless() && !self.sandbox {
+            let p = u.pocket[i];
+            let ratio = if p == NO_POCKET {
+                250
+            } else {
+                let (used, limit) = (self.pocket_used[p as usize].max(1) as i64, self.pocket_limit[p as usize] as i64);
+                (limit * 1000 / used).clamp(250, 2000)
+            };
+            share * ratio / 1000
+        } else {
+            share
+        };
         let q16 = if in_city { self.rules.heal_city_q16 } else { self.rules.heal_q16 };
         let q16 = q16 * share as u64 / 1000;
         let heal = stochastic_round_q16(q16, rand(self.seed, self.tick, u.slot[i], Purpose::Environment));
@@ -1900,7 +1921,7 @@ impl World {
             let kind = if heavy { UnitKind::Heavy } else { UnitKind::Light };
             let need = self.rules.supply[kind as usize];
             let owner = self.cities[c].owner;
-            let cost = self.rules.cost[kind as usize];
+            let cost = if self.moneyless() { 0 } else { self.rules.cost[kind as usize] };
             // In a limited war it also uses up the team's unit budget.
             let t = self.team_bit[owner as usize].trailing_zeros() as usize;
             if self.pocket_used[p as usize] + need > self.pocket_limit[p as usize]
@@ -1921,6 +1942,10 @@ impl World {
 
     /// Once per second: income from cities, upkeep of units outside cities.
     fn settle_money(&mut self) {
+        // A limited war has no money: units are limited by the budget.
+        if self.moneyless() {
+            return;
+        }
         let mut delta = [0i64; MAX_PLAYERS + 1];
         for c in &self.cities {
             delta[c.owner as usize] += self.rules.city_income;

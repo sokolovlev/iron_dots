@@ -350,3 +350,24 @@ fn limited_war_splits_the_map_and_counts_units() {
     assert_eq!(w.units().len(), units + 1, "the empty city raised a unit");
     assert_eq!(w.unit_budget(1), Some(1));
 }
+
+#[test]
+fn limited_war_has_no_money_and_heals_by_supply_per_unit() {
+    let healed = |cities: i32, units: i32| {
+        let mut w = world();
+        w.set_unit_budget(Some(100));
+        assert!(w.moneyless());
+        for k in 0..cities {
+            w.add_city((10 + 8 * k) as u32, 10, 1, k == 0).unwrap();
+        }
+        let hs: Vec<_> = (0..units).map(|k| w.spawn(1, UnitKind::Light, pt(10 + 2 * k, 14)).unwrap()).collect();
+        run(&mut w, &[], 20);
+        w.debug_set_hp(hs[0], 5_000);
+        run(&mut w, &[], 10 * TPS);
+        assert_eq!(w.player(1).money, 200_000, "no income or upkeep");
+        w.units().hp[w.units().index_of(hs[0]).unwrap()] as i32 - 5_000
+    };
+    // 4 cities (20 places) for 1 unit: ×2; 1 city (5) for 5 units: ×1.
+    let (roomy, crowded) = (healed(4, 1), healed(1, 5));
+    assert!(roomy * 10 >= crowded * 17, "roomy {roomy} crowded {crowded}");
+}

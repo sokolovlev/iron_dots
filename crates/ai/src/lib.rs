@@ -353,8 +353,10 @@ impl Controller for Bot {
 
         // ------------------------------------------------------- economy
         if strategic {
-            let money = world.player(me).money;
-            let mut budget = money - self.p.reserve;
+            // A limited war has no money, only a unit budget.
+            let moneyless = world.moneyless();
+            let mut budget = if moneyless { i64::MAX / 4 } else { world.player(me).money - self.p.reserve };
+            let mut units_left = world.unit_budget(me).unwrap_or(u32::MAX);
             for (ci, c) in cities.iter().enumerate() {
                 if c.owner != me {
                     continue;
@@ -365,11 +367,12 @@ impl Controller for Bot {
                     let every = self.p.heavy_every;
                     let want_heavy = every != 0 && self.bought % every == every - 1;
                     let kind = if want_heavy { UnitKind::Heavy } else { UnitKind::Light };
-                    let cost = world.rules().cost[kind as usize];
+                    let cost = if moneyless { 0 } else { world.rules().cost[kind as usize] };
                     let need = world.rules().supply[kind as usize];
-                    if budget < cost || free < need {
+                    if budget < cost || free < need || units_left == 0 {
                         break;
                     }
+                    units_left -= 1;
                     budget -= cost;
                     free -= need;
                     self.bought += 1;

@@ -202,7 +202,12 @@ Stage 2 had to pin down details that spec §2 describes only in words:
   whose capital is nearest, so each side starts with its half of the map and
   a front between; every city gets a light defender; each team may create
   `n` units in the whole match (`World::unit_budget`), counting purchases
-  and units raised by empty cities alike. A player with no units and nothing left to
+  and units raised by empty cities alike. A limited war has no money
+  (`World::moneyless`): no income, upkeep or prices; the budget and the
+  supply limit (5 places per city in the pocket) are the only limits, and
+  healing is multiplied by the pocket's places per unit (limit / used,
+  from ×0.25 to ×2), so a crowd around one city heals slowly and a few
+  units among many cities quickly. A player with no units and nothing left to
   create is out. Lobbies carry the mode (`LobbySettings::unit_budget`).
 - **Positions** (client helper, `client::fronts`): the player draws a curve;
   places every 1.6 tiles along it (none on impassable tiles) are taken by

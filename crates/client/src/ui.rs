@@ -167,7 +167,7 @@ fn single_player(root: &mut egui::Ui, m: &mut Menu) -> UiAction {
                         (
                             GameMode::Limited { units: limited_units },
                             "Limited war",
-                            "The map is split in half from the start, with a front between.\nEvery city has a defender, and each side may create only so many units, bought or raised.",
+                            "The map is split in half from the start, with a front between.\nEvery city has a defender. No money: each side may create only so many units, and supply limits the army.",
                         ),
                     ] {
                         let on = std::mem::discriminant(&m.settings.mode) == std::mem::discriminant(&mode);
@@ -310,11 +310,13 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
     egui::Area::new(egui::Id::unique("hud")).anchor(Align2::LEFT_TOP, [8.0, 8.0]).show(ctx, |ui| {
         hud_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Money {}", money(st.money))).strong());
-                let inc = st.net_income / 1000;
-                let col = if inc >= 0 { Color32::LIGHT_GREEN } else { Color32::LIGHT_RED };
-                ui.colored_label(col, format!("{inc:+}/s"));
-                ui.separator();
+                if !w.moneyless() {
+                    ui.label(RichText::new(format!("Money {}", money(st.money))).strong());
+                    let inc = st.net_income / 1000;
+                    let col = if inc >= 0 { Color32::LIGHT_GREEN } else { Color32::LIGHT_RED };
+                    ui.colored_label(col, format!("{inc:+}/s"));
+                    ui.separator();
+                }
                 let supply_col = if used > limit { Color32::LIGHT_RED } else { ui.visuals().text_color() };
                 ui.colored_label(supply_col, format!("Supply {used}/{limit}"));
                 ui.separator();
@@ -403,7 +405,10 @@ pub fn hud(ctx: &egui::Context, g: &mut Game, menu_open: &mut bool) -> UiAction 
                     ui.label(format!("Pocket supply {u}/{l}"));
                 }
                 let rules = g.world.rules();
-                let (cl, ch) = (rules.cost[0] / 1000, rules.cost[1] / 1000);
+                let price = |k: usize| {
+                    if g.world.moneyless() { "free".to_string() } else { (rules.cost[k] / 1000).to_string() }
+                };
+                let (cl, ch) = (price(0), price(1));
                 ui.horizontal(|ui| {
                     if ui.button(format!("Light ({cl})  [Q]")).clicked() {
                         g.buy(UnitKind::Light);
