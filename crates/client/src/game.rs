@@ -581,7 +581,7 @@ impl Game {
     /// Left click at screen `px`.
     pub fn click_select(&mut self, px: [f32; 2], viewport: [f32; 2], add: bool) {
         let w = self.camera.screen_to_world(px, viewport);
-        let radius = (10.0 / self.camera.scale).max(0.7);
+        let radius = (16.0 / self.camera.scale).max(1.2);
         if let Some(i) = self.pick_unit(w, radius) {
             let h = self.world.units().handle(i);
             if !add {
@@ -610,7 +610,7 @@ impl Game {
     /// Double click: every own unit of the same type on screen.
     pub fn select_same_type(&mut self, px: [f32; 2], viewport: [f32; 2]) {
         let w = self.camera.screen_to_world(px, viewport);
-        let radius = (10.0 / self.camera.scale).max(0.7);
+        let radius = (16.0 / self.camera.scale).max(1.2);
         let Some(i) = self.pick_unit(w, radius) else { return };
         let kind = self.world.units().kind[i];
         let a = self.camera.screen_to_world([0.0, 0.0], viewport);

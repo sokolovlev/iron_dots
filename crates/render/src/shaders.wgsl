@@ -127,9 +127,9 @@ const QUAD = array<vec2<f32>, 6>(
 @vertex
 fn vs_marker(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32, m: Marker) -> MarkerOut {
     let shape = (m.info >> 8u) & 3u;
-    var radius = max(0.45, 4.0 / cam.scale);
+    var radius = max(0.9, 8.0 / cam.scale);
     if (shape != 0u) {
-        radius = max(0.75, 7.0 / cam.scale);
+        radius = max(1.1, 10.0 / cam.scale);
     }
     let fixed_px = f32(m.stats >> 24u);
     if (fixed_px > 0.0) {
@@ -191,12 +191,19 @@ fn fs_marker(in: MarkerOut) -> @location(0) vec4<f32> {
             col = vec4<f32>(mix(col.rgb, team * 0.3, ring), col.a);
         }
         if ((in.info & 0x40u) != 0u) {
-            let r = abs(length(p) - 1.3);
-            let sel = 1.0 - smoothstep(0.1 - aa, 0.1 + aa, r);
-            col = mix(col, vec4<f32>(1.0, 1.0, 1.0, 1.0), sel);
+            // Selected: a brighter body, a bright ring hugging the dot and a
+            // soft glow around it.
+            let l = length(p);
+            col = vec4<f32>(mix(col.rgb, vec3<f32>(1.0), 0.18 * body), col.a);
+            let glow = (1.0 - smoothstep(1.0, 1.55, l)) * step(1.0, l) * 0.55;
+            let ring = 1.0 - smoothstep(0.09 - aa, 0.09 + aa, abs(l - 1.12));
+            let hl = vec3<f32>(1.0, 0.97, 0.7);
+            col = vec4<f32>(mix(col.rgb, hl, max(glow * (1.0 - col.a), ring)), max(col.a, max(glow, ring)));
         }
         // HP and morale bars above the dot when zoomed in enough.
-        if (in.px_per_unit > 4.0 && (in.stats >> 24u) == 0u && p.x > -1.0 && p.x < 1.0) {
+        // Only for units that are hurt or shaken: a healthy crowd stays clean.
+        let hurt = hp < 0.99 || morale < 0.99;
+        if (hurt && in.px_per_unit > 4.0 && (in.stats >> 24u) == 0u && p.x > -1.0 && p.x < 1.0) {
             let x = (p.x + 1.0) * 0.5;
             if (p.y > -1.75 && p.y < -1.5) {
                 let c = select(vec3<f32>(0.2, 0.2, 0.2), vec3<f32>(0.25, 0.8, 0.3), x < hp);
