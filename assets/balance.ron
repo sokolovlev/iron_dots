@@ -66,8 +66,9 @@
     // Rear: land within rear_radius of two or more cities of one side, and of
     // no city of another side, is that side's (no grey gaps behind the front).
     territory: (radius: 3, city_radius: 15, rear_radius: 30),
-    // An empty city (no own unit inside for spawn_time s) raises a unit for
-    // free when its pocket has supply to spare; spawn_heavy of them heavy.
+    // An empty city (no own unit inside for spawn_time s, nobody capturing it)
+    // raises a unit at the usual price when the owner can pay and its pocket
+    // has supply to spare; spawn_heavy of them heavy.
     city: (capture_time: "5", defense_bonus: "0.5", spawn_time: "5", spawn_heavy: "0.34"),
     match_rules: (start_light_units: 3, win_city_share: "0.8"),
 

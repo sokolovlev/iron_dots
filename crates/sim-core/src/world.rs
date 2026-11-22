@@ -819,6 +819,10 @@ impl World {
         if city >= self.cities.len() || self.cities[city].owner != player {
             return false;
         }
+        // No reinforcements into a city that is being taken.
+        if self.cities[city].capture_by != 0 {
+            return false;
+        }
         let cost = self.rules.cost[kind as usize];
         if self.player[player as usize].money < cost {
             return false;
@@ -1847,8 +1851,9 @@ impl World {
                     city.capture_ticks = 0;
                 }
             }
-            // An empty city (no owner's unit, nobody capturing) raises a unit.
-            if city.owner != 0 && !defended && attacker.is_none() {
+            // An empty city (no owner's unit, nobody capturing or about to)
+            // raises a unit.
+            if city.owner != 0 && !defended && attacker.is_none() && city.capture_by == 0 {
                 city.empty_ticks = city.empty_ticks.saturating_add(1);
                 if city.empty_ticks >= self.rules.spawn_ticks {
                     raise.push(c);
@@ -1861,18 +1866,25 @@ impl World {
             return;
         }
         for c in raise {
-            // Free, but only with supply to spare in the city's pocket;
-            // otherwise it tries again next tick.
+            // Paid like a purchase, and only with supply to spare in the
+            // city's pocket; otherwise it tries again next tick. The unit
+            // kind is drawn when the city becomes due, so waiting for money
+            // does not reroll it.
             let Some(p) = self.pocket_of_city(c) else { continue };
-            let r = rand(self.seed, self.tick, c as u32, Purpose::CitySpawn);
+            let due = self.tick - (self.cities[c].empty_ticks - self.rules.spawn_ticks) as u32;
+            let r = rand(self.seed, due, c as u32, Purpose::CitySpawn);
             let heavy = (r % 1000) < self.rules.spawn_heavy.0 as u64;
             let kind = if heavy { UnitKind::Heavy } else { UnitKind::Light };
             let need = self.rules.supply[kind as usize];
-            if self.pocket_used[p as usize] + need > self.pocket_limit[p as usize] {
+            let owner = self.cities[c].owner;
+            let cost = self.rules.cost[kind as usize];
+            if self.pocket_used[p as usize] + need > self.pocket_limit[p as usize]
+                || self.player[owner as usize].money < cost
+            {
                 continue;
             }
             self.pocket_used[p as usize] += need;
-            let owner = self.cities[c].owner;
+            self.player[owner as usize].money -= cost;
             self.pending_spawns.push((owner, kind, c as u16));
             self.cities[c].empty_ticks = 0;
         }

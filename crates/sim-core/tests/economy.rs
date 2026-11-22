@@ -234,19 +234,40 @@ fn wide_map_presets_make_fair_matches() {
 }
 
 #[test]
-fn empty_cities_raise_units_mostly_light() {
+fn empty_cities_raise_units_mostly_light_and_paid() {
     let mut w = world();
     for k in 0..12 {
         w.add_city(6 + (k % 4) * 14, 6 + (k / 4) * 20, 1, k == 0).unwrap();
     }
-    // Nothing inside: each city raises one unit after 5 s, then has a
-    // defender and stops.
+    // Nothing inside: after 5 s each city raises a unit when the money
+    // allows (200 to start, 120/s from 12 cities), then has a defender.
     run(&mut w, &[], 5 * TPS + 2);
+    let first = w.units().len();
+    // 200 to start plus 5 s of income from 12 cities: up to 4 units.
+    assert!((1..=4).contains(&first), "only what the money buys: {first}");
+    run(&mut w, &[], 60 * TPS);
     assert_eq!(w.units().len(), 12);
     run(&mut w, &[], 10 * TPS);
     assert_eq!(w.units().len(), 12, "a city with a defender does not raise more");
     let heavy = w.units().kind.iter().filter(|&&k| k == UnitKind::Heavy as u8).count();
     assert!((1..=8).contains(&heavy), "{heavy} heavy of 12");
+}
+
+#[test]
+fn a_city_being_captured_neither_sells_nor_raises() {
+    let mut w = world();
+    w.add_city(30, 30, 1, true).unwrap();
+    // An enemy stands in the empty city from the start: capture under way.
+    w.spawn(2, UnitKind::Light, pt(30, 30)).unwrap();
+    w.step(&[]);
+    assert_ne!(w.cities()[0].capture_by, 0, "capture under way");
+    let buy_cmd = [buy(w.tick(), 1, 7, 0, UnitKind::Light)];
+    w.step(&buy_cmd);
+    assert_eq!(w.stats().commands_rejected, 1, "no buying in a city being taken");
+    run(&mut w, &[], 3 * TPS);
+    assert!(w.units().owner.iter().all(|&o| o == 2), "and no raising either");
+    run(&mut w, &[], 3 * TPS);
+    assert_eq!(w.cities()[0].owner, 2);
 }
 
 #[test]

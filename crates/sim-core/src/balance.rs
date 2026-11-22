@@ -111,8 +111,9 @@ pub struct TerritoryParams {
 pub struct CityParams {
     pub capture_time: Milli,
     pub defense_bonus: Milli,
-    /// A city with none of its owner's units inside for this long (s)
-    /// raises a unit for free, if its pocket has supply to spare.
+    /// A city with none of its owner's units inside for this long (s), and
+    /// not being captured, raises a unit at the usual price if the owner
+    /// has the money and its pocket the supply.
     pub spawn_time: Milli,
     /// Share of those units that are heavy (the rest are light).
     pub spawn_heavy: Milli,

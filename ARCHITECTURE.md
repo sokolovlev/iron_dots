@@ -211,9 +211,11 @@ Stage 2 had to pin down details that spec §2 describes only in words:
   cities in that city's pocket (itself included): a city cut off from all
   others heals at a quarter rate, but still supplies its pocket.
 - **City spawn:** an owned city with none of its owner's units inside for
-  `city.spawn_time` (5 s), and nobody capturing it, raises a unit for free
-  if its pocket has supply to spare: heavy with probability
-  `city.spawn_heavy` (0.34), otherwise light (deterministic RNG).
+  `city.spawn_time` (5 s), and nobody capturing it, raises a unit at the
+  usual price if the owner can pay and its pocket has supply to spare:
+  heavy with probability `city.spawn_heavy` (0.34), otherwise light
+  (deterministic RNG, drawn when the city becomes due). A city being
+  captured neither raises units nor accepts purchases.
 - **Solid bodies** (changed after playtesting): a unit is a disc 1.5 tiles
   across (`unit.separation_radius` is the centre distance of touching
   units); overlapping units are pushed apart by up to a quarter diameter per
@@ -418,10 +420,8 @@ With solid bodies and contact movement (sim version 8) the bots are not
 retuned yet: Normal vs Easy 49% / 57%, Hard vs Normal 64% / 63%. Matches
 also last longer. With city rears and twice as many cities (version 9) the
 ordering is off too, so the strength tests are `#[ignore]`d until bots are
-retuned, which waits until the rules settle after playtesting. Since city
-spawns (version 10) bots no longer finish matches within 25 minutes; the
-"reaches victory" tests are ignored for the same reason (the golden replay
-is still checked).
+retuned, which waits until the rules settle after playtesting. City spawns cost money since version 11, and
+bot matches finish again.
 
 A fixed 10-match sample runs in `cargo test` as a regression guard. Heavy
 units still make bots weaker, so bots buy light units only.
